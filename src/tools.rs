@@ -1,3 +1,4 @@
+use crate::diff;
 use crate::graph::ConceptGraph;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -6,17 +7,20 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct SemexServer {
     graph: Arc<ConceptGraph>,
+    repo_root: PathBuf,
 }
 
 impl SemexServer {
-    pub fn new(graph: ConceptGraph) -> Self {
+    pub fn new(graph: ConceptGraph, repo_root: PathBuf) -> Self {
         Self {
             graph: Arc::new(graph),
+            repo_root,
         }
     }
 
@@ -64,14 +68,15 @@ impl SemexServer {
             .and_then(|v| v.as_str())
             .unwrap_or("HEAD~5");
 
-        // Stub: git2 integration deferred
-        Ok(json!({
-            "base_ref": since,
-            "head_ref": "HEAD",
-            "added_concepts": [],
-            "removed_concepts": [],
-            "changed_concepts": [],
-        }))
+        let result = diff::ontology_diff(
+            &self.repo_root,
+            since,
+            &self.graph.concepts,
+        )
+        .map_err(|e| format!("ontology_diff failed: {e}"))?;
+
+        serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))
     }
 
     fn handle_list_concepts(&self, args: &Value) -> Result<Value, String> {
@@ -328,7 +333,7 @@ mod tests {
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
-        SemexServer::new(graph)
+        SemexServer::new(graph, PathBuf::from("/tmp"))
     }
 
     #[test]
@@ -386,12 +391,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ontology_diff_stub() {
+    fn test_ontology_diff_returns_error_for_non_repo() {
         let server = make_test_server();
         let args = json!({"since": "HEAD~3"});
-        let result = server.handle_ontology_diff(&args).unwrap();
-        assert_eq!(result.get("base_ref").unwrap(), "HEAD~3");
-        assert_eq!(result.get("head_ref").unwrap(), "HEAD");
+        let result = server.handle_ontology_diff(&args);
+        // /tmp is not a git repo, so this should error
+        assert!(result.is_err());
     }
 
     #[test]
