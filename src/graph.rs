@@ -1,5 +1,5 @@
 use crate::embeddings::EmbeddingIndex;
-use crate::tokenizer::split_identifier;
+use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::types::{
     AnalysisResult, Concept, ConceptQueryResult, Convention, NameSuggestion,
     NamingCheckResult, PatternKind, Relationship, RelationshipKind, Verdict,
@@ -124,6 +124,32 @@ impl ConceptGraph {
                 }
             }
         }
+
+        // Check for abbreviation relationships: find concepts whose
+        // canonical is an abbreviation of the search term (or vice versa)
+        let term_as_slice = [term_lower.clone()];
+        for other in self.concepts.values() {
+            if other.id == concept.id {
+                continue;
+            }
+            let canon_as_slice = [other.canonical.clone()];
+            // Is other's canonical an abbreviation of the search term?
+            let is_abbrev = find_abbreviation(
+                &other.canonical,
+                &term_as_slice,
+            )
+            .is_some();
+            // Is the search term an abbreviation of other's canonical?
+            let is_expansion =
+                find_abbreviation(&term_lower, &canon_as_slice)
+                    .is_some();
+            if is_abbrev || is_expansion {
+                for occ in &other.occurrences {
+                    variants.push(occ.identifier.clone());
+                }
+            }
+        }
+
         variants.sort();
         variants.dedup();
 
@@ -194,56 +220,7 @@ impl ConceptGraph {
             }
         }
 
-        // 1. Check prefix conventions
-        // If the identifier uses a prefix that conflicts with a convention
-        // for the same semantic role, mark inconsistent.
-        let known_count_prefixes = ["n_", "nb_", "num_"];
-        for conv in &self.conventions {
-            if let PatternKind::Prefix(conv_prefix) = &conv.pattern {
-                // Check if identifier starts with a different prefix for
-                // the same semantic role
-                for &alt_prefix in &known_count_prefixes {
-                    if alt_prefix == conv_prefix.as_str() {
-                        continue;
-                    }
-                    if !id_lower.starts_with(alt_prefix) {
-                        continue;
-                    }
-                    // Identifier uses alt_prefix, but convention says
-                    // conv_prefix. Suggest replacement.
-                    let suffix = &id_lower[alt_prefix.len()..];
-                    let suggested =
-                        format!("{}{}", conv_prefix, suffix);
-
-                    // Check if the suggested form actually exists in
-                    // the corpus
-                    let suggestion = if id_freq.contains_key(&suggested) {
-                        Some(suggested)
-                    } else {
-                        Some(format!("{}{}", conv_prefix, suffix))
-                    };
-
-                    return NamingCheckResult {
-                        input: identifier.to_string(),
-                        subtokens,
-                        verdict: Verdict::Inconsistent,
-                        reason: format!(
-                            "project uses '{}' prefix for {} \
-                             (not '{}')",
-                            conv_prefix, conv.semantic_role, alt_prefix
-                        ),
-                        suggestion,
-                        matching_convention: Some(conv.clone()),
-                        similar_identifiers: find_similar_identifiers(
-                            identifier,
-                            &id_freq,
-                        ),
-                    };
-                }
-            }
-        }
-
-        // 2. Check if a higher-frequency variant exists in the corpus.
+        // 1. Check if a higher-frequency variant exists in the corpus.
         // For each subtoken, look for concepts whose canonical matches,
         // then check if a different identifier form is more popular.
         let input_freq = id_freq.get(&id_lower).copied().unwrap_or(0);
@@ -322,6 +299,42 @@ impl ConceptGraph {
                         &id_freq,
                     ),
                 };
+            }
+        }
+
+        // 2. Check prefix conventions — if the identifier uses a prefix
+        // that conflicts with a convention for the same semantic role
+        let known_count_prefixes = ["n_", "nb_", "num_"];
+        for conv in &self.conventions {
+            if let PatternKind::Prefix(conv_prefix) = &conv.pattern {
+                for &alt_prefix in &known_count_prefixes {
+                    if alt_prefix == conv_prefix.as_str() {
+                        continue;
+                    }
+                    if !id_lower.starts_with(alt_prefix) {
+                        continue;
+                    }
+                    let suffix = &id_lower[alt_prefix.len()..];
+                    let suggested =
+                        format!("{}{}", conv_prefix, suffix);
+
+                    return NamingCheckResult {
+                        input: identifier.to_string(),
+                        subtokens,
+                        verdict: Verdict::Inconsistent,
+                        reason: format!(
+                            "project uses '{}' prefix for {} \
+                             (not '{}')",
+                            conv_prefix, conv.semantic_role, alt_prefix
+                        ),
+                        suggestion: Some(suggested),
+                        matching_convention: Some(conv.clone()),
+                        similar_identifiers: find_similar_identifiers(
+                            identifier,
+                            &id_freq,
+                        ),
+                    };
+                }
             }
         }
 
