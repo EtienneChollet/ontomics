@@ -177,84 +177,122 @@ fn detect_conventions(parse_results: &[ParseResult]) -> Vec<Convention> {
 
 const CONVENTION_THRESHOLD: usize = 3;
 
+/// Well-known prefix roles for readability hints.
+/// Unknown prefixes that meet the frequency threshold still get detected
+/// with a generic "prefix pattern" role.
+fn prefix_role(prefix: &str) -> &'static str {
+    match prefix {
+        "nb_" => "count",
+        "is_" => "boolean predicate",
+        "has_" => "boolean predicate",
+        "n_" => "count",
+        "num_" => "count",
+        _ => "prefix pattern",
+    }
+}
+
 fn detect_prefix_conventions(
     identifiers: &[&RawIdentifier],
 ) -> Vec<Convention> {
-    let prefix_roles: &[(&str, &str)] = &[
-        ("nb_", "count"),
-        ("is_", "boolean predicate"),
-        ("has_", "boolean predicate"),
-        ("n_", "count"),
-        ("num_", "count"),
-    ];
+    // Collect all prefixes of 1-4 lowercase chars followed by '_'
+    let mut prefix_ids: HashMap<String, Vec<&RawIdentifier>> = HashMap::new();
 
+    for &id in identifiers {
+        if let Some(underscore_pos) = id.name.find('_') {
+            let candidate = &id.name[..underscore_pos];
+            if (1..=4).contains(&candidate.len())
+                && candidate.chars().all(|c| c.is_ascii_lowercase())
+            {
+                let prefix = format!("{}_", candidate);
+                prefix_ids.entry(prefix).or_default().push(id);
+            }
+        }
+    }
+
+    // Deduplicate: count distinct identifier names per prefix
     let mut conventions = Vec::new();
-
-    for &(prefix, role) in prefix_roles {
-        let matching: Vec<&RawIdentifier> = identifiers
-            .iter()
-            .filter(|id| id.name.starts_with(prefix))
-            .copied()
-            .collect();
-
-        if matching.len() < CONVENTION_THRESHOLD {
+    for (prefix, matching) in &prefix_ids {
+        let distinct: HashSet<&str> =
+            matching.iter().map(|id| id.name.as_str()).collect();
+        if distinct.len() < CONVENTION_THRESHOLD {
             continue;
         }
 
-        let entity_type = most_common_entity_type(&matching);
+        let entity_type = most_common_entity_type(matching);
         let examples: Vec<String> =
             matching.iter().map(|id| id.name.clone()).collect();
+        let role = prefix_role(prefix);
 
         conventions.push(Convention {
-            pattern: PatternKind::Prefix(prefix.to_string()),
+            pattern: PatternKind::Prefix(prefix.clone()),
             entity_type,
             semantic_role: role.to_string(),
             examples,
-            frequency: matching.len(),
+            frequency: distinct.len(),
         });
     }
 
     conventions
 }
 
+/// Well-known suffix roles for readability hints.
+/// Unknown suffixes that meet the frequency threshold still get detected
+/// with a generic "suffix pattern" role.
+fn suffix_role(suffix: &str) -> &'static str {
+    match suffix {
+        "_count" => "count",
+        "_mask" => "binary mask",
+        "_map" => "mapping",
+        "_list" => "collection",
+        "_path" => "file path",
+        "_size" => "dimension size",
+        "_shape" => "tensor shape",
+        "_idx" => "index",
+        "_fn" => "callable",
+        _ => "suffix pattern",
+    }
+}
+
 fn detect_suffix_conventions(
     identifiers: &[&RawIdentifier],
 ) -> Vec<Convention> {
-    let suffix_roles: &[(&str, &str)] = &[
-        ("_count", "count"),
-        ("_mask", "binary mask"),
-        ("_map", "mapping"),
-        ("_list", "collection"),
-        ("_path", "file path"),
-        ("_size", "dimension size"),
-        ("_shape", "tensor shape"),
-        ("_idx", "index"),
-        ("_fn", "callable"),
-    ];
+    // Collect all suffixes of '_' + 1-6 lowercase chars at end
+    let mut suffix_ids: HashMap<String, Vec<&RawIdentifier>> = HashMap::new();
 
+    for &id in identifiers {
+        if let Some(underscore_pos) = id.name.rfind('_') {
+            let candidate = &id.name[underscore_pos + 1..];
+            if (1..=6).contains(&candidate.len())
+                && candidate.chars().all(|c| c.is_ascii_lowercase())
+                // Ensure there's something before the suffix
+                && underscore_pos > 0
+            {
+                let suffix = format!("_{}", candidate);
+                suffix_ids.entry(suffix).or_default().push(id);
+            }
+        }
+    }
+
+    // Deduplicate: count distinct identifier names per suffix
     let mut conventions = Vec::new();
-
-    for &(suffix, role) in suffix_roles {
-        let matching: Vec<&RawIdentifier> = identifiers
-            .iter()
-            .filter(|id| id.name.ends_with(suffix))
-            .copied()
-            .collect();
-
-        if matching.len() < CONVENTION_THRESHOLD {
+    for (suffix, matching) in &suffix_ids {
+        let distinct: HashSet<&str> =
+            matching.iter().map(|id| id.name.as_str()).collect();
+        if distinct.len() < CONVENTION_THRESHOLD {
             continue;
         }
 
-        let entity_type = most_common_entity_type(&matching);
+        let entity_type = most_common_entity_type(matching);
         let examples: Vec<String> =
             matching.iter().map(|id| id.name.clone()).collect();
+        let role = suffix_role(suffix);
 
         conventions.push(Convention {
-            pattern: PatternKind::Suffix(suffix.to_string()),
+            pattern: PatternKind::Suffix(suffix.clone()),
             entity_type,
             semantic_role: role.to_string(),
             examples,
-            frequency: matching.len(),
+            frequency: distinct.len(),
         });
     }
 
@@ -497,6 +535,51 @@ mod tests {
                 "spatial and transform should co-occur"
             );
         }
+    }
+
+    #[test]
+    fn test_discovers_novel_prefix() {
+        let pr = make_parse_result(&[
+            ("vx_grid", EntityType::Variable),
+            ("vx_data", EntityType::Variable),
+            ("vx_size", EntityType::Variable),
+        ]);
+        let result = analyze(&[pr]).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Prefix(p) if p == "vx_")
+        });
+        assert!(conv.is_some(), "should discover novel prefix vx_");
+        assert_eq!(conv.unwrap().semantic_role, "prefix pattern");
+    }
+
+    #[test]
+    fn test_discovers_novel_suffix() {
+        let pr = make_parse_result(&[
+            ("input_vol", EntityType::Variable),
+            ("output_vol", EntityType::Variable),
+            ("target_vol", EntityType::Variable),
+        ]);
+        let result = analyze(&[pr]).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Suffix(s) if s == "_vol")
+        });
+        assert!(conv.is_some(), "should discover novel suffix _vol");
+        assert_eq!(conv.unwrap().semantic_role, "suffix pattern");
+    }
+
+    #[test]
+    fn test_known_suffix_has_semantic_role() {
+        let pr = make_parse_result(&[
+            ("loss_mask", EntityType::Variable),
+            ("roi_mask", EntityType::Variable),
+            ("seg_mask", EntityType::Variable),
+        ]);
+        let result = analyze(&[pr]).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Suffix(s) if s == "_mask")
+        });
+        assert!(conv.is_some(), "should detect _mask suffix");
+        assert_eq!(conv.unwrap().semantic_role, "binary mask");
     }
 
     #[test]
