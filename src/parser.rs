@@ -39,7 +39,19 @@ pub fn parse_directory(root: &Path) -> Result<Vec<ParseResult>> {
     let pattern = format!("{}/**/*.py", root.display());
     let paths: Vec<_> = glob::glob(&pattern)?
         .filter_map(|entry| entry.ok())
-        .filter(|p| !p.to_string_lossy().contains("__pycache__"))
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            !s.contains("__pycache__")
+                && !s.contains("/venv/")
+                && !s.contains("/venv.")
+                && !s.contains("/.venv/")
+                && !s.contains("/node_modules/")
+                && !s.contains("/.git/")
+                && !s.contains("/site-packages/")
+                && !s.contains("/.tox/")
+                && !s.contains("/.eggs/")
+                && !s.contains("/egg-info/")
+        })
         .collect();
 
     let results: Vec<ParseResult> = paths

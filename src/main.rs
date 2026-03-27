@@ -1,10 +1,14 @@
+#[allow(dead_code)]
 mod analyzer;
 mod cache;
+#[allow(dead_code)]
 mod embeddings;
 mod graph;
 mod parser;
+#[allow(dead_code)]
 mod tokenizer;
 mod tools;
+#[allow(dead_code)]
 mod types;
 
 use clap::Parser as ClapParser;
