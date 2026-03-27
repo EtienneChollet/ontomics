@@ -2,10 +2,12 @@ use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
 use crate::types::{Concept, Convention, Relationship};
 use anyhow::Result;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 pub struct IndexCache {
     db_path: PathBuf,
@@ -57,6 +59,33 @@ impl IndexCache {
         )?;
 
         Ok(())
+    }
+
+    /// Start watching for Python file changes. Returns the watcher (must be
+    /// kept alive) and a receiver that emits batches of changed `.py` paths.
+    pub fn watch(
+        &self,
+        root: &Path,
+    ) -> Result<(RecommendedWatcher, mpsc::Receiver<Vec<PathBuf>>)> {
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(
+            move |res: std::result::Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let py_paths: Vec<PathBuf> = event
+                        .paths
+                        .into_iter()
+                        .filter(|p| {
+                            p.extension().is_some_and(|e| e == "py")
+                        })
+                        .collect();
+                    if !py_paths.is_empty() {
+                        let _ = tx.send(py_paths);
+                    }
+                }
+            },
+        )?;
+        watcher.watch(root, RecursiveMode::Recursive)?;
+        Ok((watcher, rx))
     }
 
     /// Load cached graph. Returns None if cache is missing or corrupt.

@@ -27,7 +27,7 @@ pub fn ontology_diff(
     let base_tree = base_commit.tree()?;
 
     let base_parse_results = parse_git_tree(&repo, &base_tree, repo_root)?;
-    let base_analysis = analyzer::analyze(&base_parse_results)?;
+    let base_analysis = analyzer::analyze(&base_parse_results, &analyzer::AnalysisParams::default())?;
     let base_concepts: HashMap<u64, Concept> = base_analysis
         .concepts
         .into_iter()
@@ -266,7 +266,7 @@ def spatial_transform(vol, trf):
             &dir.join("module.py"),
         )
         .unwrap();
-        let analysis = analyzer::analyze(&[parse_results]).unwrap();
+        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
         let current: HashMap<u64, Concept> = analysis
             .concepts
             .into_iter()
@@ -313,7 +313,7 @@ def compute_displacement(source, target):
             &dir.join("module.py"),
         )
         .unwrap();
-        let analysis = analyzer::analyze(&[parse_results]).unwrap();
+        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
         let current: HashMap<u64, Concept> = analysis
             .concepts
             .into_iter()
@@ -372,7 +372,7 @@ def spatial_transform(vol, trf):
             &dir.join("module.py"),
         )
         .unwrap();
-        let analysis = analyzer::analyze(&[parse_results]).unwrap();
+        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
         let current: HashMap<u64, Concept> = analysis
             .concepts
             .into_iter()
