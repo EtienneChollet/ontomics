@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod analyzer;
 mod cache;
+mod diff;
 #[allow(dead_code)]
 mod embeddings;
 mod graph;
@@ -62,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
         graph
     };
 
-    let server = tools::SemexServer::new(graph);
+    let server = tools::SemexServer::new(graph, cli.repo.clone());
 
     eprintln!("Starting MCP server on stdio...");
     let running = server
