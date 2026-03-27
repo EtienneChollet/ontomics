@@ -305,13 +305,18 @@ fn most_common_entity_type(identifiers: &[&RawIdentifier]) -> EntityType {
         .unwrap_or(EntityType::Variable)
 }
 
-/// Build co-occurrence matrix: two concepts co-occur when their subtokens
-/// appear in the same identifier.
+/// Co-occurrence weight for subtokens sharing the same identifier name.
+const CO_WEIGHT_IDENTIFIER: f32 = 1.0;
+/// Co-occurrence weight for concepts sharing the same scope (function/class).
+const CO_WEIGHT_SCOPE: f32 = 0.5;
+
+/// Build co-occurrence matrix from two sources:
+/// 1. Per-identifier: subtokens in the same identifier name (weight 1.0)
+/// 2. Per-scope: identifiers sharing the same function/class scope (weight 0.5)
 fn build_co_occurrence(
     concepts: &[Concept],
     parse_results: &[ParseResult],
 ) -> Vec<((u64, u64), f32)> {
-    // Map subtoken -> concept id
     let mut subtoken_to_concept: HashMap<&str, u64> = HashMap::new();
     for concept in concepts {
         for st in &concept.subtokens {
@@ -319,32 +324,75 @@ fn build_co_occurrence(
         }
     }
 
-    // For each identifier, find which concepts its subtokens belong to.
-    // Every pair of distinct concepts in the same identifier co-occurs.
     let mut co_counts: HashMap<(u64, u64), f32> = HashMap::new();
 
+    // Per-identifier co-occurrence: subtokens in the same identifier name
     for pr in parse_results {
         for ident in &pr.identifiers {
             let subtokens = split_identifier(&ident.name);
-            let mut concept_ids: Vec<u64> = subtokens
-                .iter()
-                .filter_map(|st| subtoken_to_concept.get(st.as_str()))
-                .copied()
-                .collect::<HashSet<u64>>()
-                .into_iter()
-                .collect();
-            concept_ids.sort();
+            let concept_ids = sorted_unique_concept_ids(
+                &subtokens,
+                &subtoken_to_concept,
+            );
+            add_pairwise(&mut co_counts, &concept_ids, CO_WEIGHT_IDENTIFIER);
+        }
+    }
 
-            for i in 0..concept_ids.len() {
-                for j in (i + 1)..concept_ids.len() {
-                    let key = (concept_ids[i], concept_ids[j]);
-                    *co_counts.entry(key).or_insert(0.0) += 1.0;
+    // Per-scope co-occurrence: identifiers sharing the same scope
+    let mut scope_concepts: HashMap<&str, HashSet<u64>> = HashMap::new();
+    for pr in parse_results {
+        for ident in &pr.identifiers {
+            if let Some(ref s) = ident.scope {
+                let subtokens = split_identifier(&ident.name);
+                for st in &subtokens {
+                    if let Some(&cid) = subtoken_to_concept.get(st.as_str())
+                    {
+                        scope_concepts
+                            .entry(s.as_str())
+                            .or_default()
+                            .insert(cid);
+                    }
                 }
             }
         }
     }
+    for concept_ids_set in scope_concepts.values() {
+        let mut ids: Vec<u64> = concept_ids_set.iter().copied().collect();
+        ids.sort();
+        add_pairwise(&mut co_counts, &ids, CO_WEIGHT_SCOPE);
+    }
 
     co_counts.into_iter().collect()
+}
+
+/// Collect sorted, deduplicated concept IDs for a list of subtokens.
+fn sorted_unique_concept_ids(
+    subtokens: &[String],
+    subtoken_to_concept: &HashMap<&str, u64>,
+) -> Vec<u64> {
+    let mut ids: Vec<u64> = subtokens
+        .iter()
+        .filter_map(|st| subtoken_to_concept.get(st.as_str()))
+        .copied()
+        .collect::<HashSet<u64>>()
+        .into_iter()
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Add `weight` to every pair (i, j) where i < j in sorted concept IDs.
+fn add_pairwise(
+    co_counts: &mut HashMap<(u64, u64), f32>,
+    concept_ids: &[u64],
+    weight: f32,
+) {
+    for i in 0..concept_ids.len() {
+        for j in (i + 1)..concept_ids.len() {
+            let key = (concept_ids[i], concept_ids[j]);
+            *co_counts.entry(key).or_insert(0.0) += weight;
+        }
+    }
 }
 
 /// Run full analysis pipeline on parsed identifiers.
@@ -381,6 +429,7 @@ mod tests {
             entity_type,
             file: PathBuf::from("test.py"),
             line: 1,
+            scope: None,
         }
     }
 

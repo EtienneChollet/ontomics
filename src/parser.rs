@@ -1,5 +1,6 @@
 use crate::types::{EntityType, ParseResult, RawIdentifier};
 use anyhow::Result;
+use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::path::Path;
 
@@ -24,6 +25,7 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         tree.root_node(),
         source_bytes,
         path,
+        &None,
         &mut identifiers,
         &mut doc_texts,
     );
@@ -35,23 +37,19 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
 }
 
 /// Parse all `.py` files in a directory tree using parallel iteration.
+///
+/// Uses `ignore::WalkBuilder` to natively respect `.gitignore` files
+/// and skip hidden files/directories.
 pub fn parse_directory(root: &Path) -> Result<Vec<ParseResult>> {
-    let pattern = format!("{}/**/*.py", root.display());
-    let paths: Vec<_> = glob::glob(&pattern)?
+    let paths: Vec<_> = WalkBuilder::new(root)
+        .standard_filters(true)
+        .build()
         .filter_map(|entry| entry.ok())
-        .filter(|p| {
-            let s = p.to_string_lossy();
-            !s.contains("__pycache__")
-                && !s.contains("/venv/")
-                && !s.contains("/venv.")
-                && !s.contains("/.venv/")
-                && !s.contains("/node_modules/")
-                && !s.contains("/.git/")
-                && !s.contains("/site-packages/")
-                && !s.contains("/.tox/")
-                && !s.contains("/.eggs/")
-                && !s.contains("/egg-info/")
+        .filter(|entry| {
+            entry.file_type().is_some_and(|ft| ft.is_file())
+                && entry.path().extension().is_some_and(|ext| ext == "py")
         })
+        .map(|entry| entry.into_path())
         .collect();
 
     let results: Vec<ParseResult> = paths
@@ -67,25 +65,54 @@ pub fn parse_directory(root: &Path) -> Result<Vec<ParseResult>> {
 const SKIP_PARAMS: &[&str] = &["self", "cls"];
 
 /// Recursively visit a tree-sitter node, extracting identifiers and docstrings.
+///
+/// `scope` tracks the enclosing class/function for co-occurrence analysis.
 fn visit_node(
     node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
     doc_texts: &mut Vec<(std::path::PathBuf, usize, String)>,
 ) {
     match node.kind() {
         "function_definition" => {
-            extract_function(node, source, path, identifiers);
+            let func_name =
+                extract_function(node, source, path, scope, identifiers);
+            // Build new scope for children inside the function body
+            let child_scope = func_name.map(|name| match scope {
+                Some(parent) => format!("{parent}.{name}"),
+                None => name,
+            });
+            visit_children(
+                node,
+                source,
+                path,
+                &child_scope,
+                identifiers,
+                doc_texts,
+            );
+            return;
         }
         "class_definition" => {
-            extract_class(node, source, path, identifiers);
+            let class_name =
+                extract_class(node, source, path, scope, identifiers);
+            let child_scope = class_name.or_else(|| scope.clone());
+            visit_children(
+                node,
+                source,
+                path,
+                &child_scope,
+                identifiers,
+                doc_texts,
+            );
+            return;
         }
         "decorated_definition" => {
-            extract_decorators(node, source, path, identifiers);
+            extract_decorators(node, source, path, scope, identifiers);
         }
         "assignment" => {
-            extract_assignment(node, source, path, identifiers);
+            extract_assignment(node, source, path, scope, identifiers);
         }
         "expression_statement" => {
             try_extract_docstring(node, source, path, doc_texts);
@@ -93,34 +120,60 @@ fn visit_node(
         _ => {}
     }
 
-    // Recurse into children
+    visit_children(node, source, path, scope, identifiers, doc_texts);
+}
+
+/// Recurse into all children of a node.
+fn visit_children(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+    doc_texts: &mut Vec<(std::path::PathBuf, usize, String)>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_node(child, source, path, identifiers, doc_texts);
+        visit_node(child, source, path, scope, identifiers, doc_texts);
     }
 }
 
-/// Extract function name and its parameters.
+/// Extract function name and its parameters. Returns the function name
+/// (used to build scope for children).
 fn extract_function(
     node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
-) {
-    if let Some(name_node) = node.child_by_field_name("name") {
-        if let Ok(name) = name_node.utf8_text(source) {
-            identifiers.push(RawIdentifier {
-                name: name.to_string(),
-                entity_type: EntityType::Function,
-                file: path.to_path_buf(),
-                line: name_node.start_position().row + 1,
-            });
-        }
-    }
+) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = name_node.utf8_text(source).ok()?;
+
+    identifiers.push(RawIdentifier {
+        name: name.to_string(),
+        entity_type: EntityType::Function,
+        file: path.to_path_buf(),
+        line: name_node.start_position().row + 1,
+        scope: scope.clone(),
+    });
 
     if let Some(params_node) = node.child_by_field_name("parameters") {
-        extract_parameters(params_node, source, path, identifiers);
+        // Parameters belong to the function's own scope
+        let func_scope = Some(match scope {
+            Some(parent) => format!("{parent}.{name}"),
+            None => name.to_string(),
+        });
+        extract_parameters(
+            params_node,
+            source,
+            path,
+            &func_scope,
+            identifiers,
+        );
     }
+
+    Some(name.to_string())
 }
 
 /// Extract parameter names from a `parameters` node.
@@ -128,23 +181,27 @@ fn extract_parameters(
     params_node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
 ) {
     let mut cursor = params_node.walk();
     for child in params_node.named_children(&mut cursor) {
         match child.kind() {
-            // Simple parameter: just an identifier
             "identifier" => {
-                push_param_if_valid(child, source, path, identifiers);
+                push_param_if_valid(child, source, path, scope, identifiers);
             }
-            // `name: type` or `name = default` or `name: type = default`
-            "typed_parameter" | "default_parameter" | "typed_default_parameter" => {
-                // The param name is the first identifier child
+            "typed_parameter" | "default_parameter"
+            | "typed_default_parameter" => {
                 if let Some(name_node) = find_first_identifier_child(child) {
-                    push_param_if_valid(name_node, source, path, identifiers);
+                    push_param_if_valid(
+                        name_node,
+                        source,
+                        path,
+                        scope,
+                        identifiers,
+                    );
                 }
             }
-            // *args, **kwargs — skip
             "list_splat_pattern" | "dictionary_splat_pattern" => {}
             _ => {}
         }
@@ -156,6 +213,7 @@ fn push_param_if_valid(
     name_node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
 ) {
     if let Ok(name) = name_node.utf8_text(source) {
@@ -165,6 +223,7 @@ fn push_param_if_valid(
                 entity_type: EntityType::Parameter,
                 file: path.to_path_buf(),
                 line: name_node.start_position().row + 1,
+                scope: scope.clone(),
             });
         }
     }
@@ -186,27 +245,35 @@ fn find_named_child_by_kind<'a>(
 }
 
 /// Find the first `identifier` child of a node (for typed/default params).
-fn find_first_identifier_child(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+fn find_first_identifier_child(
+    node: tree_sitter::Node,
+) -> Option<tree_sitter::Node> {
     find_named_child_by_kind(node, "identifier")
 }
 
-/// Extract the class name.
+/// Extract the class name. Returns the class scope string for children.
 fn extract_class(
     node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
-) {
-    if let Some(name_node) = node.child_by_field_name("name") {
-        if let Ok(name) = name_node.utf8_text(source) {
-            identifiers.push(RawIdentifier {
-                name: name.to_string(),
-                entity_type: EntityType::Class,
-                file: path.to_path_buf(),
-                line: name_node.start_position().row + 1,
-            });
-        }
-    }
+) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = name_node.utf8_text(source).ok()?;
+
+    identifiers.push(RawIdentifier {
+        name: name.to_string(),
+        entity_type: EntityType::Class,
+        file: path.to_path_buf(),
+        line: name_node.start_position().row + 1,
+        scope: scope.clone(),
+    });
+
+    Some(match scope {
+        Some(parent) => format!("{parent}.{name}"),
+        None => name.to_string(),
+    })
 }
 
 /// Extract decorator names from a `decorated_definition` node.
@@ -214,19 +281,19 @@ fn extract_decorators(
     node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "decorator" {
-            // The decorator node's children: "@" + expression
-            // We want the identifier name (could be a dotted name or call)
             if let Some(name) = extract_decorator_name(child, source) {
                 identifiers.push(RawIdentifier {
                     name,
                     entity_type: EntityType::Decorator,
                     file: path.to_path_buf(),
                     line: child.start_position().row + 1,
+                    scope: scope.clone(),
                 });
             }
         }
@@ -243,16 +310,25 @@ fn extract_decorator_name(
     for child in decorator_node.named_children(&mut cursor) {
         match child.kind() {
             "identifier" => {
-                return child.utf8_text(source).ok().map(|s| s.to_string());
+                return child
+                    .utf8_text(source)
+                    .ok()
+                    .map(|s| s.to_string());
             }
             "attribute" => {
-                // Dotted name like `module.decorator` — use full text
-                return child.utf8_text(source).ok().map(|s| s.to_string());
+                return child
+                    .utf8_text(source)
+                    .ok()
+                    .map(|s| s.to_string());
             }
             "call" => {
-                // `@decorator(args)` — get the function part
-                if let Some(func_node) = child.child_by_field_name("function") {
-                    return func_node.utf8_text(source).ok().map(|s| s.to_string());
+                if let Some(func_node) =
+                    child.child_by_field_name("function")
+                {
+                    return func_node
+                        .utf8_text(source)
+                        .ok()
+                        .map(|s| s.to_string());
                 }
             }
             _ => {}
@@ -266,6 +342,7 @@ fn extract_assignment(
     node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
+    scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
 ) {
     if let Some(left) = node.child_by_field_name("left") {
@@ -276,6 +353,7 @@ fn extract_assignment(
                     entity_type: EntityType::Variable,
                     file: path.to_path_buf(),
                     line: left.start_position().row + 1,
+                    scope: scope.clone(),
                 });
             }
         }
@@ -290,21 +368,16 @@ fn try_extract_docstring(
     path: &Path,
     doc_texts: &mut Vec<(std::path::PathBuf, usize, String)>,
 ) {
-    // Must contain a string child
-    let string_node = find_named_child_by_kind(node, "string");
-    let string_node = match string_node {
+    let string_node = match find_named_child_by_kind(node, "string") {
         Some(n) => n,
         None => return,
     };
 
-    // Check: is this the first statement in a block (body of a
-    // function/class/module)?
     if !is_first_statement_in_block(node) {
         return;
     }
 
     if let Ok(text) = string_node.utf8_text(source) {
-        // Strip surrounding quotes (""", ''', ", ')
         let stripped = strip_docstring_quotes(text);
         if !stripped.is_empty() {
             doc_texts.push((
@@ -349,19 +422,26 @@ fn is_first_statement_in_block(node: tree_sitter::Node) -> bool {
 /// Strip surrounding docstring quotes (`"""`, `'''`, `"`, `'`, and r/b
 /// prefixes).
 fn strip_docstring_quotes(s: &str) -> &str {
-    // Strip string prefixes (r, b, u, f, and combinations)
     let s = s.trim_start_matches(|c: char| "rRbBuUfF".contains(c));
 
-    if let Some(inner) = s.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\"")) {
+    if let Some(inner) =
+        s.strip_prefix("\"\"\"").and_then(|s| s.strip_suffix("\"\"\""))
+    {
         return inner.trim();
     }
-    if let Some(inner) = s.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")) {
+    if let Some(inner) =
+        s.strip_prefix("'''").and_then(|s| s.strip_suffix("'''"))
+    {
         return inner.trim();
     }
-    if let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+    if let Some(inner) =
+        s.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+    {
         return inner.trim();
     }
-    if let Some(inner) = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+    if let Some(inner) =
+        s.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
+    {
         return inner.trim();
     }
     s
@@ -402,7 +482,10 @@ def spatial_transform(vol, trf, nb_dims=3):
         })
     }
 
-    fn names_of(result: &ParseResult, entity_type: EntityType) -> Vec<String> {
+    fn names_of(
+        result: &ParseResult,
+        entity_type: EntityType,
+    ) -> Vec<String> {
         result
             .identifiers
             .iter()
@@ -514,5 +597,78 @@ def spatial_transform(vol, trf, nb_dims=3):
         for (_, line, _) in &result.doc_texts {
             assert!(*line >= 1, "Docstring line numbers must be 1-indexed");
         }
+    }
+
+    #[test]
+    fn test_scope_tracking() {
+        let result = fixture_result();
+
+        // Module-level function has no scope
+        let spatial = result
+            .identifiers
+            .iter()
+            .find(|id| id.name == "spatial_transform")
+            .unwrap();
+        assert_eq!(spatial.scope, None);
+
+        // Class itself has no scope (defined at module level)
+        let class = result
+            .identifiers
+            .iter()
+            .find(|id| id.name == "MyClass")
+            .unwrap();
+        assert_eq!(class.scope, None);
+
+        // Method __init__ is scoped to MyClass
+        let init = result
+            .identifiers
+            .iter()
+            .find(|id| {
+                id.name == "__init__"
+                    && id.entity_type == EntityType::Function
+            })
+            .unwrap();
+        assert_eq!(init.scope, Some("MyClass".to_string()));
+
+        // Parameter nb_features is scoped to MyClass.__init__
+        let nb_feat = result
+            .identifiers
+            .iter()
+            .find(|id| {
+                id.name == "nb_features"
+                    && id.entity_type == EntityType::Parameter
+            })
+            .unwrap();
+        assert_eq!(nb_feat.scope, Some("MyClass.__init__".to_string()));
+
+        // Variable displacement is inside MyClass.compute_transform
+        let disp = result
+            .identifiers
+            .iter()
+            .find(|id| id.name == "displacement")
+            .unwrap();
+        assert_eq!(
+            disp.scope,
+            Some("MyClass.compute_transform".to_string())
+        );
+
+        // Variable ndim is inside spatial_transform (module-level)
+        let ndim = result
+            .identifiers
+            .iter()
+            .find(|id| id.name == "ndim")
+            .unwrap();
+        assert_eq!(ndim.scope, Some("spatial_transform".to_string()));
+
+        // Parameter vol is scoped to spatial_transform
+        let vol = result
+            .identifiers
+            .iter()
+            .find(|id| {
+                id.name == "vol"
+                    && id.entity_type == EntityType::Parameter
+            })
+            .unwrap();
+        assert_eq!(vol.scope, Some("spatial_transform".to_string()));
     }
 }
