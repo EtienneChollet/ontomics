@@ -8,20 +8,24 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct SemexServer {
-    graph: Arc<ConceptGraph>,
+    graph: Arc<RwLock<ConceptGraph>>,
     repo_root: PathBuf,
 }
 
 impl SemexServer {
     pub fn new(graph: ConceptGraph, repo_root: PathBuf) -> Self {
         Self {
-            graph: Arc::new(graph),
+            graph: Arc::new(RwLock::new(graph)),
             repo_root,
         }
+    }
+
+    pub fn graph_handle(&self) -> Arc<RwLock<ConceptGraph>> {
+        Arc::clone(&self.graph)
     }
 
     fn handle_query_concept(&self, args: &Value) -> Result<Value, String> {
@@ -30,7 +34,8 @@ impl SemexServer {
             .and_then(|v| v.as_str())
             .ok_or("missing required argument 'term'")?;
 
-        match self.graph.query_concept(term) {
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        match graph.query_concept(term) {
             Some(result) => serde_json::to_value(result)
                 .map_err(|e| format!("serialization error: {e}")),
             None => Ok(json!({
@@ -46,7 +51,8 @@ impl SemexServer {
             .and_then(|v| v.as_str())
             .ok_or("missing required argument 'identifier'")?;
 
-        let result = self.graph.check_naming(identifier);
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let result = graph.check_naming(identifier);
         serde_json::to_value(result)
             .map_err(|e| format!("serialization error: {e}"))
     }
@@ -57,7 +63,8 @@ impl SemexServer {
             .and_then(|v| v.as_str())
             .ok_or("missing required argument 'description'")?;
 
-        let result = self.graph.suggest_name(description);
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let result = graph.suggest_name(description);
         serde_json::to_value(result)
             .map_err(|e| format!("serialization error: {e}"))
     }
@@ -68,10 +75,11 @@ impl SemexServer {
             .and_then(|v| v.as_str())
             .unwrap_or("HEAD~5");
 
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let result = diff::ontology_diff(
             &self.repo_root,
             since,
-            &self.graph.concepts,
+            &graph.concepts,
         )
         .map_err(|e| format!("ontology_diff failed: {e}"))?;
 
@@ -85,7 +93,8 @@ impl SemexServer {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        let mut concepts = self.graph.list_concepts();
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let mut concepts = graph.list_concepts();
         if let Some(k) = top_k {
             concepts.truncate(k);
         }
@@ -105,7 +114,8 @@ impl SemexServer {
     }
 
     fn handle_list_conventions(&self, _args: &Value) -> Result<Value, String> {
-        let conventions = self.graph.list_conventions();
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let conventions = graph.list_conventions();
         serde_json::to_value(conventions)
             .map_err(|e| format!("serialization error: {e}"))
     }

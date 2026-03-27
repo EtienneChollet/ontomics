@@ -7,6 +7,16 @@ use crate::types::{
 use anyhow::Result;
 use std::collections::HashMap;
 
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+
 pub struct ConceptGraph {
     pub concepts: HashMap<u64, Concept>,
     pub relationships: Vec<Relationship>,
@@ -527,6 +537,33 @@ impl ConceptGraph {
     /// List all detected conventions.
     pub fn list_conventions(&self) -> &[Convention] {
         &self.conventions
+    }
+
+    /// Add SimilarTo relationship edges between concepts whose embeddings
+    /// have cosine similarity above the given threshold.
+    pub fn add_similarity_edges(&mut self, threshold: f32) {
+        let ids: Vec<u64> = self.concepts.keys().copied().collect();
+        for (i, &id_a) in ids.iter().enumerate() {
+            let vec_a = match self.embeddings.get_vector(id_a) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            for &id_b in &ids[i + 1..] {
+                let vec_b = match self.embeddings.get_vector(id_b) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let sim = cosine_similarity(&vec_a, vec_b);
+                if sim > threshold {
+                    self.relationships.push(Relationship {
+                        source: id_a,
+                        target: id_b,
+                        kind: RelationshipKind::SimilarTo,
+                        weight: sim,
+                    });
+                }
+            }
+        }
     }
 
     /// List all concepts, ordered by frequency (descending).
