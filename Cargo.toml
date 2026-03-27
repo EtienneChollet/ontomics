@@ -1,0 +1,51 @@
+[package]
+name = "semex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Parsing
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+
+# Embeddings
+fastembed = "4"
+
+# MCP server
+rmcp = { version = "0.1", features = ["server", "transport-io"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Git
+git2 = "0.19"
+
+# File watching
+notify = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Unicode
+unicode-segmentation = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Parallelism
+rayon = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Glob for file discovery
+glob = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
