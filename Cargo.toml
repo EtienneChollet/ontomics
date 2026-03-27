@@ -43,8 +43,8 @@ rayon = "1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Glob for file discovery
-glob = "0.3"
+# File walking (respects .gitignore)
+ignore = "0.4"
 
 # Logging
 tracing = "0.1"
