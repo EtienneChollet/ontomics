@@ -5,15 +5,23 @@ use std::path::Path;
 
 /// Parse a single Python file and extract identifiers and docstrings.
 pub fn parse_file(path: &Path) -> Result<ParseResult> {
+    let source = std::fs::read_to_string(path)?;
+    parse_content(&source, path)
+}
+
+/// Parse Python source content and extract identifiers and docstrings.
+///
+/// Like `parse_file`, but takes source content directly instead of reading
+/// from disk. Used by the diff module to parse files from git tree objects.
+pub fn parse_content(source: &str, path: &Path) -> Result<ParseResult> {
     let mut parser = tree_sitter::Parser::new();
     let language = tree_sitter_python::LANGUAGE;
     parser
         .set_language(&language.into())
         .expect("Error loading Python grammar");
 
-    let source = std::fs::read_to_string(path)?;
     let tree = parser
-        .parse(&source, None)
+        .parse(source, None)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse {}", path.display()))?;
 
     let source_bytes = source.as_bytes();
