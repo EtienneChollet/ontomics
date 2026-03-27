@@ -73,6 +73,8 @@ pub struct RawIdentifier {
     pub entity_type: EntityType,
     pub file: PathBuf,
     pub line: usize,
+    /// Enclosing scope, e.g. "MyClass", "MyClass.method", "function_name"
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
