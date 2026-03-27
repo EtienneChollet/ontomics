@@ -1,7 +1,8 @@
 use crate::embeddings::EmbeddingIndex;
+use crate::tokenizer::split_identifier;
 use crate::types::{
-    AnalysisResult, Concept, ConceptQueryResult, Convention, NameSuggestion, NamingCheckResult,
-    Relationship,
+    AnalysisResult, Concept, ConceptQueryResult, Convention, NameSuggestion,
+    NamingCheckResult, PatternKind, Relationship, RelationshipKind, Verdict,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -15,23 +16,499 @@ pub struct ConceptGraph {
 
 impl ConceptGraph {
     /// Build graph from analysis results + embeddings.
-    pub fn build(analysis: AnalysisResult, embeddings: EmbeddingIndex) -> Result<Self> {
-        todo!()
+    pub fn build(
+        analysis: AnalysisResult,
+        embeddings: EmbeddingIndex,
+    ) -> Result<Self> {
+        let concepts: HashMap<u64, Concept> = analysis
+            .concepts
+            .into_iter()
+            .map(|c| (c.id, c))
+            .collect();
+
+        let relationships: Vec<Relationship> = analysis
+            .co_occurrence_matrix
+            .into_iter()
+            .map(|((src, tgt), weight)| Relationship {
+                source: src,
+                target: tgt,
+                kind: RelationshipKind::CoOccurs,
+                weight,
+            })
+            .collect();
+
+        Ok(Self {
+            concepts,
+            relationships,
+            conventions: analysis.conventions,
+            embeddings,
+        })
     }
 
     /// Look up a concept by name (exact or fuzzy match via embeddings).
     pub fn query_concept(&self, term: &str) -> Option<ConceptQueryResult> {
-        todo!()
+        let term_lower = term.to_lowercase();
+        let subtokens = split_identifier(term);
+
+        // 1. Exact match on canonical name
+        let matched = self
+            .concepts
+            .values()
+            .find(|c| c.canonical == term_lower)
+            .or_else(|| {
+                // Match any concept whose canonical equals one of the
+                // query's subtokens
+                subtokens.iter().find_map(|st| {
+                    self.concepts.values().find(|c| c.canonical == *st)
+                })
+            })
+            .or_else(|| {
+                // 2. Match by occurrence identifier
+                self.concepts.values().find(|c| {
+                    c.occurrences
+                        .iter()
+                        .any(|o| o.identifier.to_lowercase() == term_lower)
+                })
+            });
+
+        // 3. Embedding-based fuzzy search (if no exact/occurrence match)
+        let matched = matched.or_else(|| {
+            // Try to find a concept whose embedding is close to the term.
+            // We need an embedding for the query — look for a concept whose
+            // canonical is a subtoken of the query as a proxy.
+            let query_vec = subtokens.iter().find_map(|st| {
+                self.concepts.values().find_map(|c| {
+                    if c.canonical == *st {
+                        self.embeddings.get_vector(c.id)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(qv) = query_vec {
+                let similar = self.embeddings.find_similar(qv, 1);
+                similar
+                    .first()
+                    .and_then(|(id, score)| {
+                        if *score > 0.5 {
+                            self.concepts.get(id)
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            }
+        });
+
+        let concept = matched?;
+
+        // Collect variants: all unique identifier names from this concept's
+        // occurrences, PLUS identifiers from other concepts that contain the
+        // search term in their identifiers.
+        let mut variants: Vec<String> = concept
+            .occurrences
+            .iter()
+            .map(|o| o.identifier.clone())
+            .collect();
+
+        // Also gather identifiers from ALL concepts that contain the term
+        for other in self.concepts.values() {
+            if other.id == concept.id {
+                continue;
+            }
+            for occ in &other.occurrences {
+                let id_lower = occ.identifier.to_lowercase();
+                if id_lower.contains(&term_lower) {
+                    variants.push(occ.identifier.clone());
+                }
+            }
+        }
+        variants.sort();
+        variants.dedup();
+
+        // Related concepts via relationships
+        let related: Vec<(Concept, RelationshipKind, f32)> = self
+            .relationships
+            .iter()
+            .filter_map(|rel| {
+                if rel.source == concept.id {
+                    self.concepts
+                        .get(&rel.target)
+                        .map(|c| (c.clone(), rel.kind.clone(), rel.weight))
+                } else if rel.target == concept.id {
+                    self.concepts
+                        .get(&rel.source)
+                        .map(|c| (c.clone(), rel.kind.clone(), rel.weight))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Conventions that match any of this concept's identifiers
+        let concept_identifiers: Vec<String> = concept
+            .occurrences
+            .iter()
+            .map(|o| o.identifier.clone())
+            .collect();
+        let conventions: Vec<Convention> = self
+            .conventions
+            .iter()
+            .filter(|conv| {
+                conv.examples
+                    .iter()
+                    .any(|ex| concept_identifiers.contains(ex))
+            })
+            .cloned()
+            .collect();
+
+        let top_occurrences: Vec<_> = concept
+            .occurrences
+            .iter()
+            .take(10)
+            .cloned()
+            .collect();
+
+        Some(ConceptQueryResult {
+            concept: concept.clone(),
+            variants,
+            related,
+            conventions,
+            top_occurrences,
+        })
     }
 
     /// Check an identifier against project conventions.
     pub fn check_naming(&self, identifier: &str) -> NamingCheckResult {
-        todo!()
+        let subtokens = split_identifier(identifier);
+        let id_lower = identifier.to_lowercase();
+
+        // Collect all identifiers and their frequencies across the corpus
+        let mut id_freq: HashMap<String, usize> = HashMap::new();
+        for concept in self.concepts.values() {
+            for occ in &concept.occurrences {
+                *id_freq
+                    .entry(occ.identifier.to_lowercase())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        // 1. Check prefix conventions
+        // If the identifier uses a prefix that conflicts with a convention
+        // for the same semantic role, mark inconsistent.
+        let known_count_prefixes = ["n_", "nb_", "num_"];
+        for conv in &self.conventions {
+            if let PatternKind::Prefix(conv_prefix) = &conv.pattern {
+                // Check if identifier starts with a different prefix for
+                // the same semantic role
+                for &alt_prefix in &known_count_prefixes {
+                    if alt_prefix == conv_prefix.as_str() {
+                        continue;
+                    }
+                    if !id_lower.starts_with(alt_prefix) {
+                        continue;
+                    }
+                    // Identifier uses alt_prefix, but convention says
+                    // conv_prefix. Suggest replacement.
+                    let suffix = &id_lower[alt_prefix.len()..];
+                    let suggested =
+                        format!("{}{}", conv_prefix, suffix);
+
+                    // Check if the suggested form actually exists in
+                    // the corpus
+                    let suggestion = if id_freq.contains_key(&suggested) {
+                        Some(suggested)
+                    } else {
+                        Some(format!("{}{}", conv_prefix, suffix))
+                    };
+
+                    return NamingCheckResult {
+                        input: identifier.to_string(),
+                        subtokens,
+                        verdict: Verdict::Inconsistent,
+                        reason: format!(
+                            "project uses '{}' prefix for {} \
+                             (not '{}')",
+                            conv_prefix, conv.semantic_role, alt_prefix
+                        ),
+                        suggestion,
+                        matching_convention: Some(conv.clone()),
+                        similar_identifiers: find_similar_identifiers(
+                            identifier,
+                            &id_freq,
+                        ),
+                    };
+                }
+            }
+        }
+
+        // 2. Check if a higher-frequency variant exists in the corpus.
+        // For each subtoken, look for concepts whose canonical matches,
+        // then check if a different identifier form is more popular.
+        let input_freq = id_freq.get(&id_lower).copied().unwrap_or(0);
+
+        // Build a set of "related" identifiers: those sharing subtokens
+        // with the input. Group by the stem concept.
+        let mut related_ids: Vec<(String, usize)> = Vec::new();
+        for concept in self.concepts.values() {
+            // Does this concept share any subtoken with the input?
+            let shares_subtoken = subtokens
+                .contains(&concept.canonical)
+                || concept.subtokens.iter().any(|cst| {
+                    subtokens.iter().any(|st| {
+                        st.contains(cst.as_str())
+                            || cst.contains(st.as_str())
+                    })
+                });
+
+            if !shares_subtoken {
+                continue;
+            }
+
+            // Collect unique identifiers from this concept
+            let mut seen = HashMap::new();
+            for occ in &concept.occurrences {
+                *seen
+                    .entry(occ.identifier.to_lowercase())
+                    .or_insert(0usize) += 1;
+            }
+            for (name, count) in seen {
+                if name != id_lower {
+                    related_ids.push((name, count));
+                }
+            }
+        }
+
+        // Also check canonical names directly as identifiers
+        // (e.g., "ndim" is both a concept canonical and an identifier)
+        for concept in self.concepts.values() {
+            let canon = &concept.canonical;
+            // Check if any subtoken of the input is a substring of the
+            // canonical, or vice versa
+            let is_related = subtokens.iter().any(|st| {
+                canon.contains(st.as_str())
+                    || st.contains(canon.as_str())
+            });
+            if !is_related {
+                continue;
+            }
+            let canon_freq =
+                id_freq.get(canon.as_str()).copied().unwrap_or(0);
+            if canon_freq > 0 && *canon != id_lower {
+                related_ids.push((canon.clone(), canon_freq));
+            }
+        }
+
+        // Deduplicate
+        related_ids.sort_by(|a, b| b.1.cmp(&a.1));
+        related_ids.dedup_by(|a, b| a.0 == b.0);
+
+        // If a related identifier has strictly higher frequency, suggest it
+        if let Some((best_name, best_freq)) = related_ids.first() {
+            if *best_freq > input_freq {
+                return NamingCheckResult {
+                    input: identifier.to_string(),
+                    subtokens,
+                    verdict: Verdict::Inconsistent,
+                    reason: format!(
+                        "'{}' appears {} times vs '{}' appears {} times",
+                        best_name, best_freq, id_lower, input_freq,
+                    ),
+                    suggestion: Some(best_name.clone()),
+                    matching_convention: None,
+                    similar_identifiers: find_similar_identifiers(
+                        identifier,
+                        &id_freq,
+                    ),
+                };
+            }
+        }
+
+        // 3. Check if identifier follows a known convention (consistent)
+        for conv in &self.conventions {
+            let matches = match &conv.pattern {
+                PatternKind::Prefix(p) => id_lower.starts_with(p.as_str()),
+                PatternKind::Suffix(s) => id_lower.ends_with(s.as_str()),
+                PatternKind::Conversion(c) => id_lower.contains(c.as_str()),
+                PatternKind::Compound(c) => id_lower.contains(c.as_str()),
+            };
+            if matches {
+                return NamingCheckResult {
+                    input: identifier.to_string(),
+                    subtokens,
+                    verdict: Verdict::Consistent,
+                    reason: format!(
+                        "follows '{}' convention for {}",
+                        match &conv.pattern {
+                            PatternKind::Prefix(p) => p.as_str(),
+                            PatternKind::Suffix(s) => s,
+                            PatternKind::Conversion(c) => c,
+                            PatternKind::Compound(c) => c,
+                        },
+                        conv.semantic_role,
+                    ),
+                    suggestion: None,
+                    matching_convention: Some(conv.clone()),
+                    similar_identifiers: find_similar_identifiers(
+                        identifier,
+                        &id_freq,
+                    ),
+                };
+            }
+        }
+
+        // 4. If identifier exists in corpus at reasonable frequency, it's OK
+        if input_freq > 0 {
+            return NamingCheckResult {
+                input: identifier.to_string(),
+                subtokens,
+                verdict: Verdict::Consistent,
+                reason: format!(
+                    "found {} occurrences in corpus",
+                    input_freq
+                ),
+                suggestion: None,
+                matching_convention: None,
+                similar_identifiers: find_similar_identifiers(
+                    identifier,
+                    &id_freq,
+                ),
+            };
+        }
+
+        // 5. Unknown — identifier not found, no convention match
+        NamingCheckResult {
+            input: identifier.to_string(),
+            subtokens,
+            verdict: Verdict::Unknown,
+            reason: "identifier not found in corpus and matches no convention"
+                .to_string(),
+            suggestion: None,
+            matching_convention: None,
+            similar_identifiers: find_similar_identifiers(
+                identifier, &id_freq,
+            ),
+        }
     }
 
     /// Suggest an identifier name given a natural language description.
-    pub fn suggest_name(&self, description: &str) -> Vec<NameSuggestion> {
-        todo!()
+    pub fn suggest_name(
+        &self,
+        description: &str,
+    ) -> Vec<NameSuggestion> {
+        let words: Vec<String> = description
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+
+        let mut suggestions = Vec::new();
+
+        // Find matching conventions by semantic role
+        let role_keywords: &[(&str, &str)] = &[
+            ("count", "count"),
+            ("number", "count"),
+            ("boolean", "boolean predicate"),
+            ("flag", "boolean predicate"),
+            ("convert", "conversion"),
+            ("conversion", "conversion"),
+        ];
+
+        let mut matched_convention: Option<&Convention> = None;
+        for word in &words {
+            for &(keyword, role) in role_keywords {
+                if word == keyword {
+                    matched_convention = self.conventions.iter().find(
+                        |c| c.semantic_role == role,
+                    );
+                    break;
+                }
+            }
+            if matched_convention.is_some() {
+                break;
+            }
+        }
+
+        // Find matching concepts by word overlap
+        let matched_concepts: Vec<&Concept> = self
+            .concepts
+            .values()
+            .filter(|c| {
+                words.iter().any(|w| {
+                    c.canonical == *w
+                        || c.occurrences.iter().any(|o| {
+                            o.identifier.to_lowercase().contains(w.as_str())
+                        })
+                })
+            })
+            .collect();
+
+        // Generate suggestions by combining convention prefix with concept
+        if let Some(conv) = matched_convention {
+            if let PatternKind::Prefix(prefix) = &conv.pattern {
+                for concept in &matched_concepts {
+                    let name = format!("{}{}", prefix, concept.canonical);
+                    // Higher confidence if this exact name exists in corpus
+                    let exists = concept
+                        .occurrences
+                        .iter()
+                        .any(|o| o.identifier == name);
+                    let confidence = if exists { 0.9 } else { 0.6 };
+
+                    suggestions.push(NameSuggestion {
+                        name,
+                        confidence,
+                        based_on: conv.examples.clone(),
+                    });
+                }
+            }
+            if let PatternKind::Conversion(sep) = &conv.pattern {
+                // For conversion, look for two concept words
+                if matched_concepts.len() >= 2 {
+                    let name = format!(
+                        "{}{}{}",
+                        matched_concepts[0].canonical,
+                        sep,
+                        matched_concepts[1].canonical,
+                    );
+                    suggestions.push(NameSuggestion {
+                        name,
+                        confidence: 0.5,
+                        based_on: conv.examples.clone(),
+                    });
+                }
+            }
+        }
+
+        // If no convention matched but we have concepts, suggest based on
+        // the most common identifier form for each concept
+        if suggestions.is_empty() {
+            for concept in &matched_concepts {
+                // Find most common identifier for this concept
+                let mut id_counts: HashMap<&str, usize> = HashMap::new();
+                for occ in &concept.occurrences {
+                    *id_counts.entry(&occ.identifier).or_insert(0) += 1;
+                }
+                if let Some((&best, _)) =
+                    id_counts.iter().max_by_key(|(_, &c)| c)
+                {
+                    suggestions.push(NameSuggestion {
+                        name: best.to_string(),
+                        confidence: 0.4,
+                        based_on: vec![format!(
+                            "concept '{}'",
+                            concept.canonical
+                        )],
+                    });
+                }
+            }
+        }
+
+        // Sort by confidence descending, take top 5
+        suggestions
+            .sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        suggestions.truncate(5);
+        suggestions
     }
 
     /// List all detected conventions.
@@ -39,16 +516,173 @@ impl ConceptGraph {
         &self.conventions
     }
 
-    /// List all concepts, ordered by frequency.
+    /// List all concepts, ordered by frequency (descending).
     pub fn list_concepts(&self) -> Vec<&Concept> {
-        todo!()
+        let mut concepts: Vec<&Concept> =
+            self.concepts.values().collect();
+        concepts.sort_by(|a, b| b.occurrences.len().cmp(&a.occurrences.len()));
+        concepts
     }
+}
+
+/// Find identifiers in the corpus similar to the given one.
+fn find_similar_identifiers(
+    identifier: &str,
+    id_freq: &HashMap<String, usize>,
+) -> Vec<(String, usize)> {
+    let id_lower = identifier.to_lowercase();
+    let subtokens = split_identifier(identifier);
+
+    let mut similar: Vec<(String, usize)> = id_freq
+        .iter()
+        .filter(|(name, _)| {
+            if *name == &id_lower {
+                return false;
+            }
+            // Share at least one subtoken
+            let other_subtokens = split_identifier(name);
+            subtokens
+                .iter()
+                .any(|st| other_subtokens.contains(st))
+        })
+        .map(|(name, &count)| (name.clone(), count))
+        .collect();
+
+    similar.sort_by(|a, b| b.1.cmp(&a.1));
+    similar.truncate(10);
+    similar
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::types::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn make_concept(
+        id: u64,
+        canonical: &str,
+        identifiers: &[&str],
+    ) -> Concept {
+        Concept {
+            id,
+            canonical: canonical.to_string(),
+            subtokens: vec![canonical.to_string()],
+            occurrences: identifiers
+                .iter()
+                .map(|name| Occurrence {
+                    file: PathBuf::from("test.py"),
+                    line: 1,
+                    identifier: name.to_string(),
+                    entity_type: EntityType::Function,
+                })
+                .collect(),
+            entity_types: HashSet::from([EntityType::Function]),
+            embedding: None,
+        }
+    }
+
+    fn make_test_graph() -> ConceptGraph {
+        let analysis = AnalysisResult {
+            concepts: vec![
+                make_concept(
+                    1,
+                    "transform",
+                    &[
+                        "spatial_transform",
+                        "apply_transform",
+                        "transform",
+                    ],
+                ),
+                make_concept(2, "spatial", &["spatial_transform"]),
+                make_concept(3, "ndim", &["ndim", "ndim", "ndim"]),
+                make_concept(
+                    4,
+                    "nb",
+                    &[
+                        "nb_features",
+                        "nb_bins",
+                        "nb_steps",
+                        "nb_dims",
+                    ],
+                ),
+                make_concept(
+                    5,
+                    "features",
+                    &["nb_features", "features"],
+                ),
+            ],
+            conventions: vec![Convention {
+                pattern: PatternKind::Prefix("nb_".to_string()),
+                entity_type: EntityType::Parameter,
+                semantic_role: "count".to_string(),
+                examples: vec![
+                    "nb_features".into(),
+                    "nb_bins".into(),
+                    "nb_steps".into(),
+                    "nb_dims".into(),
+                ],
+                frequency: 4,
+            }],
+            co_occurrence_matrix: vec![((1, 2), 1.0)],
+        };
+        ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap()
+    }
+
     #[test]
-    fn test_placeholder() {
-        // Will be replaced with real tests
+    fn test_query_concept_exact() {
+        let graph = make_test_graph();
+        let result = graph.query_concept("transform");
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert!(result
+            .variants
+            .contains(&"spatial_transform".to_string()));
+        assert!(
+            result.variants.contains(&"apply_transform".to_string())
+        );
+    }
+
+    #[test]
+    fn test_check_naming_consistent() {
+        let graph = make_test_graph();
+        let result = graph.check_naming("nb_features");
+        // nb_features follows the nb_ convention -> Consistent
+        assert_eq!(result.verdict, Verdict::Consistent);
+    }
+
+    #[test]
+    fn test_check_naming_inconsistent() {
+        let graph = make_test_graph();
+        let result = graph.check_naming("n_dims");
+        assert_eq!(result.verdict, Verdict::Inconsistent);
+        // Should suggest ndim or nb_dims
+        assert!(result.suggestion.is_some());
+    }
+
+    #[test]
+    fn test_list_concepts_sorted() {
+        let graph = make_test_graph();
+        let concepts = graph.list_concepts();
+        assert!(!concepts.is_empty());
+        // Should be sorted by occurrence count descending
+        for i in 1..concepts.len() {
+            assert!(
+                concepts[i - 1].occurrences.len()
+                    >= concepts[i].occurrences.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_suggest_name_count() {
+        let graph = make_test_graph();
+        let suggestions = graph.suggest_name("count of features");
+        assert!(!suggestions.is_empty());
+        // Should suggest nb_features
+        assert!(suggestions
+            .iter()
+            .any(|s| s.name.contains("nb_features")));
     }
 }
