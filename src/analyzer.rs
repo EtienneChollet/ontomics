@@ -114,22 +114,21 @@ fn compute_tfidf(corpus: &Corpus) -> HashMap<String, f64> {
     scores
 }
 
-const MIN_OCCURRENCES: usize = 2;
-const TFIDF_THRESHOLD: f64 = 0.1;
-
 fn build_concepts(
     corpus: &Corpus,
     tfidf_scores: &HashMap<String, f64>,
+    min_frequency: usize,
+    tfidf_threshold: f64,
 ) -> Vec<Concept> {
     let mut concepts = Vec::new();
 
     for (subtoken, total_count) in &corpus.subtoken_total_counts {
-        if *total_count < MIN_OCCURRENCES {
+        if *total_count < min_frequency {
             continue;
         }
 
         let score = tfidf_scores.get(subtoken).copied().unwrap_or(0.0);
-        if score < TFIDF_THRESHOLD {
+        if score < tfidf_threshold {
             continue;
         }
 
@@ -162,23 +161,34 @@ fn build_concepts(
 }
 
 /// Detect naming conventions (prefix, suffix, conversion patterns).
-fn detect_conventions(parse_results: &[ParseResult]) -> Vec<Convention> {
+fn detect_conventions(
+    parse_results: &[ParseResult],
+    convention_threshold: usize,
+) -> Vec<Convention> {
     let all_identifiers: Vec<&RawIdentifier> = parse_results
         .iter()
         .flat_map(|pr| pr.identifiers.iter())
         .collect();
 
     let mut conventions = Vec::new();
-    conventions.extend(detect_prefix_conventions(&all_identifiers));
-    conventions.extend(detect_suffix_conventions(&all_identifiers));
-    conventions.extend(detect_conversion_conventions(&all_identifiers));
+    conventions.extend(detect_prefix_conventions(
+        &all_identifiers,
+        convention_threshold,
+    ));
+    conventions.extend(detect_suffix_conventions(
+        &all_identifiers,
+        convention_threshold,
+    ));
+    conventions.extend(detect_conversion_conventions(
+        &all_identifiers,
+        convention_threshold,
+    ));
     conventions
 }
 
-const CONVENTION_THRESHOLD: usize = 3;
-
 fn detect_prefix_conventions(
     identifiers: &[&RawIdentifier],
+    convention_threshold: usize,
 ) -> Vec<Convention> {
     let prefix_roles: &[(&str, &str)] = &[
         ("nb_", "count"),
@@ -197,7 +207,7 @@ fn detect_prefix_conventions(
             .copied()
             .collect();
 
-        if matching.len() < CONVENTION_THRESHOLD {
+        if matching.len() < convention_threshold {
             continue;
         }
 
@@ -219,6 +229,7 @@ fn detect_prefix_conventions(
 
 fn detect_suffix_conventions(
     identifiers: &[&RawIdentifier],
+    convention_threshold: usize,
 ) -> Vec<Convention> {
     let suffix_roles: &[(&str, &str)] = &[
         ("_count", "count"),
@@ -241,7 +252,7 @@ fn detect_suffix_conventions(
             .copied()
             .collect();
 
-        if matching.len() < CONVENTION_THRESHOLD {
+        if matching.len() < convention_threshold {
             continue;
         }
 
@@ -263,6 +274,7 @@ fn detect_suffix_conventions(
 
 fn detect_conversion_conventions(
     identifiers: &[&RawIdentifier],
+    convention_threshold: usize,
 ) -> Vec<Convention> {
     let matching: Vec<&RawIdentifier> = identifiers
         .iter()
@@ -274,7 +286,7 @@ fn detect_conversion_conventions(
         .copied()
         .collect();
 
-    if matching.len() < CONVENTION_THRESHOLD {
+    if matching.len() < convention_threshold {
         return Vec::new();
     }
 
@@ -347,6 +359,23 @@ fn build_co_occurrence(
     co_counts.into_iter().collect()
 }
 
+/// Thresholds for the analysis pipeline, sourced from config.
+pub struct AnalysisParams {
+    pub min_frequency: usize,
+    pub tfidf_threshold: f64,
+    pub convention_threshold: usize,
+}
+
+impl Default for AnalysisParams {
+    fn default() -> Self {
+        Self {
+            min_frequency: 2,
+            tfidf_threshold: 0.1,
+            convention_threshold: 3,
+        }
+    }
+}
+
 /// Run full analysis pipeline on parsed identifiers.
 ///
 /// 1. Aggregate subtokens across all files
@@ -354,11 +383,20 @@ fn build_co_occurrence(
 /// 3. Build concepts from high-TF-IDF subtokens
 /// 4. Detect prefix/suffix/conversion naming conventions
 /// 5. Build co-occurrence weights from shared identifiers
-pub fn analyze(parse_results: &[ParseResult]) -> Result<AnalysisResult> {
+pub fn analyze(
+    parse_results: &[ParseResult],
+    params: &AnalysisParams,
+) -> Result<AnalysisResult> {
     let corpus = build_corpus(parse_results);
     let tfidf_scores = compute_tfidf(&corpus);
-    let concepts = build_concepts(&corpus, &tfidf_scores);
-    let conventions = detect_conventions(parse_results);
+    let concepts = build_concepts(
+        &corpus,
+        &tfidf_scores,
+        params.min_frequency,
+        params.tfidf_threshold,
+    );
+    let conventions =
+        detect_conventions(parse_results, params.convention_threshold);
     let co_occurrence_matrix =
         build_co_occurrence(&concepts, parse_results);
 
@@ -403,7 +441,7 @@ mod tests {
             ("apply_transform", EntityType::Function),
             ("transform_layer", EntityType::Class),
         ]);
-        let result = analyze(&[pr]).unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(
             result.concepts.iter().any(|c| c.canonical == "transform")
         );
@@ -417,7 +455,7 @@ mod tests {
             ("nb_steps", EntityType::Parameter),
             ("nb_dims", EntityType::Parameter),
         ]);
-        let result = analyze(&[pr]).unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(result.conventions.iter().any(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "nb_")
         }));
@@ -430,7 +468,7 @@ mod tests {
             ("params_to_affine", EntityType::Function),
             ("seg_to_mask", EntityType::Function),
         ]);
-        let result = analyze(&[pr]).unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(result.conventions.iter().any(|c| {
             matches!(&c.pattern, PatternKind::Conversion(p) if p == "_to_")
         }));
@@ -442,7 +480,7 @@ mod tests {
             ("nb_features", EntityType::Parameter),
             ("nb_bins", EntityType::Parameter),
         ]);
-        let result = analyze(&[pr]).unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(!result.conventions.iter().any(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "nb_")
         }));
@@ -456,7 +494,7 @@ mod tests {
             ("spatial_transform", EntityType::Function),
             ("apply_transform", EntityType::Function),
         ]);
-        let result = analyze(&[pr]).unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(
             !result.concepts.iter().any(|c| c.canonical == "unique")
         );
@@ -473,7 +511,7 @@ mod tests {
             ("spatial_transform", EntityType::Function),
             ("apply_transform", EntityType::Function),
         ]);
-        let result = analyze(&[pr]).unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
 
         let spatial = result
             .concepts
@@ -501,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let result = analyze(&[]).unwrap();
+        let result = analyze(&[], &AnalysisParams::default()).unwrap();
         assert!(result.concepts.is_empty());
         assert!(result.conventions.is_empty());
         assert!(result.co_occurrence_matrix.is_empty());
