@@ -115,11 +115,40 @@ pub struct AnalysisResult {
 
 // --- Query result types ---
 
+/// Lightweight summary of a related concept (avoids serializing full
+/// occurrence lists for every neighbor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelatedConcept {
+    pub canonical: String,
+    pub kind: RelationshipKind,
+    pub weight: f32,
+    pub occurrences: usize,
+}
+
+/// Optional limits for `query_concept` responses.
+pub struct QueryConceptParams {
+    pub max_related: usize,
+    pub max_occurrences: usize,
+    pub max_variants: usize,
+    pub max_signatures: usize,
+}
+
+impl Default for QueryConceptParams {
+    fn default() -> Self {
+        Self {
+            max_related: 10,
+            max_occurrences: 5,
+            max_variants: 20,
+            max_signatures: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConceptQueryResult {
     pub concept: Concept,
     pub variants: Vec<String>,
-    pub related: Vec<(Concept, RelationshipKind, f32)>,
+    pub related: Vec<RelatedConcept>,
     pub conventions: Vec<Convention>,
     pub top_occurrences: Vec<Occurrence>,
     pub signatures: Vec<Signature>,

@@ -3,8 +3,9 @@ use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::types::{
     AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
     Convention, DescribeSymbolResult, LocateConceptResult, NameSuggestion,
-    NamingCheckResult, PatternKind, Relationship, RelationshipKind,
-    SessionBriefing, Signature, Subconcept, SymbolKind, Verdict,
+    NamingCheckResult, PatternKind, QueryConceptParams, RelatedConcept,
+    Relationship, RelationshipKind, SessionBriefing, Signature, Subconcept,
+    SymbolKind, Verdict,
 };
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -64,7 +65,11 @@ impl ConceptGraph {
     }
 
     /// Look up a concept by name (exact or fuzzy match via embeddings).
-    pub fn query_concept(&self, term: &str) -> Option<ConceptQueryResult> {
+    pub fn query_concept(
+        &self,
+        term: &str,
+        params: &QueryConceptParams,
+    ) -> Option<ConceptQueryResult> {
         let term_lower = term.to_lowercase();
         let subtokens = split_identifier(term);
 
@@ -170,25 +175,40 @@ impl ConceptGraph {
 
         variants.sort();
         variants.dedup();
+        variants.truncate(params.max_variants);
 
-        // Related concepts via relationships
-        let related: Vec<(Concept, RelationshipKind, f32)> = self
+        // Related concepts via relationships (lightweight summaries)
+        let mut related: Vec<RelatedConcept> = self
             .relationships
             .iter()
             .filter_map(|rel| {
-                if rel.source == concept.id {
-                    self.concepts
-                        .get(&rel.target)
-                        .map(|c| (c.clone(), rel.kind.clone(), rel.weight))
+                let other_id = if rel.source == concept.id {
+                    Some(rel.target)
                 } else if rel.target == concept.id {
-                    self.concepts
-                        .get(&rel.source)
-                        .map(|c| (c.clone(), rel.kind.clone(), rel.weight))
+                    Some(rel.source)
                 } else {
                     None
-                }
+                }?;
+                let other = self.concepts.get(&other_id)?;
+                Some(RelatedConcept {
+                    canonical: other.canonical.clone(),
+                    kind: rel.kind.clone(),
+                    weight: rel.weight,
+                    occurrences: other.occurrences.len(),
+                })
             })
             .collect();
+        // Contrastive first, then by weight descending
+        related.sort_by(|a, b| {
+            let a_contrastive =
+                a.kind == RelationshipKind::Contrastive;
+            let b_contrastive =
+                b.kind == RelationshipKind::Contrastive;
+            b_contrastive
+                .cmp(&a_contrastive)
+                .then(b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        related.truncate(params.max_related);
 
         // Conventions that match any of this concept's identifiers
         let concept_identifiers: Vec<String> = concept
@@ -210,12 +230,12 @@ impl ConceptGraph {
         let top_occurrences: Vec<_> = concept
             .occurrences
             .iter()
-            .take(10)
+            .take(params.max_occurrences)
             .cloned()
             .collect();
 
         // L2: filter signatures matching this concept
-        let matching_signatures: Vec<Signature> = self
+        let mut matching_signatures: Vec<Signature> = self
             .signatures
             .iter()
             .filter(|sig| {
@@ -227,6 +247,7 @@ impl ConceptGraph {
             })
             .cloned()
             .collect();
+        matching_signatures.truncate(params.max_signatures);
 
         // L2: filter classes matching this concept
         let matching_classes: Vec<ClassInfo> = self
@@ -1470,7 +1491,8 @@ mod tests {
     #[test]
     fn test_query_concept_exact() {
         let graph = make_test_graph();
-        let result = graph.query_concept("transform");
+        let result =
+            graph.query_concept("transform", &QueryConceptParams::default());
         assert!(result.is_some());
         let result = result.unwrap();
         assert!(result

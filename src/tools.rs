@@ -31,13 +31,39 @@ impl SemexServer {
     }
 
     fn handle_query_concept(&self, args: &Value) -> Result<Value, String> {
+        use crate::types::QueryConceptParams;
+
         let term = args
             .get("term")
             .and_then(|v| v.as_str())
             .ok_or("missing required argument 'term'")?;
 
+        let defaults = QueryConceptParams::default();
+        let params = QueryConceptParams {
+            max_related: args
+                .get("max_related")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_related),
+            max_occurrences: args
+                .get("max_occurrences")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_occurrences),
+            max_variants: args
+                .get("max_variants")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_variants),
+            max_signatures: args
+                .get("max_signatures")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_signatures),
+        };
+
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
-        match graph.query_concept(term) {
+        match graph.query_concept(term, &params) {
             Some(result) => serde_json::to_value(result)
                 .map_err(|e| format!("serialization error: {e}")),
             None => Ok(json!({
@@ -177,12 +203,28 @@ fn tool_definitions() -> Vec<Tool> {
         Tool::new(
             "query_concept",
             "Look up a domain concept by name. Returns the concept, its variants, \
-             related concepts, matching conventions, and top occurrences.",
+             related concepts, matching conventions, signatures, and top occurrences.",
             tool_schema(
                 json!({
                     "term": {
                         "type": "string",
                         "description": "The concept term to look up (e.g. 'transform')",
+                    },
+                    "max_related": {
+                        "type": "integer",
+                        "description": "Max related concepts to return (default: 10)",
+                    },
+                    "max_occurrences": {
+                        "type": "integer",
+                        "description": "Max occurrence locations to return (default: 5)",
+                    },
+                    "max_variants": {
+                        "type": "integer",
+                        "description": "Max variant identifiers to return (default: 20)",
+                    },
+                    "max_signatures": {
+                        "type": "integer",
+                        "description": "Max function signatures to return (default: 5)",
                     }
                 }),
                 &["term"],
