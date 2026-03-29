@@ -30,6 +30,17 @@ pub struct Concept {
     pub occurrences: Vec<Occurrence>,
     pub entity_types: HashSet<EntityType>,
     pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub subconcepts: Vec<Subconcept>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subconcept {
+    pub qualifier: String,
+    pub canonical: String,
+    pub occurrences: Vec<Occurrence>,
+    pub identifiers: Vec<String>,
+    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +57,7 @@ pub enum RelationshipKind {
     SimilarTo,
     AbbreviationOf,
     SharedPattern,
+    Contrastive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +125,8 @@ pub struct ConceptQueryResult {
     pub signatures: Vec<Signature>,
     pub classes: Vec<ClassInfo>,
     pub call_graph: Vec<(String, String)>,
+    #[serde(default)]
+    pub subconcepts: Vec<Subconcept>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +152,26 @@ pub struct NameSuggestion {
     pub name: String,
     pub confidence: f32,
     pub based_on: Vec<String>,
+}
+
+// --- Locate and briefing result types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocateConceptResult {
+    pub concept: String,
+    pub exemplar_signatures: Vec<Signature>,
+    pub exemplar_classes: Vec<ClassInfo>,
+    pub files: Vec<(PathBuf, usize)>,
+    pub contrastive_concepts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBriefing {
+    pub conventions: Vec<Convention>,
+    pub abbreviations: Vec<(String, String)>,
+    pub top_concepts: Vec<(String, usize)>,
+    pub contrastive_pairs: Vec<(String, String)>,
+    pub vocabulary_warnings: Vec<String>,
 }
 
 // --- L2: Structural types ---

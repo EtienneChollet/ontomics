@@ -8,6 +8,24 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     pub embeddings: EmbeddingsConfig,
     pub cache: CacheConfig,
+    /// Bootstrap conventions to seed detection (optional).
+    #[serde(default)]
+    pub conventions: Vec<ConventionConfig>,
+}
+
+/// A convention entry in the config file, matching the TOML `[[conventions]]`
+/// array format from the spec.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConventionConfig {
+    /// Pattern type: "prefix", "suffix", "compound", or "conversion".
+    pub pattern: String,
+    /// The pattern value (e.g., "nb_", "_count", "_to_").
+    pub value: String,
+    /// Semantic role (e.g., "count", "boolean predicate").
+    pub role: String,
+    /// Entity types this convention applies to.
+    #[serde(default)]
+    pub entity_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +183,30 @@ convention_threshold = 7
         // Defaults preserved
         assert_eq!(config.index.min_frequency, 2);
         assert!(config.embeddings.enabled);
+    }
+
+    #[test]
+    fn test_conventions_config() {
+        let toml_str = r#"
+[[conventions]]
+pattern = "prefix"
+value = "nb_"
+role = "count"
+entity_types = ["Parameter", "Variable"]
+
+[[conventions]]
+pattern = "conversion"
+value = "_to_"
+role = "type/format conversion"
+entity_types = ["Function"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.conventions.len(), 2);
+        assert_eq!(config.conventions[0].pattern, "prefix");
+        assert_eq!(config.conventions[0].value, "nb_");
+        assert_eq!(config.conventions[0].role, "count");
+        assert_eq!(config.conventions[1].pattern, "conversion");
+        assert_eq!(config.conventions[1].value, "_to_");
     }
 
     #[test]

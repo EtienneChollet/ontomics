@@ -3,22 +3,27 @@ use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub struct EmbeddingIndex {
     model: Option<TextEmbedding>,
     vectors: HashMap<u64, Vec<f32>>,
+    cache_dir: Option<PathBuf>,
 }
 
 impl EmbeddingIndex {
     /// Initialize embedding index with the BGE-small model.
-    pub fn new() -> Result<Self> {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallENV15)
-                .with_show_download_progress(true),
-        )?;
+    pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
+        let mut opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_show_download_progress(true);
+        if let Some(ref dir) = cache_dir {
+            opts = opts.with_cache_dir(dir.clone());
+        }
+        let model = TextEmbedding::try_new(opts)?;
         Ok(Self {
             model: Some(model),
             vectors: HashMap::new(),
+            cache_dir,
         })
     }
 
@@ -27,7 +32,25 @@ impl EmbeddingIndex {
         Self {
             model: None,
             vectors: HashMap::new(),
+            cache_dir: None,
         }
+    }
+
+    /// Load the embedding model into an index that was deserialized from
+    /// cache (which has vectors but no model). Needed for runtime queries
+    /// like embed_text.
+    pub fn load_model(&mut self) -> Result<()> {
+        if self.model.is_some() {
+            return Ok(());
+        }
+        let mut opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_show_download_progress(true);
+        if let Some(ref dir) = self.cache_dir {
+            opts = opts.with_cache_dir(dir.clone());
+        }
+        let model = TextEmbedding::try_new(opts)?;
+        self.model = Some(model);
+        Ok(())
     }
 
     /// Embed a concept using its canonical name + subtokens + example identifiers.
@@ -79,61 +102,23 @@ impl EmbeddingIndex {
         scored
     }
 
-    /// Cluster all concepts into groups by similarity threshold.
-    ///
-    /// Uses union-find for single-linkage clustering: any pair with
-    /// cosine similarity > threshold gets merged into the same cluster.
-    pub fn cluster(&self, threshold: f32) -> Vec<Vec<u64>> {
-        let ids: Vec<u64> = self.vectors.keys().copied().collect();
-        if ids.is_empty() {
-            return Vec::new();
-        }
-
-        // Map concept IDs to contiguous indices for union-find
-        let id_to_idx: HashMap<u64, usize> =
-            ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-        let mut parent: Vec<usize> = (0..ids.len()).collect();
-
-        // Union-find helpers
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]]; // path compression
-                x = parent[x];
-            }
-            x
-        }
-        fn union(parent: &mut [usize], a: usize, b: usize) {
-            let ra = find(parent, a);
-            let rb = find(parent, b);
-            if ra != rb {
-                parent[ra] = rb;
-            }
-        }
-
-        // Merge pairs above threshold
-        for (i, &id_a) in ids.iter().enumerate() {
-            let vec_a = &self.vectors[&id_a];
-            for &id_b in &ids[i + 1..] {
-                let vec_b = &self.vectors[&id_b];
-                if cosine_similarity(vec_a, vec_b) > threshold {
-                    union(&mut parent, id_to_idx[&id_a], id_to_idx[&id_b]);
-                }
-            }
-        }
-
-        // Group by root
-        let mut clusters: HashMap<usize, Vec<u64>> = HashMap::new();
-        for (i, &id) in ids.iter().enumerate() {
-            let root = find(&mut parent, i);
-            clusters.entry(root).or_default().push(id);
-        }
-
-        clusters.into_values().collect()
+    /// Embed arbitrary text. Returns None if no model is loaded.
+    pub fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
+        let model = self.model.as_ref()?;
+        model
+            .embed(vec![text.to_string()], None)
+            .ok()
+            .and_then(|vecs| vecs.into_iter().next())
     }
 
     /// Look up a stored embedding vector by concept ID.
     pub fn get_vector(&self, concept_id: u64) -> Option<&Vec<f32>> {
         self.vectors.get(&concept_id)
+    }
+
+    /// Set the model cache directory (used after deserialization from cache).
+    pub fn set_cache_dir(&mut self, dir: PathBuf) {
+        self.cache_dir = Some(dir);
     }
 }
 
@@ -149,6 +134,7 @@ impl<'de> Deserialize<'de> for EmbeddingIndex {
         Ok(Self {
             model: None,
             vectors,
+            cache_dir: None,
         })
     }
 }
@@ -221,34 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_basic() {
-        let mut index = EmbeddingIndex::empty();
-        // Two similar vectors, one different
-        index.vectors.insert(1, vec![1.0, 0.0]);
-        index.vectors.insert(2, vec![0.95, 0.05]);
-        index.vectors.insert(3, vec![0.0, 1.0]);
-
-        let clusters = index.cluster(0.9);
-        // Concepts 1 and 2 should cluster together, 3 separate
-        assert!(clusters.len() >= 2);
-
-        // Find which cluster has concept 3
-        let cluster_with_3 = clusters.iter().find(|c| c.contains(&3)).unwrap();
-        assert_eq!(cluster_with_3.len(), 1);
-
-        // Concepts 1 and 2 should share a cluster
-        let cluster_with_1 = clusters.iter().find(|c| c.contains(&1)).unwrap();
-        assert!(cluster_with_1.contains(&2));
-    }
-
-    #[test]
-    fn test_cluster_empty() {
-        let index = EmbeddingIndex::empty();
-        let clusters = index.cluster(0.9);
-        assert!(clusters.is_empty());
-    }
-
-    #[test]
     fn test_get_vector() {
         let mut index = EmbeddingIndex::empty();
         assert!(index.get_vector(1).is_none());
@@ -277,6 +235,7 @@ mod tests {
             }],
             entity_types: HashSet::from([EntityType::Function]),
             embedding: None,
+            subconcepts: Vec::new(),
         };
 
         let result = index.embed_concept(&concept);

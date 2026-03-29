@@ -63,6 +63,13 @@ enum Command {
         /// Function or class name
         name: String,
     },
+    /// Find the best entry points for working with a concept
+    Locate {
+        /// Concept to locate (e.g. "transform")
+        term: String,
+    },
+    /// Print session briefing (conventions, abbreviations, warnings)
+    Briefing,
 }
 
 /// Build or load the concept graph from cache.
@@ -209,6 +216,14 @@ fn build_graph(
             .add_similarity_edges(config.embeddings.similarity_threshold);
     }
 
+    // Contrastive edges (must run AFTER similarity edges)
+    graph.add_contrastive_edges();
+    eprintln!("Detected contrastive pairs");
+
+    // Subconcept detection (must run AFTER embeddings and co-occurrence)
+    graph.detect_subconcepts();
+    eprintln!("Detected subconcepts");
+
     if let Err(e) = cache.save(&graph) {
         eprintln!("Warning: failed to cache index: {e}");
     } else {
@@ -239,6 +254,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Concepts { top_k } => cmd_concepts(&graph, top_k),
         Command::Conventions => cmd_conventions(&graph),
         Command::Describe { name } => cmd_describe(&graph, &name),
+        Command::Locate { term } => cmd_locate(&graph, &term),
+        Command::Briefing => cmd_briefing(&graph),
     }
 }
 
@@ -319,6 +336,26 @@ fn cmd_describe(
             std::process::exit(1);
         }
     }
+    Ok(())
+}
+
+fn cmd_locate(
+    graph: &graph::ConceptGraph,
+    term: &str,
+) -> anyhow::Result<()> {
+    match graph.locate_concept(term) {
+        Some(result) => print_json(&result),
+        None => {
+            eprintln!("No concept matching '{term}'");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_briefing(graph: &graph::ConceptGraph) -> anyhow::Result<()> {
+    let briefing = graph.session_briefing();
+    print_json(&briefing);
     Ok(())
 }
 

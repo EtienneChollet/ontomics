@@ -154,6 +154,7 @@ mod tests {
                 occurrences: vec![],
                 entity_types: HashSet::new(),
                 embedding: None,
+                subconcepts: Vec::new(),
             },
         );
         ConceptGraph {
