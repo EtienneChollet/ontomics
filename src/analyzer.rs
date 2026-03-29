@@ -154,6 +154,7 @@ fn build_concepts(
             occurrences,
             entity_types,
             embedding: None,
+            subconcepts: Vec::new(),
         });
     }
 

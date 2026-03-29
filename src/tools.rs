@@ -3,7 +3,9 @@ use crate::graph::ConceptGraph;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, Implementation, InitializeResult,
-    ListToolsResult, PaginatedRequestParam, ServerCapabilities, Tool, ToolsCapability,
+    ListToolsResult, PaginatedRequestParam, RawResource, ReadResourceRequestParam,
+    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, Tool,
+    ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{json, Value};
@@ -130,6 +132,23 @@ impl SemexServer {
         }
     }
 
+    fn handle_locate_concept(&self, args: &Value) -> Result<Value, String> {
+        let term = args
+            .get("term")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required argument 'term'")?;
+
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        match graph.locate_concept(term) {
+            Some(result) => serde_json::to_value(result)
+                .map_err(|e| format!("serialization error: {e}")),
+            None => Ok(json!({
+                "error": "not_found",
+                "message": format!("no concept matching '{term}'"),
+            })),
+        }
+    }
+
     fn handle_list_conventions(&self, _args: &Value) -> Result<Value, String> {
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let conventions = graph.list_conventions();
@@ -246,6 +265,21 @@ fn tool_definitions() -> Vec<Tool> {
                 &["name"],
             ),
         ),
+        Tool::new(
+            "locate_concept",
+            "Find the best entry points for working with a domain concept. \
+             Returns exemplar signatures, key classes, and files ranked by \
+             concept density. Also flags contrastive concepts.",
+            tool_schema(
+                json!({
+                    "term": {
+                        "type": "string",
+                        "description": "Concept to locate (e.g. 'transform')",
+                    }
+                }),
+                &["term"],
+            ),
+        ),
     ]
 }
 
@@ -257,6 +291,7 @@ impl ServerHandler for SemexServer {
                 .enable_tools_with(ToolsCapability {
                     list_changed: Some(false),
                 })
+                .enable_resources()
                 .build(),
             server_info: Implementation {
                 name: "semex".to_string(),
@@ -306,6 +341,7 @@ impl ServerHandler for SemexServer {
             "list_concepts" => self.handle_list_concepts(&args),
             "list_conventions" => self.handle_list_conventions(&args),
             "describe_symbol" => self.handle_describe_symbol(&args),
+            "locate_concept" => self.handle_locate_concept(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -315,6 +351,67 @@ impl ServerHandler for SemexServer {
             ]),
             Err(msg) => CallToolResult::error(vec![Content::text(msg)]),
         }))
+    }
+
+    fn list_resources(
+        &self,
+        _request: PaginatedRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListResourcesResult, rmcp::Error>>
+           + Send
+           + '_ {
+        let resource = Resource::new(
+            RawResource {
+                uri: "semex://briefing".to_string(),
+                name: "Session Briefing".to_string(),
+                description: Some(
+                    "Project conventions, abbreviations, top concepts, \
+                     contrastive pairs, and vocabulary warnings."
+                        .to_string(),
+                ),
+                mime_type: Some("application/json".to_string()),
+                size: None,
+            },
+            None,
+        );
+        std::future::ready(Ok(rmcp::model::ListResourcesResult {
+            resources: vec![resource],
+            next_cursor: None,
+        }))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::Error>>
+           + Send
+           + '_ {
+        let result = if request.uri == "semex://briefing" {
+            match self.graph.read() {
+                Ok(graph) => {
+                    let briefing = graph.session_briefing();
+                    let json = serde_json::to_string_pretty(&briefing)
+                        .unwrap_or_default();
+                    Ok(ReadResourceResult {
+                        contents: vec![ResourceContents::text(
+                            json,
+                            "semex://briefing",
+                        )],
+                    })
+                }
+                Err(e) => Err(rmcp::Error::internal_error(
+                    format!("lock error: {e}"),
+                    None,
+                )),
+            }
+        } else {
+            Err(rmcp::Error::resource_not_found(
+                "resource not found",
+                Some(json!({"uri": request.uri})),
+            ))
+        };
+        std::future::ready(result)
     }
 }
 
@@ -347,6 +444,7 @@ mod tests {
                 .collect(),
             entity_types: HashSet::from([EntityType::Function]),
             embedding: None,
+            subconcepts: Vec::new(),
         }
     }
 
@@ -455,7 +553,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]

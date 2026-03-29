@@ -2,12 +2,12 @@ use crate::embeddings::EmbeddingIndex;
 use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::types::{
     AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
-    Convention, DescribeSymbolResult, NameSuggestion, NamingCheckResult,
-    PatternKind, Relationship, RelationshipKind, Signature, SymbolKind,
-    Verdict,
+    Convention, DescribeSymbolResult, LocateConceptResult, NameSuggestion,
+    NamingCheckResult, PatternKind, Relationship, RelationshipKind,
+    SessionBriefing, Signature, Subconcept, SymbolKind, Verdict,
 };
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -277,6 +277,7 @@ impl ConceptGraph {
             signatures: matching_signatures,
             classes: matching_classes,
             call_graph,
+            subconcepts: concept.subconcepts.clone(),
         })
     }
 
@@ -768,6 +769,593 @@ impl ConceptGraph {
             concepts,
         })
     }
+
+    /// Detect contrastive concept pairs and add Contrastive edges.
+    /// Must run AFTER add_similarity_edges. Suppresses conflicting
+    /// SimilarTo edges.
+    pub fn add_contrastive_edges(&mut self) {
+        const KNOWN_PAIRS: &[(&str, &str)] = &[
+            ("source", "target"),
+            ("src", "trg"),
+            ("input", "output"),
+            ("pred", "true"),
+            ("before", "after"),
+            ("left", "right"),
+            ("fixed", "moving"),
+            ("old", "new"),
+            ("expected", "actual"),
+            ("query", "key"),
+        ];
+
+        let concept_ids: HashMap<&str, u64> = self
+            .concepts
+            .values()
+            .map(|c| (c.canonical.as_str(), c.id))
+            .collect();
+
+        let mut pair_scores: HashMap<(u64, u64), i32> = HashMap::new();
+
+        // Signal 1: param co-occurrence — concepts appearing as separate
+        // params in the same signature
+        let mut param_co: HashMap<(u64, u64), usize> = HashMap::new();
+        for sig in &self.signatures {
+            let mut param_concepts: Vec<u64> = Vec::new();
+            for param in &sig.params {
+                let subtokens = split_identifier(&param.name);
+                for st in &subtokens {
+                    if let Some(&cid) = concept_ids.get(st.as_str()) {
+                        if !param_concepts.contains(&cid) {
+                            param_concepts.push(cid);
+                        }
+                    }
+                }
+            }
+            for i in 0..param_concepts.len() {
+                for j in (i + 1)..param_concepts.len() {
+                    let pair = if param_concepts[i] < param_concepts[j] {
+                        (param_concepts[i], param_concepts[j])
+                    } else {
+                        (param_concepts[j], param_concepts[i])
+                    };
+                    *param_co.entry(pair).or_insert(0) += 1;
+                }
+            }
+        }
+        for (pair, count) in &param_co {
+            if *count >= 2 {
+                *pair_scores.entry(*pair).or_insert(0) += 3;
+            }
+        }
+
+        // Signal 3: known patterns
+        for &(a, b) in KNOWN_PAIRS {
+            if let (Some(&id_a), Some(&id_b)) =
+                (concept_ids.get(a), concept_ids.get(b))
+            {
+                let pair = if id_a < id_b {
+                    (id_a, id_b)
+                } else {
+                    (id_b, id_a)
+                };
+                *pair_scores.entry(pair).or_insert(0) += 3;
+            }
+        }
+
+        // Add contrastive edges for pairs scoring >= 3
+        let mut contrastive_pairs: Vec<(u64, u64)> = Vec::new();
+        for (&pair, &score) in &pair_scores {
+            if score >= 3 {
+                // Check no AbbreviationOf edge between them
+                let has_abbrev = self.relationships.iter().any(|r| {
+                    r.kind == RelationshipKind::AbbreviationOf
+                        && ((r.source == pair.0 && r.target == pair.1)
+                            || (r.source == pair.1 && r.target == pair.0))
+                });
+                if !has_abbrev {
+                    contrastive_pairs.push(pair);
+                }
+            }
+        }
+
+        // Suppress SimilarTo edges and add Contrastive edges
+        for &(a, b) in &contrastive_pairs {
+            self.relationships.retain(|r| {
+                !(r.kind == RelationshipKind::SimilarTo
+                    && ((r.source == a && r.target == b)
+                        || (r.source == b && r.target == a)))
+            });
+            self.relationships.push(Relationship {
+                source: a,
+                target: b,
+                kind: RelationshipKind::Contrastive,
+                weight: 1.0,
+            });
+        }
+    }
+
+    /// Detect subconcepts for polysemous high-frequency concepts.
+    /// Must run AFTER embeddings and co-occurrence are built.
+    pub fn detect_subconcepts(&mut self) {
+        let concept_ids: Vec<u64> =
+            self.concepts.keys().copied().collect();
+
+        for cid in concept_ids {
+            let concept = match self.concepts.get(&cid) {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            if concept.occurrences.len() < 6 {
+                continue;
+            }
+
+            let mut unique_ids: Vec<String> = concept
+                .occurrences
+                .iter()
+                .map(|o| o.identifier.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            unique_ids.sort();
+
+            if unique_ids.len() < 4 {
+                continue;
+            }
+
+            // Build affinity matrix using scope co-occurrence +
+            // embedding similarity
+            let n = unique_ids.len();
+            let mut affinity = vec![vec![0.0f32; n]; n];
+
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let mut aff = 0.0f32;
+
+                    // Signal 1: scope co-occurrence (weight 0.3)
+                    let scopes_i: HashSet<&str> = concept
+                        .occurrences
+                        .iter()
+                        .filter(|o| o.identifier == unique_ids[i])
+                        .filter_map(|o| {
+                            o.file.to_str()
+                        })
+                        .collect();
+                    let scopes_j: HashSet<&str> = concept
+                        .occurrences
+                        .iter()
+                        .filter(|o| o.identifier == unique_ids[j])
+                        .filter_map(|o| {
+                            o.file.to_str()
+                        })
+                        .collect();
+                    let shared = scopes_i.intersection(&scopes_j).count();
+                    if shared > 0 {
+                        aff += 0.3
+                            * (shared.min(3) as f32 / 3.0);
+                    }
+
+                    // Signal 2: embedding similarity (weight 0.3)
+                    let emb_i = self
+                        .embeddings
+                        .embed_text(&unique_ids[i]);
+                    let emb_j = self
+                        .embeddings
+                        .embed_text(&unique_ids[j]);
+                    if let (Some(ei), Some(ej)) = (&emb_i, &emb_j) {
+                        let sim = cosine_similarity(ei, ej);
+                        aff += 0.3 * sim.max(0.0);
+                    }
+
+                    // Signal 3: structural context (weight 0.25)
+                    let sig_i = self.signatures.iter().find(|s| {
+                        s.name == unique_ids[i]
+                    });
+                    let sig_j = self.signatures.iter().find(|s| {
+                        s.name == unique_ids[j]
+                    });
+                    if let (Some(si), Some(sj)) = (sig_i, sig_j) {
+                        let params_i: HashSet<String> = si
+                            .params
+                            .iter()
+                            .flat_map(|p| split_identifier(&p.name))
+                            .collect();
+                        let params_j: HashSet<String> = sj
+                            .params
+                            .iter()
+                            .flat_map(|p| split_identifier(&p.name))
+                            .collect();
+                        let union_len =
+                            params_i.union(&params_j).count();
+                        if union_len > 0 {
+                            let intersection_len = params_i
+                                .intersection(&params_j)
+                                .count();
+                            let jaccard = intersection_len as f32
+                                / union_len as f32;
+                            aff += 0.25 * jaccard;
+                        }
+                    }
+
+                    affinity[i][j] = aff;
+                    affinity[j][i] = aff;
+                }
+            }
+
+            // Connected components with threshold
+            let threshold = 0.25f32;
+            let mut parent: Vec<usize> = (0..n).collect();
+
+            fn find(parent: &mut [usize], x: usize) -> usize {
+                if parent[x] != x {
+                    parent[x] = find(parent, parent[x]);
+                }
+                parent[x]
+            }
+
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if affinity[i][j] >= threshold {
+                        let pi = find(&mut parent, i);
+                        let pj = find(&mut parent, j);
+                        if pi != pj {
+                            parent[pi] = pj;
+                        }
+                    }
+                }
+            }
+
+            // Group into clusters
+            let mut clusters: HashMap<usize, Vec<usize>> =
+                HashMap::new();
+            for i in 0..n {
+                let root = find(&mut parent, i);
+                clusters.entry(root).or_default().push(i);
+            }
+
+            // Filter clusters with >= 2 members
+            let valid_clusters: Vec<Vec<usize>> = clusters
+                .into_values()
+                .filter(|c| c.len() >= 2)
+                .collect();
+
+            if valid_clusters.len() < 2 {
+                continue;
+            }
+
+            // Determine qualifiers and build subconcepts
+            let mut subconcepts = Vec::new();
+            let all_cluster_subtokens: Vec<HashSet<String>> =
+                valid_clusters
+                    .iter()
+                    .map(|cluster| {
+                        cluster
+                            .iter()
+                            .flat_map(|&idx| {
+                                split_identifier(&unique_ids[idx])
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+            for (ci, cluster) in valid_clusters.iter().enumerate() {
+                let my_subtokens = &all_cluster_subtokens[ci];
+                let other_subtokens: HashSet<String> =
+                    all_cluster_subtokens
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i != ci)
+                        .flat_map(|(_, s)| s.iter().cloned())
+                        .collect();
+
+                let mut distinguishing: Vec<String> = my_subtokens
+                    .iter()
+                    .filter(|st| {
+                        !other_subtokens.contains(*st)
+                            && **st != concept.canonical
+                    })
+                    .cloned()
+                    .collect();
+                distinguishing.sort();
+
+                let qualifier = distinguishing
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        my_subtokens
+                            .iter()
+                            .find(|st| **st != concept.canonical)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                format!("group_{ci}")
+                            })
+                    });
+
+                let cluster_ids: Vec<String> = cluster
+                    .iter()
+                    .map(|&idx| unique_ids[idx].clone())
+                    .collect();
+                let cluster_occurrences = concept
+                    .occurrences
+                    .iter()
+                    .filter(|o| cluster_ids.contains(&o.identifier))
+                    .cloned()
+                    .collect();
+
+                subconcepts.push(Subconcept {
+                    qualifier: qualifier.clone(),
+                    canonical: format!(
+                        "{}.{}",
+                        concept.canonical, qualifier
+                    ),
+                    occurrences: cluster_occurrences,
+                    identifiers: cluster_ids,
+                    embedding: None,
+                });
+            }
+
+            if let Some(c) = self.concepts.get_mut(&cid) {
+                c.subconcepts = subconcepts;
+            }
+        }
+    }
+
+    /// Locate the best entry points for working with a concept.
+    pub fn locate_concept(
+        &self,
+        term: &str,
+    ) -> Option<LocateConceptResult> {
+        // Handle dotted subconcept query: "transform.spatial"
+        let (base_term, subconcept_filter) =
+            if let Some((base, sub)) = term.split_once('.') {
+                (base, Some(sub))
+            } else {
+                (term, None)
+            };
+
+        let term_lower = base_term.to_lowercase();
+        let concept = self
+            .concepts
+            .values()
+            .find(|c| c.canonical == term_lower)?;
+
+        // If subconcept filter, only use identifiers from that cluster
+        let filter_ids: Option<HashSet<&str>> =
+            subconcept_filter.and_then(|sub| {
+                concept.subconcepts.iter().find_map(|sc| {
+                    if sc.qualifier == sub
+                        || sc.canonical == term
+                    {
+                        Some(
+                            sc.identifiers
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        // Rank signatures
+        let mut scored_sigs: Vec<(&Signature, i32)> = self
+            .signatures
+            .iter()
+            .filter_map(|sig| {
+                let mut score = 0i32;
+                let name_lower = sig.name.to_lowercase();
+
+                // Check filter
+                if let Some(ref ids) = filter_ids {
+                    if !ids.contains(sig.name.as_str()) {
+                        return None;
+                    }
+                }
+
+                if concept
+                    .occurrences
+                    .iter()
+                    .any(|o| o.identifier == sig.name)
+                {
+                    score += 3;
+                } else if concept
+                    .subtokens
+                    .iter()
+                    .any(|st| name_lower.contains(st.as_str()))
+                {
+                    score += 2;
+                }
+
+                // Param match
+                for param in &sig.params {
+                    let param_subtokens =
+                        split_identifier(&param.name);
+                    if param_subtokens
+                        .iter()
+                        .any(|st| st == &concept.canonical)
+                    {
+                        score += 1;
+                    }
+                }
+
+                if score > 0 {
+                    Some((sig, score))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored_sigs.sort_by(|a, b| b.1.cmp(&a.1));
+        let exemplar_signatures: Vec<Signature> = scored_sigs
+            .into_iter()
+            .take(5)
+            .map(|(s, _)| s.clone())
+            .collect();
+
+        // Rank classes
+        let mut scored_cls: Vec<(&ClassInfo, i32)> = self
+            .classes
+            .iter()
+            .filter_map(|cls| {
+                let mut score = 0i32;
+                if concept
+                    .occurrences
+                    .iter()
+                    .any(|o| o.identifier == cls.name)
+                {
+                    score += 3;
+                }
+                for method in &cls.methods {
+                    if concept
+                        .occurrences
+                        .iter()
+                        .any(|o| o.identifier == *method)
+                    {
+                        score += 1;
+                    }
+                }
+                if score > 0 {
+                    Some((cls, score))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored_cls.sort_by(|a, b| b.1.cmp(&a.1));
+        let exemplar_classes: Vec<ClassInfo> = scored_cls
+            .into_iter()
+            .take(3)
+            .map(|(c, _)| c.clone())
+            .collect();
+
+        // Rank files by concept density
+        let mut file_counts: HashMap<&std::path::Path, usize> =
+            HashMap::new();
+        for occ in &concept.occurrences {
+            if let Some(ref ids) = filter_ids {
+                if !ids.contains(occ.identifier.as_str()) {
+                    continue;
+                }
+            }
+            *file_counts.entry(&occ.file).or_insert(0) += 1;
+        }
+        let mut files: Vec<(std::path::PathBuf, usize)> = file_counts
+            .into_iter()
+            .map(|(p, c)| (p.to_path_buf(), c))
+            .collect();
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Contrastive concepts
+        let contrastive_concepts: Vec<String> = self
+            .relationships
+            .iter()
+            .filter(|r| {
+                r.kind == RelationshipKind::Contrastive
+                    && (r.source == concept.id
+                        || r.target == concept.id)
+            })
+            .filter_map(|r| {
+                let other_id = if r.source == concept.id {
+                    r.target
+                } else {
+                    r.source
+                };
+                self.concepts
+                    .get(&other_id)
+                    .map(|c| c.canonical.clone())
+            })
+            .collect();
+
+        Some(LocateConceptResult {
+            concept: concept.canonical.clone(),
+            exemplar_signatures,
+            exemplar_classes,
+            files,
+            contrastive_concepts,
+        })
+    }
+
+    /// Generate a session briefing from current graph state.
+    pub fn session_briefing(&self) -> SessionBriefing {
+        let conventions = self.conventions.clone();
+
+        // Abbreviations from AbbreviationOf relationships
+        let abbreviations: Vec<(String, String)> = self
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::AbbreviationOf)
+            .filter_map(|r| {
+                let short = self
+                    .concepts
+                    .get(&r.source)
+                    .map(|c| c.canonical.clone())?;
+                let long = self
+                    .concepts
+                    .get(&r.target)
+                    .map(|c| c.canonical.clone())?;
+                Some((short, long))
+            })
+            .collect();
+
+        // Top 20 concepts
+        let mut concepts_sorted: Vec<&Concept> =
+            self.concepts.values().collect();
+        concepts_sorted
+            .sort_by(|a, b| b.occurrences.len().cmp(&a.occurrences.len()));
+        let top_concepts: Vec<(String, usize)> = concepts_sorted
+            .iter()
+            .take(20)
+            .map(|c| (c.canonical.clone(), c.occurrences.len()))
+            .collect();
+
+        // Contrastive pairs
+        let contrastive_pairs: Vec<(String, String)> = self
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Contrastive)
+            .filter_map(|r| {
+                let a = self
+                    .concepts
+                    .get(&r.source)
+                    .map(|c| c.canonical.clone())?;
+                let b = self
+                    .concepts
+                    .get(&r.target)
+                    .map(|c| c.canonical.clone())?;
+                Some((a, b))
+            })
+            .collect();
+
+        // Vocabulary warnings
+        let vocabulary_warnings: Vec<String> = self
+            .concepts
+            .values()
+            .filter_map(|c| {
+                let check = self.check_naming(&c.canonical);
+                if check.verdict == Verdict::Inconsistent {
+                    Some(format!(
+                        "use '{}', not '{}'",
+                        check
+                            .suggestion
+                            .as_deref()
+                            .unwrap_or("?"),
+                        c.canonical,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        SessionBriefing {
+            conventions,
+            abbreviations,
+            top_concepts,
+            contrastive_pairs,
+            vocabulary_warnings,
+        }
+    }
 }
 
 /// Find identifiers in the corpus similar to the given one.
@@ -825,6 +1413,7 @@ mod tests {
                 .collect(),
             entity_types: HashSet::from([EntityType::Function]),
             embedding: None,
+            subconcepts: Vec::new(),
         }
     }
 
