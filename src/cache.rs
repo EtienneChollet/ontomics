@@ -3,11 +3,12 @@ use crate::graph::ConceptGraph;
 use crate::types::{
     CallSite, ClassInfo, Concept, Convention, Relationship, Signature,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -52,8 +53,56 @@ impl IndexCache {
         Ok(Self { db_path })
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.db_path.with_extension("lock")
+    }
+
+    /// Acquire an exclusive lock file. Returns an error if another
+    /// instance holds the lock (stale locks older than 5 minutes are
+    /// broken automatically).
+    fn acquire_lock(&self) -> Result<()> {
+        let lock = self.lock_path();
+        if lock.exists() {
+            let metadata = fs::metadata(&lock)?;
+            let age = metadata
+                .modified()?
+                .elapsed()
+                .unwrap_or_default();
+            if age.as_secs() < 300 {
+                anyhow::bail!(
+                    "another semex instance holds the cache lock \
+                     (pid in {:?}, age {:?})",
+                    lock,
+                    age,
+                );
+            }
+            eprintln!(
+                "Warning: breaking stale cache lock ({:?} old)",
+                age,
+            );
+        }
+        fs::write(
+            &lock,
+            format!("{}", std::process::id()),
+        )?;
+        Ok(())
+    }
+
+    fn release_lock(&self) {
+        let _ = fs::remove_file(self.lock_path());
+    }
+
     /// Save full graph to cache.
     pub fn save(&self, graph: &ConceptGraph) -> Result<()> {
+        self.acquire_lock()
+            .context("failed to acquire cache lock")?;
+
+        let result = self.save_inner(graph);
+        self.release_lock();
+        result
+    }
+
+    fn save_inner(&self, graph: &ConceptGraph) -> Result<()> {
         let cached = CachedGraph {
             concepts: graph.concepts.clone(),
             relationships: graph.relationships.clone(),
@@ -90,6 +139,9 @@ impl IndexCache {
                         .into_iter()
                         .filter(|p| {
                             p.extension().is_some_and(|e| e == "py")
+                                && !p.components().any(|c| {
+                                    c.as_os_str() == ".semex"
+                                })
                         })
                         .collect();
                     if !py_paths.is_empty() {
