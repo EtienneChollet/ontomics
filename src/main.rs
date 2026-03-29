@@ -17,8 +17,8 @@ use std::time::Duration;
 #[derive(ClapParser)]
 #[command(name = "semex", about = "Domain ontology extraction for Python codebases")]
 struct Cli {
-    /// Path to the Python repository to analyze
-    #[arg(long)]
+    /// Path to the Python repository to analyze (defaults to current directory)
+    #[arg(long, default_value = ".")]
     repo: PathBuf,
 
     #[command(subcommand)]
