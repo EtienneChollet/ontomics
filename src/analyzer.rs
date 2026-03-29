@@ -517,6 +517,9 @@ mod tests {
                 .map(|(n, et)| make_id(n, et.clone()))
                 .collect(),
             doc_texts: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
         }
     }
 

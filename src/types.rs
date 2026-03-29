@@ -81,6 +81,9 @@ pub struct RawIdentifier {
 pub struct ParseResult {
     pub identifiers: Vec<RawIdentifier>,
     pub doc_texts: Vec<(PathBuf, usize, String)>,
+    pub signatures: Vec<Signature>,
+    pub classes: Vec<ClassInfo>,
+    pub call_sites: Vec<CallSite>,
 }
 
 // --- Analysis output types ---
@@ -101,6 +104,9 @@ pub struct ConceptQueryResult {
     pub related: Vec<(Concept, RelationshipKind, f32)>,
     pub conventions: Vec<Convention>,
     pub top_occurrences: Vec<Occurrence>,
+    pub signatures: Vec<Signature>,
+    pub classes: Vec<ClassInfo>,
+    pub call_graph: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +132,64 @@ pub struct NameSuggestion {
     pub name: String,
     pub confidence: f32,
     pub based_on: Vec<String>,
+}
+
+// --- L2: Structural types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Signature {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<String>,
+    pub decorators: Vec<String>,
+    pub docstring_first_line: Option<String>,
+    pub file: PathBuf,
+    pub line: usize,
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Param {
+    pub name: String,
+    pub type_annotation: Option<String>,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassInfo {
+    pub name: String,
+    pub bases: Vec<String>,
+    pub methods: Vec<String>,
+    pub attributes: Vec<String>,
+    pub docstring_first_line: Option<String>,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallSite {
+    pub caller_scope: Option<String>,
+    pub callee: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeSymbolResult {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub signature: Option<Signature>,
+    pub class_info: Option<ClassInfo>,
+    pub callers: Vec<CallSite>,
+    pub callees: Vec<CallSite>,
+    pub concepts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SymbolKind {
+    Function,
+    Class,
+    Method,
 }
 
 // --- Ontology diff types ---
