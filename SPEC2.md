@@ -46,7 +46,7 @@ All existing from v1 — no new dependencies required.
 * `tree-sitter` + `tree-sitter-python`: Python parsing and identifier/structure extraction.
 * `fastembed`: Local ONNX embeddings (`BAAI/bge-small-en-v1.5`). No API key, ~30MB model, CPU.
 * `rmcp`: Rust MCP SDK. JSON-RPC transport (stdio), tool registration, request/response lifecycle.
-* `rusqlite`: SQLite for persistent cache. Bundled via `bundled` feature flag.
+* `rusqlite`: SQLite (used for DB schema creation; cache itself is a JSON file due to SQLite blob reliability issues with large graphs).
 * `git2`: libgit2 bindings for `ontology_diff`.
 * `notify`: Cross-platform filesystem watcher for incremental re-indexing.
 * `serde` + `serde_json`: Serialization for MCP protocol, cache, and tool outputs.
@@ -121,7 +121,7 @@ semex/
 | |--- embeddings.rs    # Local embedding computation + cosine similarity
 | |--- graph.rs         # Concept graph: nodes, edges, queries (L1+L2)
 | |--- diff.rs          # git2-based ontology diff between refs
-| |--- cache.rs         # SQLite persistence + file watcher
+| |--- cache.rs         # JSON file persistence + file watcher
 | |--- tools.rs         # MCP tool definitions + handlers
 | |--- types.rs         # Shared types: Concept, Occurrence, Convention, Signature, etc.
 ```
@@ -207,14 +207,30 @@ pub struct ParseResult {
     pub call_sites: Vec<CallSite>,              // L2 — NEW
 }
 
+// RelatedConcept — lightweight summary (avoids serializing full occurrence lists)
+pub struct RelatedConcept {
+    pub canonical: String,
+    pub kind: RelationshipKind,
+    pub weight: f32,
+    pub occurrences: usize,
+}
+
+// QueryConceptParams — optional limits for response size
+pub struct QueryConceptParams {
+    pub max_related: usize,      // default: 10
+    pub max_occurrences: usize,  // default: 5
+    pub max_variants: usize,     // default: 20
+    pub max_signatures: usize,   // default: 5
+}
+
 // ConceptQueryResult gains L2 + subconcept fields
 pub struct ConceptQueryResult {
     pub concept: Concept,
-    pub variants: Vec<String>,
-    pub related: Vec<(Concept, RelationshipKind, f32)>,
+    pub variants: Vec<String>,                   // capped by max_variants
+    pub related: Vec<RelatedConcept>,            // CHANGED: lightweight summaries, capped by max_related
     pub conventions: Vec<Convention>,
-    pub top_occurrences: Vec<Occurrence>,
-    pub signatures: Vec<Signature>,              // L2 — NEW
+    pub top_occurrences: Vec<Occurrence>,         // capped by max_occurrences
+    pub signatures: Vec<Signature>,              // L2 — NEW, capped by max_signatures
     pub classes: Vec<ClassInfo>,                 // L2 — NEW
     pub call_graph: Vec<(String, String)>,       // L2 — NEW: (caller, callee) pairs
     pub subconcepts: Vec<Subconcept>,            // NEW: non-empty if concept is polysemous
@@ -765,7 +781,11 @@ RETURN SessionBriefing
 #### Existing tools (enriched responses)
 
 ```rust
-// query_concept — response now includes L2 signatures/classes/call_graph
+// query_concept — response includes L2 data; optional limit params control response size
+// Params: term (required), max_related (default 10), max_occurrences (default 5),
+//         max_variants (default 20), max_signatures (default 5)
+// `related` field returns lightweight RelatedConcept summaries, not full Concept objects.
+// Default response is ~3.7k tokens (was ~36k before limits).
 Tool::new("query_concept", ...)
 
 // check_naming — unchanged
@@ -871,7 +891,7 @@ Briefing,
 INIT:
     repo_root = resolve from CLI arg or cwd
     config = load .semex/config.toml (or defaults)
-    cache = IndexCache::open(repo_root/.semex/index.db)
+    cache = IndexCache::open(repo_root/.semex/index.json)
 
 CHECK CACHE:
     if cache.load() returns valid graph AND no files changed:
