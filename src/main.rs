@@ -216,13 +216,8 @@ fn build_graph(
             .add_similarity_edges(config.embeddings.similarity_threshold);
     }
 
-    // Contrastive edges (must run AFTER similarity edges)
     graph.add_contrastive_edges();
-    eprintln!("Detected contrastive pairs");
-
-    // Subconcept detection (must run AFTER embeddings and co-occurrence)
     graph.detect_subconcepts();
-    eprintln!("Detected subconcepts");
 
     if let Err(e) = cache.save(&graph) {
         eprintln!("Warning: failed to cache index: {e}");
