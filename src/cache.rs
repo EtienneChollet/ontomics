@@ -49,7 +49,7 @@ impl IndexCache {
         Ok(Self { db_path })
     }
 
-    /// Save full graph to cache.
+    /// Save full graph to cache as a JSON file.
     pub fn save(&self, graph: &ConceptGraph) -> Result<()> {
         let cached = CachedGraph {
             concepts: graph.concepts.clone(),
@@ -61,13 +61,8 @@ impl IndexCache {
             call_sites: graph.call_sites.clone(),
         };
         let json = serde_json::to_vec(&cached)?;
-
-        let conn = Connection::open(&self.db_path)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO cache (key, value, updated_at)
-             VALUES (?1, ?2, datetime('now'))",
-            rusqlite::params!["graph", json],
-        )?;
+        let json_path = self.db_path.with_extension("json");
+        std::fs::write(&json_path, &json)?;
 
         Ok(())
     }
@@ -101,22 +96,12 @@ impl IndexCache {
 
     /// Load cached graph. Returns None if cache is missing or corrupt.
     pub fn load(&self) -> Result<Option<ConceptGraph>> {
-        if !self.db_path.exists() {
+        let json_path = self.db_path.with_extension("json");
+        if !json_path.exists() {
             return Ok(None);
         }
 
-        let conn = Connection::open(&self.db_path)?;
-        let result: rusqlite::Result<Vec<u8>> = conn.query_row(
-            "SELECT value FROM cache WHERE key = ?1",
-            rusqlite::params!["graph"],
-            |row| row.get(0),
-        );
-
-        let blob = match result {
-            Ok(b) => b,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(_) => return Ok(None),
-        };
+        let blob = std::fs::read(&json_path)?;
 
         let cached: CachedGraph = match serde_json::from_slice(&blob) {
             Ok(c) => c,
