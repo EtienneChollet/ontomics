@@ -113,6 +113,23 @@ impl SemexServer {
         Ok(json!(summary))
     }
 
+    fn handle_describe_symbol(&self, args: &Value) -> Result<Value, String> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required argument 'name'")?;
+
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        match graph.describe_symbol(name) {
+            Some(result) => serde_json::to_value(result)
+                .map_err(|e| format!("serialization error: {e}")),
+            None => Ok(json!({
+                "error": "not_found",
+                "message": format!("no symbol matching '{name}'"),
+            })),
+        }
+    }
+
     fn handle_list_conventions(&self, _args: &Value) -> Result<Value, String> {
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let conventions = graph.list_conventions();
@@ -215,6 +232,20 @@ fn tool_definitions() -> Vec<Tool> {
              patterns) with examples and frequency counts.",
             tool_schema(json!({}), &[]),
         ),
+        Tool::new(
+            "describe_symbol",
+            "Get full structural information for a function or class: \
+             signature, callers, callees, and related domain concepts.",
+            tool_schema(
+                json!({
+                    "name": {
+                        "type": "string",
+                        "description": "Function or class name (e.g. 'spatial_transform')",
+                    }
+                }),
+                &["name"],
+            ),
+        ),
     ]
 }
 
@@ -274,6 +305,7 @@ impl ServerHandler for SemexServer {
             "ontology_diff" => self.handle_ontology_diff(&args),
             "list_concepts" => self.handle_list_concepts(&args),
             "list_conventions" => self.handle_list_conventions(&args),
+            "describe_symbol" => self.handle_describe_symbol(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -340,6 +372,9 @@ mod tests {
                 frequency: 3,
             }],
             co_occurrence_matrix: vec![((1, 2), 1.0)],
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -420,7 +455,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
@@ -429,5 +464,15 @@ mod tests {
         let info = server.get_info();
         assert_eq!(info.server_info.name, "semex");
         assert!(info.capabilities.tools.is_some());
+    }
+
+    #[test]
+    fn test_describe_symbol_not_found() {
+        let server = make_test_server();
+        let args = json!({"name": "nonexistent"});
+        let result = server.handle_describe_symbol(&args);
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val.get("error").unwrap(), "not_found");
     }
 }

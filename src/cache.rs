@@ -1,6 +1,8 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
-use crate::types::{Concept, Convention, Relationship};
+use crate::types::{
+    CallSite, ClassInfo, Concept, Convention, Relationship, Signature,
+};
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
@@ -20,6 +22,12 @@ struct CachedGraph {
     relationships: Vec<Relationship>,
     conventions: Vec<Convention>,
     embeddings: EmbeddingIndex,
+    #[serde(default)]
+    signatures: Vec<Signature>,
+    #[serde(default)]
+    classes: Vec<ClassInfo>,
+    #[serde(default)]
+    call_sites: Vec<CallSite>,
 }
 
 impl IndexCache {
@@ -48,6 +56,9 @@ impl IndexCache {
             relationships: graph.relationships.clone(),
             conventions: graph.conventions.clone(),
             embeddings: serde_json::from_value(serde_json::to_value(&graph.embeddings)?)?,
+            signatures: graph.signatures.clone(),
+            classes: graph.classes.clone(),
+            call_sites: graph.call_sites.clone(),
         };
         let json = serde_json::to_vec(&cached)?;
 
@@ -117,6 +128,9 @@ impl IndexCache {
             relationships: cached.relationships,
             conventions: cached.conventions,
             embeddings: cached.embeddings,
+            signatures: cached.signatures,
+            classes: cached.classes,
+            call_sites: cached.call_sites,
         }))
     }
 }
@@ -147,6 +161,9 @@ mod tests {
             relationships: Vec::new(),
             conventions: Vec::new(),
             embeddings: EmbeddingIndex::empty(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
         }
     }
 
