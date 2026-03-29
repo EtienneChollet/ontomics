@@ -202,8 +202,9 @@ fn tool_definitions() -> Vec<Tool> {
     vec![
         Tool::new(
             "query_concept",
-            "Look up a domain concept by name. Returns the concept, its variants, \
-             related concepts, matching conventions, signatures, and top occurrences.",
+            "Look up a domain concept. Use when asked 'what is X', 'what does X mean', \
+             or 'where is X used'. Returns variants, related concepts, conventions, \
+             signatures, and occurrences.",
             tool_schema(
                 json!({
                     "term": {
@@ -232,9 +233,9 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "check_naming",
-            "Check an identifier against project naming conventions. Returns \
-             whether the name is consistent, inconsistent, or unknown, with \
-             suggestions if applicable.",
+            "Check if an identifier follows project conventions. Use when \
+             writing new code or reviewing names. Returns consistent/inconsistent \
+             verdict with suggestions.",
             tool_schema(
                 json!({
                     "identifier": {
@@ -247,8 +248,8 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "suggest_name",
-            "Suggest an identifier name given a natural language description, \
-             based on project conventions and existing vocabulary.",
+            "Suggest an identifier name from a description. Use when naming \
+             new functions, variables, or parameters to match project style.",
             tool_schema(
                 json!({
                     "description": {
@@ -275,8 +276,9 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "list_concepts",
-            "List all detected domain concepts, ordered by frequency. \
-             Optionally truncate to top_k.",
+            "List the project's domain concepts by frequency. Use when asked \
+             'what is this project about' or 'what are the main concepts'. \
+             Returns concept names with occurrence counts.",
             tool_schema(
                 json!({
                     "top_k": {
@@ -289,14 +291,16 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "list_conventions",
-            "List all detected naming conventions (prefix, suffix, conversion \
-             patterns) with examples and frequency counts.",
+            "List the project's naming conventions. Use when asked about coding \
+             style or before writing new code. Shows prefix, suffix, and \
+             conversion patterns with examples.",
             tool_schema(json!({}), &[]),
         ),
         Tool::new(
             "describe_symbol",
-            "Get full structural information for a function or class: \
-             signature, callers, callees, and related domain concepts.",
+            "Describe a function or class without reading its file. Use when asked \
+             'what does function X do' or 'what is class X'. Returns signature, \
+             parameters, callers, callees, and related concepts.",
             tool_schema(
                 json!({
                     "name": {
@@ -309,9 +313,9 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "locate_concept",
-            "Find the best entry points for working with a domain concept. \
-             Returns exemplar signatures, key classes, and files ranked by \
-             concept density. Also flags contrastive concepts.",
+            "Find where to start reading about a concept. Use when asked 'how does X work' \
+             or 'where should I look for X'. Returns ranked signatures, classes, and files \
+             — the minimum context needed to understand a concept.",
             tool_schema(
                 json!({
                     "term": {
@@ -341,8 +345,20 @@ impl ServerHandler for SemexServer {
             },
             instructions: Some(
                 "semex extracts domain ontologies from Python codebases. \
-                 Use query_concept to explore vocabulary, check_naming to \
-                 validate identifiers, and list_conventions to see patterns."
+                 Use it BEFORE reading files when exploring unfamiliar code.\n\
+                 \n\
+                 WHEN TO USE:\n\
+                 - \"what is X\" / \"what does X mean\" → query_concept\n\
+                 - \"how does X work\" / \"where is X\" → locate_concept + describe_symbol\n\
+                 - \"what are the main concepts\" → list_concepts\n\
+                 - \"what naming conventions\" → list_conventions\n\
+                 - \"is this name correct\" → check_naming\n\
+                 - \"what should I call this\" → suggest_name\n\
+                 - \"describe function/class X\" → describe_symbol\n\
+                 \n\
+                 semex gives you semantic understanding (concepts, conventions, \
+                 relationships) without reading files. Use file reading only as \
+                 fallback when semex returns insufficient detail."
                     .to_string(),
             ),
         }
