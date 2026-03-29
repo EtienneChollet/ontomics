@@ -29,13 +29,21 @@ impl EmbeddingIndex {
 
     /// Create an empty embedding index (no model, for when embeddings are disabled).
     pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for EmbeddingIndex {
+    fn default() -> Self {
         Self {
             model: None,
             vectors: HashMap::new(),
             cache_dir: None,
         }
     }
+}
 
+impl EmbeddingIndex {
     /// Load the embedding model into an index that was deserialized from
     /// cache (which has vectors but no model). Needed for runtime queries
     /// like embed_text.

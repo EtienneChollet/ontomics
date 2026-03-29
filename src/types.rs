@@ -29,6 +29,7 @@ pub struct Concept {
     pub subtokens: Vec<String>,
     pub occurrences: Vec<Occurrence>,
     pub entity_types: HashSet<EntityType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     #[serde(default)]
     pub subconcepts: Vec<Subconcept>,
@@ -79,7 +80,7 @@ pub enum PatternKind {
 
 // --- Parser output types ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RawIdentifier {
     pub name: String,
     pub entity_type: EntityType,
@@ -89,9 +90,10 @@ pub struct RawIdentifier {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ParseResult {
     pub identifiers: Vec<RawIdentifier>,
+    #[allow(dead_code)]
     pub doc_texts: Vec<(PathBuf, usize, String)>,
     pub signatures: Vec<Signature>,
     pub classes: Vec<ClassInfo>,
@@ -100,16 +102,13 @@ pub struct ParseResult {
 
 // --- Analysis output types ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AnalysisResult {
     pub concepts: Vec<Concept>,
     pub conventions: Vec<Convention>,
     pub co_occurrence_matrix: Vec<((u64, u64), f32)>,
-    #[serde(default)]
     pub signatures: Vec<Signature>,
-    #[serde(default)]
     pub classes: Vec<ClassInfo>,
-    #[serde(default)]
     pub call_sites: Vec<CallSite>,
 }
 
