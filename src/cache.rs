@@ -16,18 +16,18 @@ pub struct IndexCache {
     db_path: PathBuf,
 }
 
-/// Serializable proxy for ConceptGraph (which may not derive Serialize).
-#[derive(Serialize, Deserialize)]
+/// Serializable proxy for ConceptGraph.
+/// `#[serde(default)]` on the struct ensures old caches missing new
+/// fields deserialize gracefully (fields default to empty/zero).
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct CachedGraph {
     concepts: HashMap<u64, Concept>,
     relationships: Vec<Relationship>,
     conventions: Vec<Convention>,
     embeddings: EmbeddingIndex,
-    #[serde(default)]
     signatures: Vec<Signature>,
-    #[serde(default)]
     classes: Vec<ClassInfo>,
-    #[serde(default)]
     call_sites: Vec<CallSite>,
 }
 
