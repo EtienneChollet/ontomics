@@ -212,6 +212,9 @@ impl ConceptGraph {
             related,
             conventions,
             top_occurrences,
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_graph: Vec::new(),
         })
     }
 
@@ -287,9 +290,63 @@ impl ConceptGraph {
             }
         }
 
+        // 1b. Prefix expansion: if a subtoken is a prefix of a concept
+        // canonical, include it. Handles short inputs ("trans" → "transform")
+        // where embeddings match surface form instead of semantics.
+        for concept in self.concepts.values() {
+            let canon = &concept.canonical;
+            let is_prefix_match = subtokens.iter().any(|st| {
+                st.len() >= 2
+                    && canon.len() > st.len()
+                    && canon.starts_with(st.as_str())
+            });
+            if is_prefix_match && *canon != id_lower {
+                related_ids.push((
+                    canon.clone(),
+                    concept.occurrences.len(),
+                ));
+            }
+        }
+
+        // 1c. Embedding-based similarity: find concepts semantically
+        // close to the input, even if they share no subtokens.
+        // Use concept-level occurrence count (not per-identifier) so
+        // that a broad concept like "transform" (17 total) beats a
+        // narrow substring match like "transformer" (11).
+        if let Some(query_vec) = self.embeddings.embed_text(&id_lower) {
+            for (cid, score) in self.embeddings.find_similar(&query_vec, 5)
+            {
+                if score < 0.5 {
+                    continue;
+                }
+                if let Some(concept) = self.concepts.get(&cid) {
+                    let canon = &concept.canonical;
+                    if *canon != id_lower {
+                        let concept_freq = concept.occurrences.len();
+                        related_ids.push((
+                            canon.clone(),
+                            concept_freq,
+                        ));
+                    }
+                }
+            }
+        }
+
         // Deduplicate
         related_ids.sort_by(|a, b| b.1.cmp(&a.1));
         related_ids.dedup_by(|a, b| a.0 == b.0);
+
+        // Build similar_identifiers from related_ids (all signals merged)
+        let similar_from_related = |skip: Option<&str>| -> Vec<(String, usize)> {
+            related_ids
+                .iter()
+                .filter(|(name, _)| {
+                    skip.is_none_or(|s| name != s)
+                })
+                .take(10)
+                .cloned()
+                .collect()
+        };
 
         // If a related identifier has strictly higher frequency, suggest it
         if let Some((best_name, best_freq)) = related_ids.first() {
@@ -304,9 +361,8 @@ impl ConceptGraph {
                     ),
                     suggestion: Some(best_name.clone()),
                     matching_convention: None,
-                    similar_identifiers: find_similar_identifiers(
-                        identifier,
-                        &id_freq,
+                    similar_identifiers: similar_from_related(
+                        Some(best_name.as_str()),
                     ),
                 };
             }
@@ -373,10 +429,7 @@ impl ConceptGraph {
                     ),
                     suggestion: None,
                     matching_convention: Some(conv.clone()),
-                    similar_identifiers: find_similar_identifiers(
-                        identifier,
-                        &id_freq,
-                    ),
+                    similar_identifiers: similar_from_related(None),
                 };
             }
         }
@@ -409,9 +462,7 @@ impl ConceptGraph {
                 .to_string(),
             suggestion: None,
             matching_convention: None,
-            similar_identifiers: find_similar_identifiers(
-                identifier, &id_freq,
-            ),
+            similar_identifiers: similar_from_related(None),
         }
     }
 
