@@ -1,8 +1,10 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::types::{
-    AnalysisResult, Concept, ConceptQueryResult, Convention, NameSuggestion,
-    NamingCheckResult, PatternKind, Relationship, RelationshipKind, Verdict,
+    AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
+    Convention, DescribeSymbolResult, NameSuggestion, NamingCheckResult,
+    PatternKind, Relationship, RelationshipKind, Signature, SymbolKind,
+    Verdict,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -22,6 +24,9 @@ pub struct ConceptGraph {
     pub relationships: Vec<Relationship>,
     pub conventions: Vec<Convention>,
     pub embeddings: EmbeddingIndex,
+    pub signatures: Vec<Signature>,
+    pub classes: Vec<ClassInfo>,
+    pub call_sites: Vec<CallSite>,
 }
 
 impl ConceptGraph {
@@ -52,6 +57,9 @@ impl ConceptGraph {
             relationships,
             conventions: analysis.conventions,
             embeddings,
+            signatures: analysis.signatures,
+            classes: analysis.classes,
+            call_sites: analysis.call_sites,
         })
     }
 
@@ -206,15 +214,69 @@ impl ConceptGraph {
             .cloned()
             .collect();
 
+        // L2: filter signatures matching this concept
+        let matching_signatures: Vec<Signature> = self
+            .signatures
+            .iter()
+            .filter(|sig| {
+                concept_identifiers.contains(&sig.name)
+                    || concept
+                        .subtokens
+                        .iter()
+                        .any(|st| sig.name.to_lowercase().contains(st.as_str()))
+            })
+            .cloned()
+            .collect();
+
+        // L2: filter classes matching this concept
+        let matching_classes: Vec<ClassInfo> = self
+            .classes
+            .iter()
+            .filter(|cls| {
+                concept_identifiers.contains(&cls.name)
+                    || cls.methods.iter().any(|m| {
+                        concept_identifiers.iter().any(|id| id == m)
+                    })
+                    || concept.subtokens.iter().any(|st| {
+                        cls.name.to_lowercase().contains(st.as_str())
+                    })
+            })
+            .cloned()
+            .collect();
+
+        // L2: build call graph pairs involving matching signatures
+        let sig_names: Vec<&str> =
+            matching_signatures.iter().map(|s| s.name.as_str()).collect();
+        let call_graph: Vec<(String, String)> = self
+            .call_sites
+            .iter()
+            .filter(|cs| {
+                sig_names.iter().any(|sn| {
+                    cs.callee.contains(sn)
+                        || cs.caller_scope.as_deref() == Some(sn)
+                        || cs
+                            .caller_scope
+                            .as_deref()
+                            .is_some_and(|s| s.ends_with(&format!(".{sn}")))
+                })
+            })
+            .map(|cs| {
+                (
+                    cs.caller_scope.clone().unwrap_or_default(),
+                    cs.callee.clone(),
+                )
+            })
+            .collect();
+
         Some(ConceptQueryResult {
             concept: concept.clone(),
             variants,
             related,
             conventions,
             top_occurrences,
-            signatures: Vec::new(),
-            classes: Vec::new(),
-            call_graph: Vec::new(),
+            signatures: matching_signatures,
+            classes: matching_classes,
+            call_graph,
         })
     }
 
@@ -624,6 +686,88 @@ impl ConceptGraph {
         concepts.sort_by(|a, b| b.occurrences.len().cmp(&a.occurrences.len()));
         concepts
     }
+
+    /// Describe a symbol (function or class) by name.
+    pub fn describe_symbol(
+        &self,
+        name: &str,
+    ) -> Option<DescribeSymbolResult> {
+        let name_lower = name.to_lowercase();
+
+        let signature = self
+            .signatures
+            .iter()
+            .find(|s| s.name.to_lowercase() == name_lower)
+            .cloned();
+
+        let class_info = self
+            .classes
+            .iter()
+            .find(|c| c.name.to_lowercase() == name_lower)
+            .cloned();
+
+        if signature.is_none() && class_info.is_none() {
+            return None;
+        }
+
+        let kind = if class_info.is_some() {
+            SymbolKind::Class
+        } else if let Some(ref sig) = signature {
+            if sig.scope.as_ref().is_some_and(|s| {
+                self.classes.iter().any(|c| s.contains(&c.name))
+            }) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        } else {
+            SymbolKind::Function
+        };
+
+        let callers: Vec<CallSite> = self
+            .call_sites
+            .iter()
+            .filter(|cs| {
+                cs.callee.to_lowercase() == name_lower
+                    || cs
+                        .callee
+                        .to_lowercase()
+                        .ends_with(&format!(".{name_lower}"))
+            })
+            .cloned()
+            .collect();
+
+        let callees: Vec<CallSite> = self
+            .call_sites
+            .iter()
+            .filter(|cs| {
+                cs.caller_scope.as_ref().is_some_and(|s| {
+                    s.to_lowercase() == name_lower
+                        || s.to_lowercase()
+                            .ends_with(&format!(".{name_lower}"))
+                })
+            })
+            .cloned()
+            .collect();
+
+        let subtokens = split_identifier(name);
+        let concepts: Vec<String> = self
+            .concepts
+            .values()
+            .filter(|c| subtokens.contains(&c.canonical))
+            .map(|c| c.canonical.clone())
+            .collect();
+
+        Some(DescribeSymbolResult {
+            name: name.to_string(),
+            kind,
+            signature,
+            class_info,
+            callers,
+            callees,
+            concepts,
+        })
+    }
 }
 
 /// Find identifiers in the corpus similar to the given one.
@@ -727,6 +871,9 @@ mod tests {
                 frequency: 4,
             }],
             co_occurrence_matrix: vec![((1, 2), 1.0)],
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
         };
         ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap()
     }
@@ -785,5 +932,57 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|s| s.name.contains("nb_features")));
+    }
+
+    #[test]
+    fn test_describe_symbol_not_found() {
+        let graph = make_test_graph();
+        assert!(graph.describe_symbol("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_describe_symbol_function() {
+        use crate::types::{Param, Signature};
+        let mut analysis = AnalysisResult {
+            concepts: vec![make_concept(
+                1,
+                "transform",
+                &["spatial_transform"],
+            )],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: vec![Signature {
+                name: "spatial_transform".to_string(),
+                params: vec![Param {
+                    name: "vol".to_string(),
+                    type_annotation: Some("Tensor".to_string()),
+                    default: None,
+                }],
+                return_type: Some("Tensor".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: Some(
+                    "Apply spatial transform.".to_string(),
+                ),
+                file: PathBuf::from("utils.py"),
+                line: 10,
+                scope: None,
+            }],
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        analysis.call_sites.push(crate::types::CallSite {
+            caller_scope: Some("register".to_string()),
+            callee: "spatial_transform".to_string(),
+            file: PathBuf::from("reg.py"),
+            line: 20,
+        });
+        let graph = ConceptGraph::build(analysis, EmbeddingIndex::empty())
+            .unwrap();
+        let result = graph
+            .describe_symbol("spatial_transform")
+            .expect("should find symbol");
+        assert!(result.signature.is_some());
+        assert_eq!(result.callers.len(), 1);
+        assert!(result.concepts.contains(&"transform".to_string()));
     }
 }

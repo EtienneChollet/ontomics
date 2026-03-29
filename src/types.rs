@@ -93,6 +93,12 @@ pub struct AnalysisResult {
     pub concepts: Vec<Concept>,
     pub conventions: Vec<Convention>,
     pub co_occurrence_matrix: Vec<((u64, u64), f32)>,
+    #[serde(default)]
+    pub signatures: Vec<Signature>,
+    #[serde(default)]
+    pub classes: Vec<ClassInfo>,
+    #[serde(default)]
+    pub call_sites: Vec<CallSite>,
 }
 
 // --- Query result types ---

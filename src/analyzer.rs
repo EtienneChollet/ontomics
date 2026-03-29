@@ -485,10 +485,27 @@ pub fn analyze(
     let co_occurrence_matrix =
         build_co_occurrence(&concepts, parse_results);
 
+    // L2 pass-through: collect from all parse results
+    let signatures = parse_results
+        .iter()
+        .flat_map(|pr| pr.signatures.clone())
+        .collect();
+    let classes = parse_results
+        .iter()
+        .flat_map(|pr| pr.classes.clone())
+        .collect();
+    let call_sites = parse_results
+        .iter()
+        .flat_map(|pr| pr.call_sites.clone())
+        .collect();
+
     Ok(AnalysisResult {
         concepts,
         conventions,
         co_occurrence_matrix,
+        signatures,
+        classes,
+        call_sites,
     })
 }
 
