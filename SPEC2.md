@@ -46,7 +46,7 @@ All existing from v1 — no new dependencies required.
 * `tree-sitter` + `tree-sitter-python`: Python parsing and identifier/structure extraction.
 * `fastembed`: Local ONNX embeddings (`BAAI/bge-small-en-v1.5`). No API key, ~30MB model, CPU.
 * `rmcp`: Rust MCP SDK. JSON-RPC transport (stdio), tool registration, request/response lifecycle.
-* `rusqlite`: SQLite (used for DB schema creation; cache itself is a JSON file due to SQLite blob reliability issues with large graphs).
+* `rusqlite`: SQLite for persistent cache. Bundled via `bundled` feature flag.
 * `git2`: libgit2 bindings for `ontology_diff`.
 * `notify`: Cross-platform filesystem watcher for incremental re-indexing.
 * `serde` + `serde_json`: Serialization for MCP protocol, cache, and tool outputs.
@@ -121,7 +121,7 @@ semex/
 | |--- embeddings.rs    # Local embedding computation + cosine similarity
 | |--- graph.rs         # Concept graph: nodes, edges, queries (L1+L2)
 | |--- diff.rs          # git2-based ontology diff between refs
-| |--- cache.rs         # JSON file persistence + file watcher
+| |--- cache.rs         # SQLite persistence + file watcher + lock file
 | |--- tools.rs         # MCP tool definitions + handlers
 | |--- types.rs         # Shared types: Concept, Occurrence, Convention, Signature, etc.
 ```
@@ -198,7 +198,7 @@ pub struct CallSite {
 ### `types.rs` — Extended existing types
 
 ```rust
-// ParseResult gains L2 fields
+// ParseResult gains L2 fields (internal type — no Serialize/Deserialize)
 pub struct ParseResult {
     pub identifiers: Vec<RawIdentifier>,        // L1
     pub doc_texts: Vec<(PathBuf, usize, String)>, // L1
@@ -891,7 +891,7 @@ Briefing,
 INIT:
     repo_root = resolve from CLI arg or cwd
     config = load .semex/config.toml (or defaults)
-    cache = IndexCache::open(repo_root/.semex/index.json)
+    cache = IndexCache::open(repo_root/.semex/index.db)
 
 CHECK CACHE:
     if cache.load() returns valid graph AND no files changed:
@@ -926,22 +926,30 @@ DETECT SUBCONCEPTS:
     // and AFTER co-occurrence matrix is built
 
 PERSIST:
-    cache.save(graph)
+    cache.acquire_lock()   // .semex/index.lock — prevents concurrent writers
+    cache.save(graph)      // SQLite INSERT OR REPLACE into .semex/index.db
+    cache.release_lock()
 
 SERVE:
-    start file watcher
+    start file watcher (excludes .semex/ directory to prevent self-triggering)
     register all MCP tools (L1 + L2)
     register MCP resource: semex://briefing
     enter MCP event loop
 ```
 
+### Cache concurrency
+
+- **Lock file** (`.semex/index.lock`): Acquired before any cache write. If another instance holds the lock (< 5 min old), save fails with an error. Stale locks (> 5 min, e.g. crashed process) are broken automatically.
+- **Watcher exclusion**: The file watcher filters out paths containing `.semex/`, preventing a rebuild loop when the watcher's own cache writes trigger filesystem events.
+
 ### Incremental update (on file change)
 
 ```
 ON FILE CHANGE (paths: Vec<PathBuf>):
+    // .semex/ paths are excluded by the watcher filter
     re-parse changed files (produces L1 + L2 data)
     rebuild full graph (recompute concepts, attach new signatures/classes/calls)
-    cache.save(graph)
+    cache.save(graph)  // acquires lock
 ```
 
 ## Configuration
