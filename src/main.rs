@@ -260,7 +260,7 @@ fn cmd_query(
     graph: &graph::ConceptGraph,
     term: &str,
 ) -> anyhow::Result<()> {
-    match graph.query_concept(term) {
+    match graph.query_concept(term, &types::QueryConceptParams::default()) {
         Some(result) => print_json(&result),
         None => {
             eprintln!("No concept matching '{term}'");
