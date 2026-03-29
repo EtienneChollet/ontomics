@@ -822,8 +822,8 @@ impl ConceptGraph {
             }
         }
         for (pair, count) in &param_co {
-            if *count >= 2 {
-                *pair_scores.entry(*pair).or_insert(0) += 3;
+            if *count >= 3 {
+                *pair_scores.entry(*pair).or_insert(0) += 2;
             }
         }
 
