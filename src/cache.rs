@@ -174,28 +174,32 @@ impl IndexCache {
         Ok(())
     }
 
-    /// Start watching for Python file changes. Returns the watcher (must be
-    /// kept alive) and a receiver that emits batches of changed `.py` paths.
+    /// Start watching for source file changes matching the given extensions.
+    /// Returns the watcher (must be kept alive) and a receiver that emits
+    /// batches of changed paths.
     pub fn watch(
         &self,
         root: &Path,
+        extensions: &[&str],
     ) -> Result<(RecommendedWatcher, mpsc::Receiver<Vec<PathBuf>>)> {
+        let exts: Vec<String> = extensions.iter().map(|e| e.to_string()).collect();
         let (tx, rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(
             move |res: std::result::Result<Event, notify::Error>| {
                 if let Ok(event) = res {
-                    let py_paths: Vec<PathBuf> = event
+                    let matched: Vec<PathBuf> = event
                         .paths
                         .into_iter()
                         .filter(|p| {
-                            p.extension().is_some_and(|e| e == "py")
-                                && !p.components().any(|c| {
-                                    c.as_os_str() == ".semex"
-                                })
+                            p.extension().is_some_and(|e| {
+                                exts.iter().any(|ext| e == ext.as_str())
+                            }) && !p.components().any(|c| {
+                                c.as_os_str() == ".semex"
+                            })
                         })
                         .collect();
-                    if !py_paths.is_empty() {
-                        let _ = tx.send(py_paths);
+                    if !matched.is_empty() {
+                        let _ = tx.send(matched);
                     }
                 }
             },

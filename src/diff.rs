@@ -1,5 +1,6 @@
 use crate::analyzer;
 use crate::parser;
+use crate::parser::LanguageParser;
 use crate::types::{Concept, ConceptDelta, OntologyDiff, ParseResult};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -7,13 +8,14 @@ use std::path::Path;
 
 /// Compute ontology diff between a base git ref and the current concept graph.
 ///
-/// Resolves `base_ref` in the git repo at `repo_root`, parses all Python files
+/// Resolves `base_ref` in the git repo at `repo_root`, parses all source files
 /// from that commit's tree, runs analysis, and compares against
 /// `current_concepts` (the HEAD state already built by the server).
 pub fn ontology_diff(
     repo_root: &Path,
     base_ref: &str,
     current_concepts: &HashMap<u64, Concept>,
+    lang: &dyn LanguageParser,
 ) -> Result<OntologyDiff> {
     let repo = git2::Repository::open(repo_root)
         .context("failed to open git repository")?;
@@ -26,7 +28,7 @@ pub fn ontology_diff(
         .with_context(|| format!("'{base_ref}' does not resolve to a commit"))?;
     let base_tree = base_commit.tree()?;
 
-    let base_parse_results = parse_git_tree(&repo, &base_tree, repo_root)?;
+    let base_parse_results = parse_git_tree(&repo, &base_tree, repo_root, lang)?;
     let base_analysis = analyzer::analyze(&base_parse_results, &analyzer::AnalysisParams::default())?;
     let base_concepts: HashMap<u64, Concept> = base_analysis
         .concepts
@@ -112,15 +114,20 @@ const SKIP_DIRS: &[&str] = &[
     ".tox/",
     ".eggs/",
     "egg-info/",
+    "dist/",
+    ".next/",
 ];
 
-/// Parse all Python files from a git tree object (without touching the
-/// working directory).
+/// Parse all source files from a git tree object (without touching the
+/// working directory). Only parses files whose extension matches the
+/// active parser.
 fn parse_git_tree(
     repo: &git2::Repository,
     tree: &git2::Tree,
     repo_root: &Path,
+    lang: &dyn LanguageParser,
 ) -> Result<Vec<ParseResult>> {
+    let extensions = lang.extensions();
     let mut results = Vec::new();
 
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
@@ -129,7 +136,10 @@ fn parse_git_tree(
             None => return git2::TreeWalkResult::Ok,
         };
 
-        if !name.ends_with(".py") {
+        let has_matching_ext = extensions.iter().any(|ext| {
+            name.ends_with(&format!(".{ext}"))
+        });
+        if !has_matching_ext {
             return git2::TreeWalkResult::Ok;
         }
 
@@ -152,7 +162,7 @@ fn parse_git_tree(
         };
 
         let file_path = repo_root.join(dir).join(name);
-        if let Ok(parse_result) = parser::parse_content(content, &file_path) {
+        if let Ok(parse_result) = parser::parse_content_with(content, &file_path, lang) {
             results.push(parse_result);
         }
 
@@ -259,6 +269,7 @@ def spatial_transform(vol, trf):
         let (dir, _repo) =
             make_test_repo("no_diff", &[("module.py", base_py)]);
 
+        // Parse HEAD to get current concepts
         let parse_results = parser::parse_content(
             base_py,
             &dir.join("module.py"),
@@ -271,7 +282,7 @@ def spatial_transform(vol, trf):
             .map(|c| (c.id, c))
             .collect();
 
-        let diff = ontology_diff(&dir, "HEAD", &current).unwrap();
+        let diff = ontology_diff(&dir, "HEAD", &current, &parser::PythonParser).unwrap();
         assert!(diff.added_concepts.is_empty());
         assert!(diff.removed_concepts.is_empty());
         assert!(diff.changed_concepts.is_empty());
@@ -305,6 +316,7 @@ def compute_displacement(source, target):
 "#;
         commit_files(&repo, &dir, &[("module.py", head_py)], "add displacement");
 
+        // Parse HEAD to get current concepts
         let parse_results = parser::parse_content(
             head_py,
             &dir.join("module.py"),
@@ -317,8 +329,9 @@ def compute_displacement(source, target):
             .map(|c| (c.id, c))
             .collect();
 
-        let diff = ontology_diff(&dir, "HEAD~1", &current).unwrap();
+        let diff = ontology_diff(&dir, "HEAD~1", &current, &parser::PythonParser).unwrap();
 
+        // "displacement" should be added (appears in HEAD but not in base)
         let added_names: Vec<&str> = diff
             .added_concepts
             .iter()
@@ -375,7 +388,7 @@ def spatial_transform(vol, trf):
             .map(|c| (c.id, c))
             .collect();
 
-        let diff = ontology_diff(&dir, "HEAD~1", &current).unwrap();
+        let diff = ontology_diff(&dir, "HEAD~1", &current, &parser::PythonParser).unwrap();
 
         let removed_names: Vec<&str> = diff
             .removed_concepts
@@ -396,7 +409,7 @@ def spatial_transform(vol, trf):
         let (dir, _repo) =
             make_test_repo("invalid_ref", &[("module.py", base_py)]);
 
-        let result = ontology_diff(&dir, "nonexistent_ref", &HashMap::new());
+        let result = ontology_diff(&dir, "nonexistent_ref", &HashMap::new(), &parser::PythonParser);
         assert!(result.is_err());
 
         fs::remove_dir_all(&dir).unwrap();

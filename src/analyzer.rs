@@ -184,6 +184,14 @@ fn detect_conventions(
         &all_identifiers,
         convention_threshold,
     ));
+    conventions.extend(detect_camelcase_prefix_conventions(
+        &all_identifiers,
+        convention_threshold,
+    ));
+    conventions.extend(detect_special_suffix_conventions(
+        &all_identifiers,
+        convention_threshold,
+    ));
     conventions
 }
 
@@ -339,6 +347,129 @@ fn detect_conversion_conventions(
         examples,
         frequency: matching.len(),
     }]
+}
+
+/// Detect camelCase prefix conventions (e.g. `useAuth`, `onClick`,
+/// `handleSubmit`). Looks for a lowercase prefix before the first
+/// uppercase letter in identifiers.
+fn detect_camelcase_prefix_conventions(
+    identifiers: &[&RawIdentifier],
+    convention_threshold: usize,
+) -> Vec<Convention> {
+    let mut prefix_ids: HashMap<String, Vec<&RawIdentifier>> = HashMap::new();
+
+    for &id in identifiers {
+        // Only consider identifiers that start with lowercase and contain
+        // an uppercase letter (i.e. camelCase).
+        let name = &id.name;
+        if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+            continue;
+        }
+        // Find first uppercase letter after position 0
+        if let Some(pos) = name[1..].find(|c: char| c.is_uppercase()) {
+            let prefix = &name[..pos + 1];
+            if (2..=6).contains(&prefix.len())
+                && prefix.chars().all(|c| c.is_ascii_lowercase())
+            {
+                prefix_ids.entry(prefix.to_string()).or_default().push(id);
+            }
+        }
+    }
+
+    let mut conventions = Vec::new();
+    for (prefix, matching) in &prefix_ids {
+        let distinct: HashSet<&str> =
+            matching.iter().map(|id| id.name.as_str()).collect();
+        if distinct.len() < convention_threshold {
+            continue;
+        }
+        let entity_type = most_common_entity_type(matching);
+        let examples: Vec<String> =
+            matching.iter().map(|id| id.name.clone()).collect();
+        let role = camelcase_prefix_role(prefix);
+        conventions.push(Convention {
+            pattern: PatternKind::Prefix(prefix.clone()),
+            entity_type,
+            semantic_role: role.to_string(),
+            examples,
+            frequency: distinct.len(),
+        });
+    }
+    conventions
+}
+
+/// Well-known camelCase prefix roles for TS/JS conventions.
+fn camelcase_prefix_role(prefix: &str) -> &'static str {
+    match prefix {
+        "use" => "React hook",
+        "on" => "event handler",
+        "handle" => "event handler implementation",
+        "get" => "accessor",
+        "set" => "mutator",
+        "to" => "conversion",
+        _ => "prefix pattern",
+    }
+}
+
+/// Detect special non-underscore suffix conventions like `$` for
+/// Observables and `I` prefix for interfaces.
+fn detect_special_suffix_conventions(
+    identifiers: &[&RawIdentifier],
+    convention_threshold: usize,
+) -> Vec<Convention> {
+    let mut conventions = Vec::new();
+
+    // Detect `$` suffix (RxJS Observables)
+    let dollar_ids: Vec<&RawIdentifier> = identifiers
+        .iter()
+        .filter(|id| id.name.ends_with('$') && id.name.len() > 1)
+        .copied()
+        .collect();
+    if dollar_ids.len() >= convention_threshold {
+        let distinct: HashSet<&str> =
+            dollar_ids.iter().map(|id| id.name.as_str()).collect();
+        if distinct.len() >= convention_threshold {
+            let entity_type = most_common_entity_type(&dollar_ids);
+            let examples: Vec<String> =
+                dollar_ids.iter().map(|id| id.name.clone()).collect();
+            conventions.push(Convention {
+                pattern: PatternKind::Suffix("$".to_string()),
+                entity_type,
+                semantic_role: "Observable".to_string(),
+                examples,
+                frequency: distinct.len(),
+            });
+        }
+    }
+
+    // Detect `I` prefix on PascalCase identifiers (TS interfaces)
+    let i_prefix_ids: Vec<&RawIdentifier> = identifiers
+        .iter()
+        .filter(|id| {
+            id.name.starts_with('I')
+                && id.name.len() > 1
+                && id.name.chars().nth(1).is_some_and(|c| c.is_uppercase())
+        })
+        .copied()
+        .collect();
+    if i_prefix_ids.len() >= convention_threshold {
+        let distinct: HashSet<&str> =
+            i_prefix_ids.iter().map(|id| id.name.as_str()).collect();
+        if distinct.len() >= convention_threshold {
+            let entity_type = most_common_entity_type(&i_prefix_ids);
+            let examples: Vec<String> =
+                i_prefix_ids.iter().map(|id| id.name.clone()).collect();
+            conventions.push(Convention {
+                pattern: PatternKind::Prefix("I".to_string()),
+                entity_type,
+                semantic_role: "interface".to_string(),
+                examples,
+                frequency: distinct.len(),
+            });
+        }
+    }
+
+    conventions
 }
 
 /// Return the most common entity type from a slice of identifiers.
@@ -703,5 +834,99 @@ mod tests {
         let b = hash_string("transform");
         assert_eq!(a, b);
         assert_ne!(hash_string("transform"), hash_string("spatial"));
+    }
+
+    // --- camelCase convention tests ---
+
+    #[test]
+    fn test_camelcase_use_prefix_detected() {
+        let pr = make_parse_result(&[
+            ("useAuth", EntityType::Function),
+            ("useRouter", EntityType::Function),
+            ("useState", EntityType::Function),
+        ]);
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Prefix(p) if p == "use")
+        });
+        assert!(conv.is_some(), "should detect camelCase prefix 'use'");
+        assert_eq!(conv.unwrap().semantic_role, "React hook");
+    }
+
+    #[test]
+    fn test_camelcase_handle_prefix_detected() {
+        let pr = make_parse_result(&[
+            ("handleSubmit", EntityType::Function),
+            ("handleClick", EntityType::Function),
+            ("handleChange", EntityType::Function),
+        ]);
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Prefix(p) if p == "handle")
+        });
+        assert!(conv.is_some(), "should detect camelCase prefix 'handle'");
+        assert_eq!(
+            conv.unwrap().semantic_role,
+            "event handler implementation"
+        );
+    }
+
+    #[test]
+    fn test_camelcase_on_prefix_detected() {
+        let pr = make_parse_result(&[
+            ("onClick", EntityType::Variable),
+            ("onChange", EntityType::Variable),
+            ("onSubmit", EntityType::Variable),
+        ]);
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Prefix(p) if p == "on")
+        });
+        assert!(conv.is_some(), "should detect camelCase prefix 'on'");
+        assert_eq!(conv.unwrap().semantic_role, "event handler");
+    }
+
+    #[test]
+    fn test_camelcase_below_threshold_not_detected() {
+        let pr = make_parse_result(&[
+            ("useAuth", EntityType::Function),
+            ("useRouter", EntityType::Function),
+            // Only 2 — below default threshold of 3
+        ]);
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Prefix(p) if p == "use")
+        });
+        assert!(conv.is_none(), "should not detect below threshold");
+    }
+
+    #[test]
+    fn test_dollar_suffix_detected() {
+        let pr = make_parse_result(&[
+            ("user$", EntityType::Variable),
+            ("data$", EntityType::Variable),
+            ("click$", EntityType::Variable),
+        ]);
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Suffix(s) if s == "$")
+        });
+        assert!(conv.is_some(), "should detect $ suffix (Observable)");
+        assert_eq!(conv.unwrap().semantic_role, "Observable");
+    }
+
+    #[test]
+    fn test_i_prefix_interface_detected() {
+        let pr = make_parse_result(&[
+            ("IPatient", EntityType::Class),
+            ("IConfig", EntityType::Class),
+            ("IService", EntityType::Class),
+        ]);
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
+        let conv = result.conventions.iter().find(|c| {
+            matches!(&c.pattern, PatternKind::Prefix(p) if p == "I")
+        });
+        assert!(conv.is_some(), "should detect I prefix for interfaces");
+        assert_eq!(conv.unwrap().semantic_role, "interface");
     }
 }

@@ -49,11 +49,15 @@ fn spawn_parent_watchdog() {
 }
 
 #[derive(ClapParser)]
-#[command(name = "semex", about = "Domain ontology extraction for Python codebases")]
+#[command(name = "semex", about = "Domain ontology extraction for Python/TypeScript/JavaScript codebases")]
 struct Cli {
-    /// Path to the Python repository to analyze (defaults to current directory)
+    /// Path to the repository to analyze (defaults to current directory)
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+
+    /// Language to analyze: auto, python, typescript, javascript
+    #[arg(long, default_value = "auto")]
+    language: String,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -110,7 +114,7 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// List entities (Python objects) with optional filtering
+    /// List entities (classes, functions) with optional filtering
     Entities {
         /// Filter by concept
         #[arg(long)]
@@ -150,6 +154,7 @@ fn build_graph(
     repo: &Path,
     config: &config::Config,
     defer_embeddings: bool,
+    lang: &dyn parser::LanguageParser,
 ) -> anyhow::Result<BuildResult> {
     let cache = cache::IndexCache::open(repo)?;
 
@@ -212,7 +217,7 @@ fn build_graph(
         exclude: config.index.exclude.clone(),
         respect_gitignore: config.index.respect_gitignore,
     };
-    let parse_results = parser::parse_directory(repo, &parse_opts)?;
+    let parse_results = parser::parse_directory_with(repo, &parse_opts, lang)?;
     eprintln!("Parsed {} files", parse_results.len());
 
     let analysis_params = analyzer::AnalysisParams {
@@ -647,7 +652,27 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = config::Config::load(&cli.repo)?;
+    let mut config = config::Config::load(&cli.repo)?;
+
+    // Resolve language: CLI flag > config file > auto-detection
+    let language = match cli.language.as_str() {
+        "auto" => config.language.resolve(&cli.repo),
+        "python" | "py" => config::Language::Python,
+        "typescript" | "ts" => config::Language::TypeScript,
+        "javascript" | "js" => config::Language::JavaScript,
+        other => anyhow::bail!(
+            "Unknown language: {other}. Use: auto, python, typescript, javascript"
+        ),
+    };
+    config.index.resolve_for_language(&language);
+
+    let active_parser: Box<dyn parser::LanguageParser> = match &language {
+        config::Language::Python => Box::new(parser::python_parser()),
+        config::Language::TypeScript => Box::new(parser::typescript_parser()),
+        config::Language::JavaScript => Box::new(parser::javascript_parser()),
+        config::Language::Auto => Box::new(parser::python_parser()),
+    };
+    eprintln!("Language: {language:?}");
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.resources.max_threads)
@@ -663,7 +688,7 @@ async fn main() -> anyhow::Result<()> {
         cli.command.as_ref().unwrap_or(&Command::Serve),
         Command::Serve
     );
-    let result = build_graph(&cli.repo, &config, is_serve)?;
+    let result = build_graph(&cli.repo, &config, is_serve, &*active_parser)?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
@@ -673,6 +698,7 @@ async fn main() -> anyhow::Result<()> {
                 result.loaded_packs,
                 &cli.repo,
                 &config,
+                active_parser,
             )
             .await
         }
@@ -684,7 +710,7 @@ async fn main() -> anyhow::Result<()> {
             cmd_suggest(&result.graph, &description)
         }
         Command::Diff { since } => {
-            cmd_diff(&cli.repo, &result.graph, &since)
+            cmd_diff(&cli.repo, &result.graph, &since, &*active_parser)
         }
         Command::Concepts { top_k } => {
             cmd_concepts(&result.graph, top_k)
@@ -742,8 +768,9 @@ fn cmd_diff(
     repo: &Path,
     graph: &graph::ConceptGraph,
     since: &str,
+    lang: &dyn parser::LanguageParser,
 ) -> anyhow::Result<()> {
-    let result = diff::ontology_diff(repo, since, &graph.concepts)?;
+    let result = diff::ontology_diff(repo, since, &graph.concepts, lang)?;
     print_json(&result);
     Ok(())
 }
@@ -898,10 +925,16 @@ async fn run_server(
     loaded_packs: Vec<types::DomainPack>,
     repo: &Path,
     config: &config::Config,
+    active_parser: Box<dyn parser::LanguageParser>,
 ) -> anyhow::Result<()> {
     spawn_parent_watchdog();
 
-    let server = tools::SemexServer::new(graph, repo.to_path_buf());
+    let active_parser: Arc<dyn parser::LanguageParser> = Arc::from(active_parser);
+    let server = tools::SemexServer::new(
+        graph,
+        repo.to_path_buf(),
+        Arc::clone(&active_parser),
+    );
 
     let graph_handle = server.graph_handle();
     let repo_root = repo.to_path_buf();
@@ -920,6 +953,11 @@ async fn run_server(
     }
     let watcher_config = config.clone();
     let watcher_packs = loaded_packs;
+    let watcher_extensions: Vec<String> = active_parser
+        .extensions()
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
     tokio::task::spawn_blocking(move || {
         let watcher_cache = match cache::IndexCache::open(&repo_root) {
             Ok(c) => c,
@@ -928,7 +966,8 @@ async fn run_server(
                 return;
             }
         };
-        let (_watcher, rx) = match watcher_cache.watch(&repo_root) {
+        let ext_refs: Vec<&str> = watcher_extensions.iter().map(|s| s.as_str()).collect();
+        let (_watcher, rx) = match watcher_cache.watch(&repo_root, &ext_refs) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("Warning: file watcher failed to start: {e}");
@@ -959,9 +998,10 @@ async fn run_server(
                             .respect_gitignore,
                     };
                     let parse_results =
-                        match parser::parse_directory(
+                        match parser::parse_directory_with(
                             &repo_root,
                             &watcher_parse_opts,
+                            &*active_parser,
                         ) {
                             Ok(r) => r,
                             Err(e) => {

@@ -1,9 +1,147 @@
 use serde::Deserialize;
 use std::path::Path;
 
+/// Language to analyze.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    #[default]
+    Auto,
+    Python,
+    #[serde(alias = "ts")]
+    TypeScript,
+    #[serde(alias = "js")]
+    JavaScript,
+}
+
+/// Directories to skip when counting file extensions for auto-detection.
+const DETECT_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "__pycache__",
+    ".git",
+    "dist",
+    ".next",
+    "venv",
+    ".venv",
+    ".tox",
+    "target",
+    ".semex",
+];
+
+impl Language {
+    /// Auto-detect language from file extensions in the repo root.
+    /// Walks up to `max_depth` levels, skipping common non-source dirs.
+    pub fn detect(repo_root: &Path) -> Language {
+        let mut py_count = 0u32;
+        let mut ts_count = 0u32;
+        let mut js_count = 0u32;
+        count_extensions(repo_root, &mut py_count, &mut ts_count, &mut js_count, 3);
+
+        if ts_count > py_count && ts_count > js_count {
+            Language::TypeScript
+        } else if js_count > py_count && js_count > ts_count {
+            Language::JavaScript
+        } else {
+            Language::Python
+        }
+    }
+
+    /// Resolve auto-detection: if `Auto`, detect from repo. Otherwise
+    /// return self.
+    pub fn resolve(&self, repo_root: &Path) -> Language {
+        match self {
+            Language::Auto => Language::detect(repo_root),
+            other => other.clone(),
+        }
+    }
+
+    /// Default include globs for this language.
+    pub fn default_include(&self) -> Vec<String> {
+        match self {
+            Language::Python | Language::Auto => {
+                vec!["**/*.py".to_string()]
+            }
+            Language::TypeScript => {
+                vec!["**/*.ts".to_string(), "**/*.tsx".to_string()]
+            }
+            Language::JavaScript => {
+                vec!["**/*.js".to_string(), "**/*.jsx".to_string()]
+            }
+        }
+    }
+
+    /// Default exclude globs for this language.
+    pub fn default_exclude(&self) -> Vec<String> {
+        match self {
+            Language::Python | Language::Auto => vec![
+                "**/test_*".to_string(),
+                "**/__pycache__".to_string(),
+            ],
+            Language::TypeScript => vec![
+                "**/node_modules".to_string(),
+                "**/dist".to_string(),
+                "**/.next".to_string(),
+                "**/*.d.ts".to_string(),
+                "**/*.test.ts".to_string(),
+                "**/*.spec.ts".to_string(),
+            ],
+            Language::JavaScript => vec![
+                "**/node_modules".to_string(),
+                "**/dist".to_string(),
+                "**/.next".to_string(),
+                "**/*.test.js".to_string(),
+                "**/*.spec.js".to_string(),
+            ],
+        }
+    }
+}
+
+/// Recursively count file extensions up to `remaining_depth`.
+fn count_extensions(
+    dir: &Path,
+    py: &mut u32,
+    ts: &mut u32,
+    js: &mut u32,
+    remaining_depth: u32,
+) {
+    if remaining_depth == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                if DETECT_SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                count_extensions(&path, py, ts, js, remaining_depth - 1);
+                continue;
+            }
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            match ext {
+                "py" => *py += 1,
+                "ts" | "tsx" => *ts += 1,
+                "js" | "jsx" | "mjs" | "cjs" => *js += 1,
+                _ => {}
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Language to analyze (default: auto-detect).
+    #[serde(default)]
+    pub language: Language,
     pub index: IndexConfig,
     pub analysis: AnalysisConfig,
     pub embeddings: EmbeddingsConfig,
@@ -98,6 +236,20 @@ impl Default for IndexConfig {
             ],
             min_frequency: 2,
             respect_gitignore: true,
+        }
+    }
+}
+
+impl IndexConfig {
+    /// Apply language-specific defaults if the user hasn't customized them.
+    /// Detects customization by comparing against the Python defaults.
+    pub fn resolve_for_language(&mut self, lang: &Language) {
+        let py_defaults = IndexConfig::default();
+        if self.include == py_defaults.include {
+            self.include = lang.default_include();
+        }
+        if self.exclude == py_defaults.exclude {
+            self.exclude = lang.default_exclude();
         }
     }
 }
@@ -289,5 +441,170 @@ entity_types = ["Function"]
         assert_eq!(config.index.min_frequency, 2); // default
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Language tests ---
+
+    #[test]
+    fn test_language_default_is_auto() {
+        let config = Config::default();
+        assert_eq!(config.language, Language::Auto);
+    }
+
+    #[test]
+    fn test_language_from_toml() {
+        let toml_str = r#"language = "typescript""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Language::TypeScript);
+    }
+
+    #[test]
+    fn test_language_alias_ts() {
+        let toml_str = r#"language = "ts""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Language::TypeScript);
+    }
+
+    #[test]
+    fn test_language_alias_js() {
+        let toml_str = r#"language = "js""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Language::JavaScript);
+    }
+
+    #[test]
+    fn test_language_detect_python() {
+        let dir = std::path::Path::new("/tmp/semex_test_detect_py");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("foo.py"), "").unwrap();
+        std::fs::write(dir.join("bar.py"), "").unwrap();
+        std::fs::write(dir.join("baz.py"), "").unwrap();
+
+        let detected = Language::detect(dir);
+        assert_eq!(detected, Language::Python);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_detect_typescript() {
+        let dir = std::path::Path::new("/tmp/semex_test_detect_ts");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("index.ts"), "").unwrap();
+        std::fs::write(dir.join("app.tsx"), "").unwrap();
+        std::fs::write(dir.join("utils.ts"), "").unwrap();
+
+        let detected = Language::detect(dir);
+        assert_eq!(detected, Language::TypeScript);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_detect_javascript() {
+        let dir = std::path::Path::new("/tmp/semex_test_detect_js");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("index.js"), "").unwrap();
+        std::fs::write(dir.join("app.jsx"), "").unwrap();
+        std::fs::write(dir.join("utils.js"), "").unwrap();
+
+        let detected = Language::detect(dir);
+        assert_eq!(detected, Language::JavaScript);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_detect_skips_node_modules() {
+        let dir = std::path::Path::new("/tmp/semex_test_detect_skip_nm");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        // Many JS files in node_modules should not tip the scale
+        for i in 0..20 {
+            std::fs::write(
+                dir.join("node_modules").join(format!("lib_{i}.js")),
+                "",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("main.py"), "").unwrap();
+        std::fs::write(dir.join("utils.py"), "").unwrap();
+
+        let detected = Language::detect(dir);
+        assert_eq!(detected, Language::Python);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_resolve_auto_detects() {
+        let dir = std::path::Path::new("/tmp/semex_test_resolve_auto");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "").unwrap();
+        std::fs::write(dir.join("b.ts"), "").unwrap();
+
+        let resolved = Language::Auto.resolve(dir);
+        assert_eq!(resolved, Language::TypeScript);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_resolve_explicit_unchanged() {
+        let dir = std::path::Path::new("/tmp/semex_test_resolve_explicit");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        // Even though there are TS files, explicit Python stays Python
+        std::fs::write(dir.join("a.ts"), "").unwrap();
+
+        let resolved = Language::Python.resolve(dir);
+        assert_eq!(resolved, Language::Python);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_typescript_default_globs() {
+        let include = Language::TypeScript.default_include();
+        assert_eq!(include, vec!["**/*.ts", "**/*.tsx"]);
+        let exclude = Language::TypeScript.default_exclude();
+        assert!(exclude.contains(&"**/node_modules".to_string()));
+        assert!(exclude.contains(&"**/*.d.ts".to_string()));
+    }
+
+    #[test]
+    fn test_javascript_default_globs() {
+        let include = Language::JavaScript.default_include();
+        assert_eq!(include, vec!["**/*.js", "**/*.jsx"]);
+        let exclude = Language::JavaScript.default_exclude();
+        assert!(exclude.contains(&"**/node_modules".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_for_language_overrides_defaults() {
+        let mut index = IndexConfig::default();
+        assert_eq!(index.include, vec!["**/*.py"]);
+
+        index.resolve_for_language(&Language::TypeScript);
+        assert_eq!(index.include, vec!["**/*.ts", "**/*.tsx"]);
+        assert!(index.exclude.contains(&"**/node_modules".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_for_language_preserves_custom() {
+        let mut index = IndexConfig {
+            include: vec!["src/**/*.py".to_string()],
+            exclude: vec!["**/vendor/**".to_string()],
+            ..Default::default()
+        };
+
+        index.resolve_for_language(&Language::TypeScript);
+        // Custom values preserved (not replaced with TS defaults)
+        assert_eq!(index.include, vec!["src/**/*.py"]);
+        assert_eq!(index.exclude, vec!["**/vendor/**"]);
     }
 }
