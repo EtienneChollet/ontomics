@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/eti/projects/ontomics/install.sh)",
+      "Bash(/home/eti/projects/ontomics/install.sh /home/eti/projects/pylot)",
+      "Bash(/home/eti/projects/ontomics/install.sh /home/eti/projects/voxelmorph)",
+      "Bash(/home/eti/projects/ontomics/install.sh /home/eti/projects/neurite)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"[feat] Add install.sh for per-project MCP registration:*)",
+      "Bash(sort -t: -k2 -rn)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo build:*)",
+      "Skill(update-config)",
+      "Skill(update-config:*)"
+    ]
+  }
+}
