@@ -121,6 +121,7 @@ fn parse_git_tree(
     tree: &git2::Tree,
     repo_root: &Path,
 ) -> Result<Vec<ParseResult>> {
+    let py_parser = parser::python_parser();
     let mut results = Vec::new();
 
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
@@ -148,12 +149,11 @@ fn parse_git_tree(
 
         let content = match std::str::from_utf8(blob.content()) {
             Ok(s) => s,
-            // Binary or non-utf8 file, skip
             Err(_) => return git2::TreeWalkResult::Ok,
         };
 
         let file_path = repo_root.join(dir).join(name);
-        if let Ok(parse_result) = parser::parse_content(content, &file_path) {
+        if let Ok(parse_result) = parser::parse_content(content, &file_path, &py_parser) {
             results.push(parse_result);
         }
 
@@ -260,10 +260,11 @@ def spatial_transform(vol, trf):
         let (dir, _repo) =
             make_test_repo("no_diff", &[("module.py", base_py)]);
 
-        // Parse HEAD to get current concepts
+        let py_parser = parser::python_parser();
         let parse_results = parser::parse_content(
             base_py,
             &dir.join("module.py"),
+            &py_parser,
         )
         .unwrap();
         let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
@@ -307,10 +308,11 @@ def compute_displacement(source, target):
 "#;
         commit_files(&repo, &dir, &[("module.py", head_py)], "add displacement");
 
-        // Parse HEAD to get current concepts
+        let py_parser = parser::python_parser();
         let parse_results = parser::parse_content(
             head_py,
             &dir.join("module.py"),
+            &py_parser,
         )
         .unwrap();
         let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
@@ -322,7 +324,6 @@ def compute_displacement(source, target):
 
         let diff = ontology_diff(&dir, "HEAD~1", &current).unwrap();
 
-        // "displacement" should be added (appears in HEAD but not in base)
         let added_names: Vec<&str> = diff
             .added_concepts
             .iter()
@@ -367,9 +368,11 @@ def spatial_transform(vol, trf):
             "remove displacement",
         );
 
+        let py_parser = parser::python_parser();
         let parse_results = parser::parse_content(
             head_py,
             &dir.join("module.py"),
+            &py_parser,
         )
         .unwrap();
         let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
