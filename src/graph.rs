@@ -31,7 +31,88 @@ pub struct ConceptGraph {
     pub entities: HashMap<u64, Entity>,
 }
 
+/// Jaccard similarity between two sets of strings.
+fn jaccard_str(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let set_a: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let set_b: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    intersection as f64 / union as f64
+}
+
+/// Jaccard similarity between two concept tag sets.
+fn jaccard_u64(a: &[u64], b: &[u64]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let set_a: HashSet<u64> = a.iter().copied().collect();
+    let set_b: HashSet<u64> = b.iter().copied().collect();
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    intersection as f64 / union as f64
+}
+
+/// Entity similarity: max of concept tag Jaccard and name subtoken Jaccard.
+fn entity_similarity(a: &Entity, b: &Entity) -> f64 {
+    let concept_sim = jaccard_u64(&a.concept_tags, &b.concept_tags);
+    let subtokens_a = split_identifier(&a.name);
+    let subtokens_b = split_identifier(&b.name);
+    let name_sim = jaccard_str(&subtokens_a, &subtokens_b);
+    concept_sim.max(name_sim)
+}
+
+/// MMR selection: pick top_k entities balancing relevance and diversity.
+/// lambda controls the tradeoff (1.0 = pure relevance, 0.0 = pure diversity).
+/// Scores are normalized to [0, 1] internally so relevance and similarity
+/// contribute on the same scale.
+fn select_diverse<'a>(
+    candidates: &mut Vec<&'a Entity>,
+    scores: &HashMap<u64, f64>,
+    top_k: usize,
+    lambda: f64,
+) -> Vec<&'a Entity> {
+    let max_score = scores.values().copied().fold(0.0_f64, f64::max);
+    let norm = if max_score > 0.0 { max_score } else { 1.0 };
+
+    let mut selected: Vec<&Entity> = Vec::with_capacity(top_k);
+    while selected.len() < top_k && !candidates.is_empty() {
+        let best_idx = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, candidate)| {
+                let relevance =
+                    scores.get(&candidate.id).copied().unwrap_or(0.0) / norm;
+                let max_sim = selected
+                    .iter()
+                    .map(|s| entity_similarity(candidate, s))
+                    .fold(0.0_f64, f64::max);
+                let mmr = lambda * relevance - (1.0 - lambda) * max_sim;
+                (i, mmr)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap();
+        selected.push(candidates.remove(best_idx));
+    }
+    selected
+}
+
 impl ConceptGraph {
+    /// Compute domain density score: sum of concept occurrence counts / subtoken count.
+    fn domain_density(&self, entity: &Entity) -> f64 {
+        let subtokens = split_identifier(&entity.name).len().max(1);
+        let occ_sum: usize = entity
+            .concept_tags
+            .iter()
+            .filter_map(|id| self.concepts.get(id))
+            .map(|c| c.occurrences.len())
+            .sum();
+        occ_sum as f64 / subtokens as f64
+    }
+
     /// Build graph from analysis results + embeddings + entities.
     pub fn build(
         analysis: AnalysisResult,
@@ -739,7 +820,7 @@ impl ConceptGraph {
         concepts
     }
 
-    /// List entities with optional filtering, ordered by concept tag count (descending).
+    /// List entities with optional filtering, ranked by MMR (domain density + diversity).
     pub fn list_entities(
         &self,
         concept_filter: Option<&str>,
@@ -778,12 +859,12 @@ impl ConceptGraph {
                 true
             })
             .collect();
-        matched.sort_by(|a, b| b.concept_tags.len().cmp(&a.concept_tags.len()));
-        matched
-            .into_iter()
-            .take(top_k)
-            .map(|e| e.summary())
-            .collect()
+        let scores: HashMap<u64, f64> = matched
+            .iter()
+            .map(|e| (e.id, self.domain_density(e)))
+            .collect();
+        let diverse = select_diverse(&mut matched, &scores, top_k, 0.7);
+        diverse.into_iter().map(|e| e.summary()).collect()
     }
 
     /// Describe a symbol (function or class) by name.
@@ -1488,18 +1569,20 @@ impl ConceptGraph {
             })
             .collect();
 
-        // Key entities sorted by specificity (fewer concept tags = more specific)
-        let mut key_entities_vec: Vec<_> = self
+        let mut key_candidates: Vec<_> = self
             .entities
             .values()
             .filter(|e| e.concept_tags.contains(&concept.id))
-            .collect::<Vec<_>>();
-        key_entities_vec.sort_by_key(|e| e.concept_tags.len());
-        let key_entities: Vec<_> = key_entities_vec
-            .into_iter()
-            .take(5)
-            .map(|e| e.summary())
             .collect();
+        let key_scores: HashMap<u64, f64> = key_candidates
+            .iter()
+            .map(|e| (e.id, self.domain_density(e)))
+            .collect();
+        let key_entities: Vec<_> =
+            select_diverse(&mut key_candidates, &key_scores, 5, 0.7)
+                .into_iter()
+                .map(|e| e.summary())
+                .collect();
 
         Some(LocateConceptResult {
             concept: concept.canonical.clone(),
@@ -1876,10 +1959,15 @@ mod tests {
     }
 
     #[test]
-    fn test_list_entities_sorted_by_concept_tag_count() {
+    fn test_list_entities_diverse_mmr() {
+        // transform: 3 occurrences, spatial: 1 occurrence, loss: 1 occurrence
         let analysis = AnalysisResult {
             concepts: vec![
-                make_concept(1, "transform", &["spatial_transform"]),
+                make_concept(
+                    1,
+                    "transform",
+                    &["transform", "apply_transform", "transform"],
+                ),
                 make_concept(2, "spatial", &["spatial_transform"]),
                 make_concept(3, "loss", &["dice_loss"]),
             ],
@@ -1890,8 +1978,33 @@ mod tests {
             call_sites: Vec::new(),
         };
         let entities = vec![
+            // density = (3 + 1) / 2 = 2.0
             Entity {
                 id: 10,
+                name: "spatial_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1, 2],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("utils.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            // density = (3 + 1) / 3 = 1.33, Jaccard=1.0 with spatial_transform
+            Entity {
+                id: 11,
+                name: "compute_spatial_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1, 2],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("utils.py"),
+                line: 20,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            // density = 1 / 2 = 0.5, Jaccard=0.0 with transform entities
+            Entity {
+                id: 12,
                 name: "dice_loss".to_string(),
                 kind: EntityKind::Function,
                 concept_tags: vec![3],
@@ -1902,18 +2015,7 @@ mod tests {
                 class_info_idx: None,
             },
             Entity {
-                id: 11,
-                name: "spatial_transform".to_string(),
-                kind: EntityKind::Function,
-                concept_tags: vec![1, 2],
-                semantic_role: "transform".to_string(),
-                file: PathBuf::from("utils.py"),
-                line: 10,
-                signature_idx: None,
-                class_info_idx: None,
-            },
-            Entity {
-                id: 12,
+                id: 13,
                 name: "helper".to_string(),
                 kind: EntityKind::Function,
                 concept_tags: vec![],
@@ -1933,10 +2035,77 @@ mod tests {
         .unwrap();
 
         let results = graph.list_entities(None, None, None, 10);
-        assert_eq!(results.len(), 3);
-        // Most concept tags first
+        assert_eq!(results.len(), 4);
+        // Highest density first
         assert_eq!(results[0].name, "spatial_transform");
+        // dice_loss (different concepts) beats compute_spatial_transform
+        // (same concepts as spatial_transform, penalized by MMR)
         assert_eq!(results[1].name, "dice_loss");
-        assert_eq!(results[2].name, "helper");
+        assert_eq!(results[2].name, "compute_spatial_transform");
+    }
+
+    #[test]
+    fn test_jaccard_u64() {
+        assert_eq!(jaccard_u64(&[1, 2], &[1, 2]), 1.0);
+        assert_eq!(jaccard_u64(&[1], &[2]), 0.0);
+        assert_eq!(jaccard_u64(&[1, 2], &[2, 3]), 1.0 / 3.0);
+        assert_eq!(jaccard_u64(&[], &[]), 1.0);
+        assert_eq!(jaccard_u64(&[], &[1]), 0.0);
+    }
+
+    #[test]
+    fn test_entity_similarity_uses_name_subtokens() {
+        // Same name, different concept tags → similarity = 1.0 via name
+        let a = Entity {
+            id: 1,
+            name: "Tensor".to_string(),
+            kind: EntityKind::Class,
+            concept_tags: vec![10],
+            semantic_role: String::new(),
+            file: PathBuf::from("a.py"),
+            line: 1,
+            signature_idx: None,
+            class_info_idx: None,
+        };
+        let b = Entity {
+            id: 2,
+            name: "Tensor".to_string(),
+            kind: EntityKind::Class,
+            concept_tags: vec![10, 20],
+            semantic_role: String::new(),
+            file: PathBuf::from("b.py"),
+            line: 1,
+            signature_idx: None,
+            class_info_idx: None,
+        };
+        assert_eq!(entity_similarity(&a, &b), 1.0);
+
+        // Different name, same concept tags → similarity = 1.0 via concepts
+        let c = Entity {
+            id: 3,
+            name: "Module".to_string(),
+            kind: EntityKind::Class,
+            concept_tags: vec![10],
+            semantic_role: String::new(),
+            file: PathBuf::from("c.py"),
+            line: 1,
+            signature_idx: None,
+            class_info_idx: None,
+        };
+        assert_eq!(entity_similarity(&a, &c), 1.0);
+
+        // Different name, different concept tags → low similarity
+        let d = Entity {
+            id: 4,
+            name: "Optimizer".to_string(),
+            kind: EntityKind::Class,
+            concept_tags: vec![30],
+            semantic_role: String::new(),
+            file: PathBuf::from("d.py"),
+            line: 1,
+            signature_idx: None,
+            class_info_idx: None,
+        };
+        assert_eq!(entity_similarity(&a, &d), 0.0);
     }
 }
