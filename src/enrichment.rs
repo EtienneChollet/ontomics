@@ -179,7 +179,7 @@ mod tests {
         use crate::cache::IndexCache;
 
         let dir = std::path::Path::new(
-            "/tmp/semex_test_lock_retry",
+            "/tmp/ontomics_test_lock_retry",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -227,7 +227,7 @@ mod tests {
         use crate::cache::IndexCache;
 
         let dir = std::path::Path::new(
-            "/tmp/semex_test_lock_retry_gen",
+            "/tmp/ontomics_test_lock_retry_gen",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();

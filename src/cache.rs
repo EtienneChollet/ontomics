@@ -15,7 +15,7 @@ use std::sync::mpsc;
 /// Auto-generated hash of indexing source files. Changes whenever
 /// entity.rs, analyzer.rs, parser.rs, cache.rs, tokenizer.rs, or types.rs
 /// are modified, triggering automatic re-indexing of stale caches.
-const CACHE_VERSION: &str = env!("SEMEX_CACHE_VERSION");
+const CACHE_VERSION: &str = env!("ONTOMICS_CACHE_VERSION");
 
 pub struct IndexCache {
     db_path: PathBuf,
@@ -38,12 +38,12 @@ struct CachedGraph {
 }
 
 impl IndexCache {
-    /// Open or create cache at `<repo_root>/.semex/index.db`.
+    /// Open or create cache at `<repo_root>/.ontomics/index.db`.
     pub fn open(repo_root: &Path) -> Result<Self> {
-        let semex_dir = repo_root.join(".semex");
-        std::fs::create_dir_all(&semex_dir)?;
+        let ontomics_dir = repo_root.join(".ontomics");
+        std::fs::create_dir_all(&ontomics_dir)?;
 
-        let db_path = semex_dir.join("index.db");
+        let db_path = ontomics_dir.join("index.db");
         {
             let conn = Connection::open(&db_path)?;
             conn.execute_batch(
@@ -76,7 +76,7 @@ impl IndexCache {
                 .unwrap_or_default();
             if age.as_secs() < 300 {
                 anyhow::bail!(
-                    "another semex instance holds the cache lock \
+                    "another ontomics instance holds the cache lock \
                      (pid in {:?}, age {:?})",
                     lock,
                     age,
@@ -199,7 +199,7 @@ impl IndexCache {
                             p.extension().is_some_and(|e| {
                                 exts.iter().any(|ext| e == ext.as_str())
                             }) && !p.components().any(|c| {
-                                c.as_os_str() == ".semex"
+                                c.as_os_str() == ".ontomics"
                             })
                         })
                         .collect();
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_cache_roundtrip() {
-        let dir = std::path::Path::new("/tmp/semex_test_cache");
+        let dir = std::path::Path::new("/tmp/ontomics_test_cache");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_sqlite_blob_roundtrip_sizes() {
-        let dir = std::path::Path::new("/tmp/semex_test_blob_sizes");
+        let dir = std::path::Path::new("/tmp/ontomics_test_blob_sizes");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
@@ -398,11 +398,11 @@ mod tests {
 
     #[test]
     fn test_sqlite_save_load_pattern() {
-        let dir = std::path::Path::new("/tmp/semex_test_save_pattern");
+        let dir = std::path::Path::new("/tmp/ontomics_test_save_pattern");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
-        let db_path = dir.join(".semex").join("index.db");
+        let db_path = dir.join(".ontomics").join("index.db");
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         // Step 1: open() — create table
@@ -472,7 +472,7 @@ mod tests {
             Signature, Param,
         };
 
-        let dir = std::path::Path::new("/tmp/semex_test_cache_realistic");
+        let dir = std::path::Path::new("/tmp/ontomics_test_cache_realistic");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
@@ -581,9 +581,9 @@ mod tests {
         cache.save(&graph, "python").unwrap();
 
         // Check for leftover journal/wal files
-        let semex_dir = dir.join(".semex");
-        let journal = semex_dir.join("index.db-journal");
-        let wal = semex_dir.join("index.db-wal");
+        let ontomics_dir = dir.join(".ontomics");
+        let journal = ontomics_dir.join("index.db-journal");
+        let wal = ontomics_dir.join("index.db-wal");
         assert!(
             !journal.exists(),
             "Journal file should not exist after save"
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_cache_load_missing() {
-        let dir = std::path::Path::new("/tmp/semex_test_cache_missing");
+        let dir = std::path::Path::new("/tmp/ontomics_test_cache_missing");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn test_cache_roundtrip_partial_embeddings() {
         let dir = std::path::Path::new(
-            "/tmp/semex_test_cache_partial_embed",
+            "/tmp/ontomics_test_cache_partial_embed",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn test_cache_roundtrip_incremental_embeddings() {
         let dir = std::path::Path::new(
-            "/tmp/semex_test_cache_incr_embed",
+            "/tmp/ontomics_test_cache_incr_embed",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn test_embedding_lock_acquire_release() {
         let dir = std::path::Path::new(
-            "/tmp/semex_test_embed_lock_basic",
+            "/tmp/ontomics_test_embed_lock_basic",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn test_embedding_lock_same_process_blocks() {
         let dir = std::path::Path::new(
-            "/tmp/semex_test_embed_lock_block",
+            "/tmp/ontomics_test_embed_lock_block",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn test_embedding_lock_stale_pid_breaks() {
         let dir = std::path::Path::new(
-            "/tmp/semex_test_embed_lock_stale",
+            "/tmp/ontomics_test_embed_lock_stale",
         );
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -821,7 +821,7 @@ mod tests {
         let cache = IndexCache::open(dir).unwrap();
 
         // Write a lock file with a PID that almost certainly doesn't exist
-        let lock_path = dir.join(".semex").join("index.embedding.lock");
+        let lock_path = dir.join(".ontomics").join("index.embedding.lock");
         std::fs::write(&lock_path, "999999999").unwrap();
 
         // Should break the stale lock and acquire

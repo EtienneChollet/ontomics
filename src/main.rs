@@ -49,7 +49,7 @@ fn spawn_parent_watchdog() {
 }
 
 #[derive(ClapParser)]
-#[command(name = "semex", about = "Domain ontology extraction for Python/TypeScript/JavaScript codebases")]
+#[command(name = "ontomics", about = "Domain ontology extraction for Python/TypeScript/JavaScript codebases")]
 struct Cli {
     /// Path to the repository to analyze (defaults to current directory)
     #[arg(long, default_value = ".")]
@@ -448,7 +448,7 @@ fn build_graph(
     if let Err(e) = cache.save(&graph, language_name) {
         eprintln!("Warning: failed to cache index: {e}");
     } else {
-        eprintln!("Cached index to .semex/index.db");
+        eprintln!("Cached index to .ontomics/index.db");
     }
 
     Ok(BuildResult {
@@ -641,7 +641,7 @@ fn enrich_graph_with_embeddings_inner(
             eprintln!("Background: cache save failed: {e}");
         } else {
             eprintln!(
-                "Background: cached index to .semex/index.db"
+                "Background: cached index to .ontomics/index.db"
             );
         }
     }
@@ -937,7 +937,7 @@ async fn run_server(
     spawn_parent_watchdog();
 
     let active_parser: Arc<dyn parser::LanguageParser> = Arc::from(active_parser);
-    let server = tools::SemexServer::new(
+    let server = tools::OntomicsServer::new(
         graph,
         repo.to_path_buf(),
         Arc::clone(&active_parser),

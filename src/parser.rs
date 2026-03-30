@@ -2391,7 +2391,7 @@ def spatial_transform(vol: Tensor, trf, nb_dims=3):
     fn fixture_result() -> &'static ParseResult {
         static RESULT: OnceLock<ParseResult> = OnceLock::new();
         RESULT.get_or_init(|| {
-            let path = Path::new("/tmp/semex_test_parser.py");
+            let path = Path::new("/tmp/ontomics_test_parser.py");
             std::fs::write(path, FIXTURE).unwrap();
             parse_file(path).unwrap()
         })

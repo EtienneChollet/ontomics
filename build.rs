@@ -21,5 +21,5 @@ fn main() {
         }
     }
     let hash = hasher.finish();
-    println!("cargo:rustc-env=SEMEX_CACHE_VERSION={hash}");
+    println!("cargo:rustc-env=ONTOMICS_CACHE_VERSION={hash}");
 }
