@@ -12,6 +12,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
+/// Auto-generated hash of indexing source files. Changes whenever
+/// entity.rs, analyzer.rs, parser.rs, cache.rs, tokenizer.rs, or types.rs
+/// are modified, triggering automatic re-indexing of stale caches.
+const CACHE_VERSION: &str = env!("SEMEX_CACHE_VERSION");
+
 pub struct IndexCache {
     db_path: PathBuf,
 }
@@ -157,6 +162,14 @@ impl IndexCache {
              VALUES (?1, ?2, datetime('now'))",
             rusqlite::params!["graph", &json],
         )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params![
+                "cache_version",
+                CACHE_VERSION.as_bytes()
+            ],
+        )?;
 
         Ok(())
     }
@@ -191,12 +204,27 @@ impl IndexCache {
         Ok((watcher, rx))
     }
 
-    /// Load cached graph. Returns None if cache is missing or corrupt.
+    /// Load cached graph. Returns None if cache is missing, corrupt, or stale.
     pub fn load(&self) -> Result<Option<ConceptGraph>> {
         if !self.db_path.exists() {
             return Ok(None);
         }
         let conn = Connection::open(&self.db_path)?;
+
+        // Check cache version — stale cache triggers re-index
+        let stored_version: Option<String> = conn
+            .query_row(
+                "SELECT value FROM cache WHERE key = ?1",
+                rusqlite::params!["cache_version"],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        if stored_version.as_deref() != Some(CACHE_VERSION) {
+            eprintln!("Cache version mismatch — re-indexing");
+            return Ok(None);
+        }
+
         let result: rusqlite::Result<Vec<u8>> = conn.query_row(
             "SELECT value FROM cache WHERE key = ?1",
             rusqlite::params!["graph"],
