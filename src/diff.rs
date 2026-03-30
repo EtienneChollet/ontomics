@@ -121,7 +121,6 @@ fn parse_git_tree(
     tree: &git2::Tree,
     repo_root: &Path,
 ) -> Result<Vec<ParseResult>> {
-    let py_parser = parser::python_parser();
     let mut results = Vec::new();
 
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
@@ -153,7 +152,7 @@ fn parse_git_tree(
         };
 
         let file_path = repo_root.join(dir).join(name);
-        if let Ok(parse_result) = parser::parse_content(content, &file_path, &py_parser) {
+        if let Ok(parse_result) = parser::parse_content(content, &file_path) {
             results.push(parse_result);
         }
 
@@ -260,11 +259,9 @@ def spatial_transform(vol, trf):
         let (dir, _repo) =
             make_test_repo("no_diff", &[("module.py", base_py)]);
 
-        let py_parser = parser::python_parser();
         let parse_results = parser::parse_content(
             base_py,
             &dir.join("module.py"),
-            &py_parser,
         )
         .unwrap();
         let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
@@ -308,11 +305,9 @@ def compute_displacement(source, target):
 "#;
         commit_files(&repo, &dir, &[("module.py", head_py)], "add displacement");
 
-        let py_parser = parser::python_parser();
         let parse_results = parser::parse_content(
             head_py,
             &dir.join("module.py"),
-            &py_parser,
         )
         .unwrap();
         let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
@@ -368,11 +363,9 @@ def spatial_transform(vol, trf):
             "remove displacement",
         );
 
-        let py_parser = parser::python_parser();
         let parse_results = parser::parse_content(
             head_py,
             &dir.join("module.py"),
-            &py_parser,
         )
         .unwrap();
         let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
