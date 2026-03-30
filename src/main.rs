@@ -207,13 +207,12 @@ fn build_graph(
     }
 
     eprintln!("Indexing {}...", repo.display());
-    let py_parser = parser::python_parser();
     let parse_opts = parser::ParseOptions {
         include: config.index.include.clone(),
         exclude: config.index.exclude.clone(),
         respect_gitignore: config.index.respect_gitignore,
     };
-    let parse_results = parser::parse_directory(repo, &parse_opts, &py_parser)?;
+    let parse_results = parser::parse_directory(repo, &parse_opts)?;
     eprintln!("Parsed {} files", parse_results.len());
 
     let analysis_params = analyzer::AnalysisParams {
@@ -922,7 +921,6 @@ async fn run_server(
     let watcher_config = config.clone();
     let watcher_packs = loaded_packs;
     tokio::task::spawn_blocking(move || {
-        let watcher_py_parser = parser::python_parser();
         let watcher_cache = match cache::IndexCache::open(&repo_root) {
             Ok(c) => c,
             Err(e) => {
@@ -964,7 +962,6 @@ async fn run_server(
                         match parser::parse_directory(
                             &repo_root,
                             &watcher_parse_opts,
-                            &watcher_py_parser,
                         ) {
                             Ok(r) => r,
                             Err(e) => {
