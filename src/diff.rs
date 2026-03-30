@@ -185,7 +185,7 @@ mod tests {
         files: &[(&str, &str)],
     ) -> (PathBuf, git2::Repository) {
         let dir = std::env::temp_dir().join(format!(
-            "semex_diff_test_{}_{}",
+            "ontomics_diff_test_{}_{}",
             std::process::id(),
             test_name,
         ));

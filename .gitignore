@@ -1,3 +1,7 @@
 /target
 LAUNCH.md
 SPEC.md
+SPEC2.md
+.fastembed_cache/
+.ontomics/
+.semex/

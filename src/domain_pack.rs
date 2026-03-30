@@ -513,7 +513,7 @@ mod tests {
         let pack = export_domain_pack(&graph);
         let yaml = serde_yaml::to_string(&pack).unwrap();
 
-        let dir = PathBuf::from("/tmp/semex_test_domain_pack_rt");
+        let dir = PathBuf::from("/tmp/ontomics_test_domain_pack_rt");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_pack.yaml");
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_load_domain_pack_rejects_bad_version() {
-        let dir = PathBuf::from("/tmp/semex_test_domain_pack_bad");
+        let dir = PathBuf::from("/tmp/ontomics_test_domain_pack_bad");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.yaml");

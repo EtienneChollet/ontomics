@@ -14,13 +14,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
-pub struct SemexServer {
+pub struct OntomicsServer {
     graph: Arc<RwLock<ConceptGraph>>,
     repo_root: PathBuf,
     parser: Arc<dyn LanguageParser>,
 }
 
-impl SemexServer {
+impl OntomicsServer {
     pub fn new(
         graph: ConceptGraph,
         repo_root: PathBuf,
@@ -426,7 +426,7 @@ fn tool_definitions() -> Vec<Tool> {
     ]
 }
 
-impl ServerHandler for SemexServer {
+impl ServerHandler for OntomicsServer {
     fn get_info(&self) -> InitializeResult {
         InitializeResult {
             protocol_version: Default::default(),
@@ -437,11 +437,11 @@ impl ServerHandler for SemexServer {
                 .enable_resources()
                 .build(),
             server_info: Implementation {
-                name: "semex".to_string(),
+                name: "ontomics".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             instructions: Some(
-                "semex extracts domain ontologies from codebases (Python, TypeScript, JavaScript). \
+                "ontomics extracts domain ontologies from codebases (Python, TypeScript, JavaScript). \
                  Use it BEFORE reading files when exploring unfamiliar code.\n\
                  \n\
                  WHEN TO USE:\n\
@@ -454,9 +454,9 @@ impl ServerHandler for SemexServer {
                  - \"describe function/class X\" → describe_symbol\n\
                  - \"what loss functions exist\" / \"show me X classes\" → list_entities\n\
                  \n\
-                 semex gives you semantic understanding (concepts, conventions, \
+                 ontomics gives you semantic understanding (concepts, conventions, \
                  relationships) without reading files. Use file reading only as \
-                 fallback when semex returns insufficient detail."
+                 fallback when ontomics returns insufficient detail."
                     .to_string(),
             ),
         }
@@ -520,7 +520,7 @@ impl ServerHandler for SemexServer {
            + '_ {
         let resource = Resource::new(
             RawResource {
-                uri: "semex://briefing".to_string(),
+                uri: "ontomics://briefing".to_string(),
                 name: "Session Briefing".to_string(),
                 description: Some(
                     "Project conventions, abbreviations, top concepts, \
@@ -545,7 +545,7 @@ impl ServerHandler for SemexServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::Error>>
            + Send
            + '_ {
-        let result = if request.uri == "semex://briefing" {
+        let result = if request.uri == "ontomics://briefing" {
             match self.graph.read() {
                 Ok(graph) => {
                     let briefing = graph.session_briefing();
@@ -554,7 +554,7 @@ impl ServerHandler for SemexServer {
                     Ok(ReadResourceResult {
                         contents: vec![ResourceContents::text(
                             json,
-                            "semex://briefing",
+                            "ontomics://briefing",
                         )],
                     })
                 }
@@ -606,7 +606,7 @@ mod tests {
         }
     }
 
-    fn make_test_server() -> SemexServer {
+    fn make_test_server() -> OntomicsServer {
         let analysis = AnalysisResult {
             concepts: vec![
                 make_concept(
@@ -634,7 +634,7 @@ mod tests {
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
-        SemexServer::new(
+        OntomicsServer::new(
             graph,
             PathBuf::from("/tmp"),
             Arc::new(crate::parser::python_parser()),
@@ -722,7 +722,7 @@ mod tests {
     fn test_get_info() {
         let server = make_test_server();
         let info = server.get_info();
-        assert_eq!(info.server_info.name, "semex");
+        assert_eq!(info.server_info.name, "ontomics");
         assert!(info.capabilities.tools.is_some());
     }
 

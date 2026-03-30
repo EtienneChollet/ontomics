@@ -25,7 +25,7 @@ const DETECT_SKIP_DIRS: &[&str] = &[
     ".venv",
     ".tox",
     "target",
-    ".semex",
+    ".ontomics",
 ];
 
 impl Language {
@@ -279,7 +279,7 @@ impl Default for EmbeddingsConfig {
             enabled: true,
             model: "BAAI/bge-small-en-v1.5".to_string(),
             similarity_threshold: 0.75,
-            model_cache_dir: "~/.cache/semex".to_string(),
+            model_cache_dir: "~/.cache/ontomics".to_string(),
         }
     }
 }
@@ -288,7 +288,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            path: ".semex/index.db".to_string(),
+            path: ".ontomics/index.db".to_string(),
         }
     }
 }
@@ -328,10 +328,10 @@ impl Default for ResourcesConfig {
 }
 
 impl Config {
-    /// Load config from `.semex/config.toml` relative to repo_root.
+    /// Load config from `.ontomics/config.toml` relative to repo_root.
     /// Returns default config if file doesn't exist.
     pub fn load(repo_root: &Path) -> anyhow::Result<Self> {
-        let config_path = repo_root.join(".semex").join("config.toml");
+        let config_path = repo_root.join(".ontomics").join("config.toml");
         if !config_path.exists() {
             return Ok(Self::default());
         }
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_load_missing_file_returns_default() {
-        let dir = std::path::Path::new("/tmp/semex_test_config_missing");
+        let dir = std::path::Path::new("/tmp/ontomics_test_config_missing");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
@@ -434,13 +434,13 @@ entity_types = ["Function"]
 
     #[test]
     fn test_load_from_file() {
-        let dir = std::path::Path::new("/tmp/semex_test_config_load");
+        let dir = std::path::Path::new("/tmp/ontomics_test_config_load");
         let _ = std::fs::remove_dir_all(dir);
-        let semex_dir = dir.join(".semex");
-        std::fs::create_dir_all(&semex_dir).unwrap();
+        let ontomics_dir = dir.join(".ontomics");
+        std::fs::create_dir_all(&ontomics_dir).unwrap();
 
         std::fs::write(
-            semex_dir.join("config.toml"),
+            ontomics_dir.join("config.toml"),
             "[analysis]\nconvention_threshold = 4\n",
         )
         .unwrap();
@@ -483,7 +483,7 @@ entity_types = ["Function"]
 
     #[test]
     fn test_language_detect_python() {
-        let dir = std::path::Path::new("/tmp/semex_test_detect_py");
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_py");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("foo.py"), "").unwrap();
@@ -498,7 +498,7 @@ entity_types = ["Function"]
 
     #[test]
     fn test_language_detect_typescript() {
-        let dir = std::path::Path::new("/tmp/semex_test_detect_ts");
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_ts");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("index.ts"), "").unwrap();
@@ -513,7 +513,7 @@ entity_types = ["Function"]
 
     #[test]
     fn test_language_detect_javascript() {
-        let dir = std::path::Path::new("/tmp/semex_test_detect_js");
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_js");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("index.js"), "").unwrap();
@@ -528,7 +528,7 @@ entity_types = ["Function"]
 
     #[test]
     fn test_language_detect_skips_node_modules() {
-        let dir = std::path::Path::new("/tmp/semex_test_detect_skip_nm");
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_skip_nm");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
         // Many JS files in node_modules should not tip the scale
@@ -550,7 +550,7 @@ entity_types = ["Function"]
 
     #[test]
     fn test_language_resolve_auto_detects() {
-        let dir = std::path::Path::new("/tmp/semex_test_resolve_auto");
+        let dir = std::path::Path::new("/tmp/ontomics_test_resolve_auto");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("a.ts"), "").unwrap();
@@ -564,7 +564,7 @@ entity_types = ["Function"]
 
     #[test]
     fn test_language_resolve_explicit_unchanged() {
-        let dir = std::path::Path::new("/tmp/semex_test_resolve_explicit");
+        let dir = std::path::Path::new("/tmp/ontomics_test_resolve_explicit");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         // Even though there are TS files, explicit Python stays Python

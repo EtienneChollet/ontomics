@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-## What is semex?
+## What is ontomics?
 
 A Rust MCP server that extracts domain ontologies from Python codebases. It indexes **domain semantics** (concepts, naming conventions, vocabulary) — not code structure. See `SPEC.md` for the full design contract.
 
@@ -10,7 +10,7 @@ A Rust MCP server that extracts domain ontologies from Python codebases. It inde
 
 ## Paths
 
-- **Project**: `/home/eti/projects/semex`
+- **Project**: `/home/eti/projects/ontomics`
 - **Test corpus (primary)**: `/home/eti/projects/voxelmorph` — medical image registration, rich domain vocabulary
 - **Test corpus (secondary)**: `/home/eti/projects/neurite` — neural network utilities, overlapping domain
 
@@ -68,5 +68,5 @@ Each step should compile and pass tests before moving to the next.
 - **TF-IDF over subtokens** where "documents" = files. This naturally separates domain terms (`displacement`, `segmentation`) from generic terms (`value`, `data`, `self`).
 - **Convention detection threshold**: minimum 3 examples before declaring a pattern (e.g., need `nb_features`, `nb_bins`, `nb_steps` before declaring `nb_` is a convention).
 - **MCP transport**: stdio only. No HTTP, no WebSocket.
-- **Cache location**: `<target_repo>/.semex/index.db` — lives inside the repo being analyzed, not in semex's own directory.
+- **Cache location**: `<target_repo>/.ontomics/index.db` — lives inside the repo being analyzed, not in ontomics's own directory.
 
