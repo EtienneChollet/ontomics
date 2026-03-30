@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.etiennechollet/ontomics",
+  "description": "MCP server that understands your project's domain concepts. Indexes naming conventions, concept vocabulary, and semantic relationships via tree-sitter parsing and embedding similarity.",
+  "title": "ontomics",
+  "websiteUrl": "https://github.com/EtienneChollet/ontomics",
+  "repository": {
+    "url": "https://github.com/EtienneChollet/ontomics",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@ontomics/ontomics",
+      "version": "0.1.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--repo",
+          "description": "Path to the repository to analyze",
+          "valueHint": "filepath",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
