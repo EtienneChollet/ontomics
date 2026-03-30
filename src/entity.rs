@@ -5,6 +5,28 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 
+const MIN_PREFIX_LEN: usize = 4;
+
+/// Match a subtoken to a concept canonical via prefix overlap.
+/// Returns the concept id if the shorter string is a prefix of the longer
+/// (or they're equal), with a minimum length to avoid false positives.
+fn match_concept(subtoken: &str, concepts: &HashMap<&str, u64>) -> Option<u64> {
+    if let Some(&id) = concepts.get(subtoken) {
+        return Some(id);
+    }
+    if subtoken.len() < MIN_PREFIX_LEN {
+        return None;
+    }
+    concepts
+        .iter()
+        .find(|(canonical, _)| {
+            canonical.len() >= MIN_PREFIX_LEN
+                && (subtoken.starts_with(*canonical)
+                    || canonical.starts_with(subtoken))
+        })
+        .map(|(_, &id)| id)
+}
+
 /// Build entity nodes from L2 structural data + L1 concept data.
 ///
 /// Returns entities and their relationship edges (Instantiates, InheritsFrom, Uses).
@@ -47,7 +69,7 @@ pub fn build_entities(
         let subtokens = split_identifier(&class.name);
         let concept_tags: Vec<u64> = subtokens
             .iter()
-            .filter_map(|st| concept_by_canonical.get(st.as_str()).copied())
+            .filter_map(|st| match_concept(st, &concept_by_canonical))
             .collect();
 
         let is_significant = !concept_tags.is_empty()
@@ -95,7 +117,7 @@ pub fn build_entities(
         let subtokens = split_identifier(&sig.name);
         let concept_tags: Vec<u64> = subtokens
             .iter()
-            .filter_map(|st| concept_by_canonical.get(st.as_str()).copied())
+            .filter_map(|st| match_concept(st, &concept_by_canonical))
             .collect();
 
         let is_significant = !concept_tags.is_empty()
