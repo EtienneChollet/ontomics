@@ -68,19 +68,9 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
 ///
 /// Like `parse_file`, but takes source content directly instead of reading
 /// from disk. Used by the diff module to parse files from git tree objects.
+#[cfg(test)]
 pub fn parse_content(source: &str, path: &Path) -> Result<ParseResult> {
     parse_content_with(source, path, &PythonParser)
-}
-
-/// Parse all matching files in a directory tree using parallel iteration.
-///
-/// Uses `ignore::WalkBuilder` to natively respect `.gitignore` files
-/// and skip hidden files/directories.
-pub fn parse_directory(
-    root: &Path,
-    opts: &ParseOptions,
-) -> Result<Vec<ParseResult>> {
-    parse_directory_with(root, opts, &PythonParser)
 }
 
 // ---------------------------------------------------------------------------

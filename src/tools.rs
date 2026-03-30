@@ -1,5 +1,6 @@
 use crate::diff;
 use crate::graph::ConceptGraph;
+use crate::parser::LanguageParser;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, Implementation, InitializeResult,
@@ -16,13 +17,19 @@ use std::sync::{Arc, RwLock};
 pub struct SemexServer {
     graph: Arc<RwLock<ConceptGraph>>,
     repo_root: PathBuf,
+    parser: Arc<dyn LanguageParser>,
 }
 
 impl SemexServer {
-    pub fn new(graph: ConceptGraph, repo_root: PathBuf) -> Self {
+    pub fn new(
+        graph: ConceptGraph,
+        repo_root: PathBuf,
+        parser: Arc<dyn LanguageParser>,
+    ) -> Self {
         Self {
             graph: Arc::new(RwLock::new(graph)),
             repo_root,
+            parser,
         }
     }
 
@@ -113,6 +120,7 @@ impl SemexServer {
             &self.repo_root,
             since,
             &graph.concepts,
+            &*self.parser,
         )
         .map_err(|e| format!("ontology_diff failed: {e}"))?;
 
@@ -389,7 +397,7 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "list_entities",
-            "List Python objects (classes, functions) that instantiate domain concepts. \
+            "List code entities (classes, functions) that instantiate domain concepts. \
              Use when asked 'what loss functions exist', 'show me the network classes', \
              or 'what uses concept X'. Returns entities with semantic roles and concept tags.",
             tool_schema(
@@ -433,7 +441,7 @@ impl ServerHandler for SemexServer {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             instructions: Some(
-                "semex extracts domain ontologies from Python codebases. \
+                "semex extracts domain ontologies from codebases (Python, TypeScript, JavaScript). \
                  Use it BEFORE reading files when exploring unfamiliar code.\n\
                  \n\
                  WHEN TO USE:\n\
@@ -626,7 +634,11 @@ mod tests {
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
-        SemexServer::new(graph, PathBuf::from("/tmp"))
+        SemexServer::new(
+            graph,
+            PathBuf::from("/tmp"),
+            Arc::new(crate::parser::python_parser()),
+        )
     }
 
     #[test]
