@@ -3366,3 +3366,388 @@ function spatialTransform(vol, trf, nbDims = 3) {
         assert!(aliases.is_empty(), "JS should have no type aliases");
     }
 }
+
+// =========================================================================
+// Cross-language parity tests
+// =========================================================================
+
+#[cfg(test)]
+mod cross_language_tests {
+    use super::*;
+    use crate::types::EntityType;
+    use std::path::Path;
+
+    fn names_of(
+        result: &ParseResult,
+        entity_type: EntityType,
+    ) -> Vec<String> {
+        result
+            .identifiers
+            .iter()
+            .filter(|id| id.entity_type == entity_type)
+            .map(|id| id.name.clone())
+            .collect()
+    }
+
+    // The three equivalent source snippets define the same domain concepts.
+    const PY_SOURCE: &str = r#"
+class SpatialTransform:
+    def __init__(self, source, target):
+        self.displacement = source - target
+
+    def apply(self, volume):
+        return volume
+
+def compute_displacement(source, target):
+    displacement = source - target
+    return displacement
+"#;
+
+    const TS_SOURCE: &str = r#"
+class SpatialTransform {
+    displacement: number;
+    constructor(source: any, target: any) {
+        this.displacement = source - target;
+    }
+    apply(volume: any): any {
+        return volume;
+    }
+}
+
+function computeDisplacement(source: any, target: any): number {
+    const displacement = source - target;
+    return displacement;
+}
+"#;
+
+    const JS_SOURCE: &str = r#"
+class SpatialTransform {
+    constructor(source, target) {
+        this.displacement = source - target;
+    }
+    apply(volume) {
+        return volume;
+    }
+}
+
+function computeDisplacement(source, target) {
+    const displacement = source - target;
+    return displacement;
+}
+"#;
+
+    #[test]
+    fn test_cross_language_parity() {
+        let py = parse_content_with(
+            PY_SOURCE, Path::new("test.py"), &PythonParser,
+        )
+        .unwrap();
+        let ts = parse_content_with(
+            TS_SOURCE, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let js = parse_content_with(
+            JS_SOURCE, Path::new("test.js"), &JavaScriptParser,
+        )
+        .unwrap();
+
+        for (label, result) in
+            [("Python", &py), ("TypeScript", &ts), ("JavaScript", &js)]
+        {
+            let classes = names_of(result, EntityType::Class);
+            assert!(
+                classes.contains(&"SpatialTransform".to_string()),
+                "{label}: missing class SpatialTransform. Got: {classes:?}"
+            );
+
+            let fns = names_of(result, EntityType::Function);
+            assert!(
+                fns.contains(&"apply".to_string()),
+                "{label}: missing method 'apply'. Got: {fns:?}"
+            );
+
+            let vars = names_of(result, EntityType::Variable);
+            assert!(
+                vars.contains(&"displacement".to_string()),
+                "{label}: missing variable displacement. Got: {vars:?}"
+            );
+
+            let attrs = names_of(result, EntityType::Attribute);
+            assert!(
+                attrs.contains(&"displacement".to_string()),
+                "{label}: missing attribute displacement \
+                 (self/this.displacement). Got: {attrs:?}"
+            );
+        }
+
+        // Standalone function names differ by convention (snake_case vs
+        // camelCase), but both must be classified as Function.
+        assert!(
+            names_of(&py, EntityType::Function)
+                .contains(&"compute_displacement".to_string()),
+            "Python: missing fn compute_displacement"
+        );
+        assert!(
+            names_of(&ts, EntityType::Function)
+                .contains(&"computeDisplacement".to_string()),
+            "TypeScript: missing fn computeDisplacement"
+        );
+        assert!(
+            names_of(&js, EntityType::Function)
+                .contains(&"computeDisplacement".to_string()),
+            "JavaScript: missing fn computeDisplacement"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TS-specific features
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ts_interface_extraction() {
+        let source = r#"
+interface VolumeTransform {
+    source: Float32Array;
+    displacement: number[];
+    apply(volume: any): any;
+}
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let interfaces = names_of(&result, EntityType::Interface);
+        assert!(
+            interfaces.contains(&"VolumeTransform".to_string()),
+            "Missing interface VolumeTransform. Got: {interfaces:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_type_alias_extraction() {
+        let source = r#"
+type DisplacementField = Float32Array;
+type RegistrationResult = { source: any; target: any };
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let aliases = names_of(&result, EntityType::TypeAlias);
+        assert!(
+            aliases.contains(&"DisplacementField".to_string()),
+            "Missing type alias DisplacementField. Got: {aliases:?}"
+        );
+        assert!(
+            aliases.contains(&"RegistrationResult".to_string()),
+            "Missing type alias RegistrationResult. Got: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_jsdoc_with_param_tags() {
+        let source = r#"
+/**
+ * Apply a spatial transform to a volume.
+ * @param source - the source volume
+ * @param displacement - the displacement field
+ * @returns transformed volume
+ */
+function applyTransform(source: any, displacement: any): any {
+    return source;
+}
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        assert!(
+            !result.doc_texts.is_empty(),
+            "Expected JSDoc to be extracted"
+        );
+        let combined: String = result
+            .doc_texts
+            .iter()
+            .map(|(_, _, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("spatial transform"),
+            "Expected 'spatial transform' in doc. Got: {combined:?}"
+        );
+        assert!(
+            combined.contains("@param"),
+            "Expected @param tags in doc. Got: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_decorators_extracted() {
+        let source = r#"
+class Model {
+    @injectable
+    private service: any;
+
+    @deprecated
+    oldMethod(): void {}
+}
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let decorators = names_of(&result, EntityType::Decorator);
+        assert!(
+            decorators.contains(&"injectable".to_string()),
+            "Missing decorator: injectable. Got: {decorators:?}"
+        );
+        assert!(
+            decorators.contains(&"deprecated".to_string()),
+            "Missing decorator: deprecated. Got: {decorators:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_export_default_class() {
+        let source = r#"
+export default class VolumeRenderer {
+    render(volume: any): void {}
+}
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let classes = names_of(&result, EntityType::Class);
+        assert!(
+            classes.contains(&"VolumeRenderer".to_string()),
+            "Missing class from export default class. Got: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_export_const_arrow_function() {
+        let source = r#"
+export const computeNorm = (vec: number[]): number => {
+    return Math.sqrt(vec.reduce((a, b) => a + b * b, 0));
+};
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let fns = names_of(&result, EntityType::Function);
+        assert!(
+            fns.contains(&"computeNorm".to_string()),
+            "export const arrow fn should be Function. Got: {fns:?}"
+        );
+        let vars = names_of(&result, EntityType::Variable);
+        assert!(
+            !vars.contains(&"computeNorm".to_string()),
+            "Arrow fn computeNorm must not be a Variable. Got: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_arrow_function_with_complex_types() {
+        let source = r#"
+const processVolume = (
+    source: Float32Array,
+    target: Float32Array,
+    options: { normalize: boolean; nbDims: number }
+): Promise<Float32Array> => {
+    return Promise.resolve(source);
+};
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.ts"), &TypeScriptParser,
+        )
+        .unwrap();
+        let fns = names_of(&result, EntityType::Function);
+        assert!(
+            fns.contains(&"processVolume".to_string()),
+            "Missing arrow fn with complex types. Got: {fns:?}"
+        );
+        let params = names_of(&result, EntityType::Parameter);
+        assert!(
+            params.contains(&"source".to_string()),
+            "Missing param source. Got: {params:?}"
+        );
+        assert!(
+            params.contains(&"target".to_string()),
+            "Missing param target. Got: {params:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // JS edge cases: patterns that must not crash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_js_module_exports_no_crash() {
+        let source = r#"
+function computeTransform(source, target) {
+    return source - target;
+}
+
+module.exports = {
+    computeTransform,
+};
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.js"), &JavaScriptParser,
+        );
+        assert!(result.is_ok(), "module.exports should not crash the parser");
+        let fns = names_of(&result.unwrap(), EntityType::Function);
+        assert!(
+            fns.contains(&"computeTransform".to_string()),
+            "Missing fn with module.exports. Got: {fns:?}"
+        );
+    }
+
+    #[test]
+    fn test_js_require_calls_no_crash() {
+        let source = r#"
+const fs = require('fs');
+const path = require('path');
+
+function loadVolume(filepath) {
+    return fs.readFileSync(filepath);
+}
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.js"), &JavaScriptParser,
+        );
+        assert!(result.is_ok(), "require() calls should not crash the parser");
+        let fns = names_of(&result.unwrap(), EntityType::Function);
+        assert!(
+            fns.contains(&"loadVolume".to_string()),
+            "Missing fn with require. Got: {fns:?}"
+        );
+    }
+
+    #[test]
+    fn test_js_prototype_pattern_no_crash() {
+        let source = r#"
+function VolumeProcessor(threshold) {
+    this.threshold = threshold;
+}
+
+VolumeProcessor.prototype.process = function(volume) {
+    return volume;
+};
+"#;
+        let result = parse_content_with(
+            source, Path::new("test.js"), &JavaScriptParser,
+        );
+        assert!(
+            result.is_ok(),
+            "Prototype patterns should not crash the parser"
+        );
+        let fns = names_of(&result.unwrap(), EntityType::Function);
+        assert!(
+            fns.contains(&"VolumeProcessor".to_string()),
+            "Missing constructor fn VolumeProcessor. Got: {fns:?}"
+        );
+    }
+}
