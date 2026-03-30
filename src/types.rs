@@ -13,6 +13,8 @@ pub enum EntityType {
     Decorator,
     TypeAnnotation,
     DocText,
+    Interface,
+    TypeAlias,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
