@@ -739,7 +739,7 @@ impl ConceptGraph {
         concepts
     }
 
-    /// List entities with optional filtering by concept, semantic role, and kind.
+    /// List entities with optional filtering, ordered by concept tag count (descending).
     pub fn list_entities(
         &self,
         concept_filter: Option<&str>,
@@ -778,7 +778,7 @@ impl ConceptGraph {
                 true
             })
             .collect();
-        matched.sort_by(|a, b| a.name.cmp(&b.name));
+        matched.sort_by(|a, b| b.concept_tags.len().cmp(&a.concept_tags.len()));
         matched
             .into_iter()
             .take(top_k)
@@ -1873,5 +1873,70 @@ mod tests {
         assert!(abbrevs.iter().any(|r| r.source == 1 && r.target == 2));
         // seg → segmentation
         assert!(abbrevs.iter().any(|r| r.source == 3 && r.target == 4));
+    }
+
+    #[test]
+    fn test_list_entities_sorted_by_concept_tag_count() {
+        let analysis = AnalysisResult {
+            concepts: vec![
+                make_concept(1, "transform", &["spatial_transform"]),
+                make_concept(2, "spatial", &["spatial_transform"]),
+                make_concept(3, "loss", &["dice_loss"]),
+            ],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let entities = vec![
+            Entity {
+                id: 10,
+                name: "dice_loss".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![3],
+                semantic_role: "loss".to_string(),
+                file: PathBuf::from("losses.py"),
+                line: 1,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 11,
+                name: "spatial_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1, 2],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("utils.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 12,
+                name: "helper".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![],
+                semantic_role: "utility".to_string(),
+                file: PathBuf::from("utils.py"),
+                line: 50,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+        let graph = ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let results = graph.list_entities(None, None, None, 10);
+        assert_eq!(results.len(), 3);
+        // Most concept tags first
+        assert_eq!(results[0].name, "spatial_transform");
+        assert_eq!(results[1].name, "dice_loss");
+        assert_eq!(results[2].name, "helper");
     }
 }
