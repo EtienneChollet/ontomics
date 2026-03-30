@@ -2,6 +2,10 @@
 name = "semex"
 version = "0.1.0"
 edition = "2021"
+description = "MCP server that extracts domain ontologies from Python codebases"
+license = "MIT"
+repository = "https://github.com/EtienneChollet/semex"
+readme = "README.md"
 
 [features]
 lsp = []
@@ -10,6 +14,8 @@ lsp = []
 # Parsing
 tree-sitter = "0.24"
 tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
 
 # Embeddings
 fastembed = "4"
@@ -21,7 +27,7 @@ rmcp = { version = "0.1", features = ["server", "transport-io"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Git
-git2 = "0.19"
+git2 = { version = "0.19", features = ["vendored-openssl"] }
 
 # File watching
 notify = "7"
@@ -55,3 +61,8 @@ ignore = "0.4"
 # Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
