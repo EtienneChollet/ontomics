@@ -46,6 +46,15 @@ impl Language {
         }
     }
 
+    /// Stable string name for cache tagging.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Language::Auto | Language::Python => "python",
+            Language::TypeScript => "typescript",
+            Language::JavaScript => "javascript",
+        }
+    }
+
     /// Resolve auto-detection: if `Auto`, detect from repo. Otherwise
     /// return self.
     pub fn resolve(&self, repo_root: &Path) -> Language {

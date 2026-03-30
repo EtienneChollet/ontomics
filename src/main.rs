@@ -155,6 +155,7 @@ fn build_graph(
     config: &config::Config,
     defer_embeddings: bool,
     lang: &dyn parser::LanguageParser,
+    language_name: &str,
 ) -> anyhow::Result<BuildResult> {
     let cache = cache::IndexCache::open(repo)?;
 
@@ -164,7 +165,7 @@ fn build_graph(
     // (fresh build, cache hit, watcher, background enrichment).
     let loaded_packs = load_domain_packs(repo, config);
 
-    if let Some(mut cached) = cache.load()? {
+    if let Some(mut cached) = cache.load(language_name)? {
         let nb_concepts = cached.concepts.len();
         let nb_embedded = cached.embeddings.nb_vectors();
         eprintln!(
@@ -348,7 +349,7 @@ fn build_graph(
             graph.entities.insert(ent.id, ent);
         }
 
-        if let Err(e) = cache.save(&graph) {
+        if let Err(e) = cache.save(&graph, language_name) {
             eprintln!("Warning: failed to cache initial index: {e}");
         }
 
@@ -444,7 +445,7 @@ fn build_graph(
         }
     }
 
-    if let Err(e) = cache.save(&graph) {
+    if let Err(e) = cache.save(&graph, language_name) {
         eprintln!("Warning: failed to cache index: {e}");
     } else {
         eprintln!("Cached index to .semex/index.db");
@@ -468,6 +469,7 @@ fn enrich_graph_with_embeddings(
     graph_handle: std::sync::Arc<std::sync::RwLock<graph::ConceptGraph>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     repo: PathBuf,
+    language_name: String,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -509,6 +511,7 @@ fn enrich_graph_with_embeddings(
         generation,
         my_gen,
         &cache,
+        &language_name,
     );
 
     cache.release_embedding_lock();
@@ -524,6 +527,7 @@ fn enrich_graph_with_embeddings_inner(
     generation: Arc<std::sync::atomic::AtomicU64>,
     my_gen: u64,
     cache: &cache::IndexCache,
+    language_name: &str,
 ) -> anyhow::Result<()> {
     // Check generation before expensive model load
     if enrichment::is_generation_stale(&generation, my_gen) {
@@ -590,7 +594,7 @@ fn enrich_graph_with_embeddings_inner(
 
             // Checkpoint to cache
             if let Ok(g) = graph_handle.read() {
-                if let Err(e) = cache.save(&g) {
+                if let Err(e) = cache.save(&g, language_name) {
                     eprintln!(
                         "Background: checkpoint failed: {e}"
                     );
@@ -633,7 +637,7 @@ fn enrich_graph_with_embeddings_inner(
 
     // Final cache save
     if let Ok(g) = graph_handle.read() {
-        if let Err(e) = cache.save(&g) {
+        if let Err(e) = cache.save(&g, language_name) {
             eprintln!("Background: cache save failed: {e}");
         } else {
             eprintln!(
@@ -688,7 +692,8 @@ async fn main() -> anyhow::Result<()> {
         cli.command.as_ref().unwrap_or(&Command::Serve),
         Command::Serve
     );
-    let result = build_graph(&cli.repo, &config, is_serve, &*active_parser)?;
+    let lang_name = language.name().to_string();
+    let result = build_graph(&cli.repo, &config, is_serve, &*active_parser, &lang_name)?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
@@ -699,6 +704,7 @@ async fn main() -> anyhow::Result<()> {
                 &cli.repo,
                 &config,
                 active_parser,
+                lang_name,
             )
             .await
         }
@@ -926,6 +932,7 @@ async fn run_server(
     repo: &Path,
     config: &config::Config,
     active_parser: Box<dyn parser::LanguageParser>,
+    language_name: String,
 ) -> anyhow::Result<()> {
     spawn_parent_watchdog();
 
@@ -945,14 +952,16 @@ async fn run_server(
         let bg_handle = Arc::clone(&graph_handle);
         let bg_gen = Arc::clone(&generation);
         let bg_repo = repo_root.clone();
+        let bg_lang_name = language_name.clone();
         std::thread::spawn(move || {
             enrich_graph_with_embeddings(
-                work, bg_handle, bg_gen, bg_repo,
+                work, bg_handle, bg_gen, bg_repo, bg_lang_name,
             );
         });
     }
     let watcher_config = config.clone();
     let watcher_packs = loaded_packs;
+    let watcher_language_name = language_name;
     let watcher_extensions: Vec<String> = active_parser
         .extensions()
         .iter()
@@ -1124,9 +1133,10 @@ async fn run_server(
                         let bg_handle = Arc::clone(&graph_handle);
                         let bg_gen = Arc::clone(&generation);
                         let bg_repo = repo_root.clone();
+                        let bg_lang_name = watcher_language_name.clone();
                         std::thread::spawn(move || {
                             enrich_graph_with_embeddings(
-                                work, bg_handle, bg_gen, bg_repo,
+                                work, bg_handle, bg_gen, bg_repo, bg_lang_name,
                             );
                         });
                     }
