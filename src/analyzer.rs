@@ -184,9 +184,11 @@ fn detect_conventions(
         &all_identifiers,
         convention_threshold,
     ));
+    // Higher threshold for camelCase conventions to avoid false positives
+    // in Python codebases that happen to have a few camelCase names
     conventions.extend(detect_camelcase_prefix_conventions(
         &all_identifiers,
-        convention_threshold,
+        convention_threshold.max(5),
     ));
     conventions.extend(detect_special_suffix_conventions(
         &all_identifiers,
@@ -844,6 +846,8 @@ mod tests {
             ("useAuth", EntityType::Function),
             ("useRouter", EntityType::Function),
             ("useState", EntityType::Function),
+            ("useEffect", EntityType::Function),
+            ("useMemo", EntityType::Function),
         ]);
         let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
@@ -859,6 +863,8 @@ mod tests {
             ("handleSubmit", EntityType::Function),
             ("handleClick", EntityType::Function),
             ("handleChange", EntityType::Function),
+            ("handleInput", EntityType::Function),
+            ("handleBlur", EntityType::Function),
         ]);
         let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
@@ -877,6 +883,8 @@ mod tests {
             ("onClick", EntityType::Variable),
             ("onChange", EntityType::Variable),
             ("onSubmit", EntityType::Variable),
+            ("onBlur", EntityType::Variable),
+            ("onFocus", EntityType::Variable),
         ]);
         let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {

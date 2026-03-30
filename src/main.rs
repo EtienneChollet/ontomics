@@ -674,7 +674,7 @@ async fn main() -> anyhow::Result<()> {
         config::Language::Python => Box::new(parser::python_parser()),
         config::Language::TypeScript => Box::new(parser::typescript_parser()),
         config::Language::JavaScript => Box::new(parser::javascript_parser()),
-        config::Language::Auto => Box::new(parser::python_parser()),
+        config::Language::Auto => unreachable!("Language::Auto must be resolved before parser instantiation"),
     };
     eprintln!("Language: {language:?}");
 
