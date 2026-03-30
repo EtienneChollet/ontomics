@@ -133,17 +133,17 @@ impl IndexCache {
         let _ = fs::remove_file(self.embedding_lock_path());
     }
 
-    /// Save full graph to cache.
-    pub fn save(&self, graph: &ConceptGraph) -> Result<()> {
+    /// Save full graph to cache, tagged with the active language.
+    pub fn save(&self, graph: &ConceptGraph, language: &str) -> Result<()> {
         self.acquire_lock()
             .context("failed to acquire cache lock")?;
 
-        let result = self.save_inner(graph);
+        let result = self.save_inner(graph, language);
         self.release_lock();
         result
     }
 
-    fn save_inner(&self, graph: &ConceptGraph) -> Result<()> {
+    fn save_inner(&self, graph: &ConceptGraph, language: &str) -> Result<()> {
         let cached = CachedGraph {
             concepts: graph.concepts.clone(),
             relationships: graph.relationships.clone(),
@@ -169,6 +169,11 @@ impl IndexCache {
                 "cache_version",
                 CACHE_VERSION.as_bytes()
             ],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params!["language", language.as_bytes()],
         )?;
 
         Ok(())
@@ -208,8 +213,9 @@ impl IndexCache {
         Ok((watcher, rx))
     }
 
-    /// Load cached graph. Returns None if cache is missing, corrupt, or stale.
-    pub fn load(&self) -> Result<Option<ConceptGraph>> {
+    /// Load cached graph. Returns None if cache is missing, corrupt, stale,
+    /// or was built for a different language.
+    pub fn load(&self, language: &str) -> Result<Option<ConceptGraph>> {
         if !self.db_path.exists() {
             return Ok(None);
         }
@@ -226,6 +232,23 @@ impl IndexCache {
             .and_then(|b| String::from_utf8(b).ok());
         if stored_version.as_deref() != Some(CACHE_VERSION) {
             eprintln!("Cache version mismatch — re-indexing");
+            return Ok(None);
+        }
+
+        let stored_language: Option<String> = conn
+            .query_row(
+                "SELECT value FROM cache WHERE key = ?1",
+                rusqlite::params!["language"],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        if stored_language.as_deref() != Some(language) {
+            eprintln!(
+                "Cache language mismatch (cached {:?}, active {:?}) — re-indexing",
+                stored_language.as_deref().unwrap_or("unknown"),
+                language,
+            );
             return Ok(None);
         }
 
@@ -301,9 +324,9 @@ mod tests {
 
         let cache = IndexCache::open(dir).unwrap();
         let graph = make_test_graph();
-        cache.save(&graph).unwrap();
+        cache.save(&graph, "python").unwrap();
 
-        let loaded = cache.load().unwrap();
+        let loaded = cache.load("python").unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert!(loaded.concepts.contains_key(&1));
@@ -555,7 +578,7 @@ mod tests {
         };
 
         let cache = IndexCache::open(dir).unwrap();
-        cache.save(&graph).unwrap();
+        cache.save(&graph, "python").unwrap();
 
         // Check for leftover journal/wal files
         let semex_dir = dir.join(".semex");
@@ -571,7 +594,7 @@ mod tests {
         );
 
         // Load from cache
-        let loaded = cache.load().unwrap().expect("cache should load");
+        let loaded = cache.load("python").unwrap().expect("cache should load");
 
         // Verify all data roundtripped
         assert_eq!(loaded.concepts.len(), 50);
@@ -610,7 +633,7 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
 
         let cache = IndexCache::open(dir).unwrap();
-        let loaded = cache.load().unwrap();
+        let loaded = cache.load("python").unwrap();
         assert!(loaded.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
@@ -659,9 +682,9 @@ mod tests {
         };
 
         let cache = IndexCache::open(dir).unwrap();
-        cache.save(&graph).unwrap();
+        cache.save(&graph, "python").unwrap();
 
-        let loaded = cache.load().unwrap().expect("cache should load");
+        let loaded = cache.load("python").unwrap().expect("cache should load");
         assert_eq!(loaded.concepts.len(), 10);
         assert_eq!(loaded.embeddings.nb_vectors(), 5);
 
@@ -725,19 +748,19 @@ mod tests {
         };
 
         let cache = IndexCache::open(dir).unwrap();
-        cache.save(&graph).unwrap();
+        cache.save(&graph, "python").unwrap();
 
         // Load, add 4 more embeddings, save again
-        let mut loaded = cache.load().unwrap().expect("first load");
+        let mut loaded = cache.load("python").unwrap().expect("first load");
         assert_eq!(loaded.embeddings.nb_vectors(), 3);
 
         for i in 3..7u64 {
             loaded.embeddings.insert_vector(i, vec![i as f32; 3]);
         }
-        cache.save(&loaded).unwrap();
+        cache.save(&loaded, "python").unwrap();
 
         // Second load: should have 7
-        let reloaded = cache.load().unwrap().expect("second load");
+        let reloaded = cache.load("python").unwrap().expect("second load");
         assert_eq!(reloaded.concepts.len(), 10);
         assert_eq!(reloaded.embeddings.nb_vectors(), 7);
 
