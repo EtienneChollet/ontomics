@@ -60,6 +60,11 @@ impl SemexServer {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(defaults.max_signatures),
+            max_entities: args
+                .get("max_entities")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(defaults.max_entities),
         };
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
@@ -130,10 +135,16 @@ impl SemexServer {
         let summary: Vec<Value> = concepts
             .iter()
             .map(|c| {
+                let entity_count = graph
+                    .entities
+                    .values()
+                    .filter(|e| e.concept_tags.contains(&c.id))
+                    .count();
                 json!({
                     "canonical": c.canonical,
                     "occurrences": c.occurrences.len(),
                     "entity_types": c.entity_types,
+                    "entity_count": entity_count,
                 })
             })
             .collect();
@@ -179,6 +190,47 @@ impl SemexServer {
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let conventions = graph.list_conventions();
         serde_json::to_value(conventions)
+            .map_err(|e| format!("serialization error: {e}"))
+    }
+
+    fn handle_export_domain_pack(&self, _args: &Value) -> Result<Value, String> {
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let pack = crate::domain_pack::export_domain_pack(&graph);
+        let yaml = serde_yaml::to_string(&pack)
+            .map_err(|e| format!("YAML serialization error: {e}"))?;
+        let stats = json!({
+            "abbreviations": pack.abbreviations.len(),
+            "conventions": pack.conventions.len(),
+            "domain_terms": pack.domain_terms.len(),
+            "concept_associations": pack.concept_associations.len(),
+        });
+        Ok(json!({
+            "yaml": yaml,
+            "stats": stats,
+        }))
+    }
+
+    fn handle_list_entities(&self, args: &Value) -> Result<Value, String> {
+        use crate::types::EntityKind;
+
+        let concept = args.get("concept").and_then(|v| v.as_str());
+        let role = args.get("role").and_then(|v| v.as_str());
+        let kind = args.get("kind").and_then(|v| v.as_str()).and_then(|k| {
+            match k.to_lowercase().as_str() {
+                "class" => Some(EntityKind::Class),
+                "function" => Some(EntityKind::Function),
+                _ => None,
+            }
+        });
+        let top_k = args
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(20);
+
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let results = graph.list_entities(concept, role, kind.as_ref(), top_k);
+        serde_json::to_value(results)
             .map_err(|e| format!("serialization error: {e}"))
     }
 }
@@ -326,6 +378,43 @@ fn tool_definitions() -> Vec<Tool> {
                 &["term"],
             ),
         ),
+        Tool::new(
+            "export_domain_pack",
+            "Export the project's domain knowledge as a portable YAML pack. \
+             Use when asked to 'export conventions', 'create a domain pack', \
+             or 'share naming rules'. Returns YAML containing abbreviations, \
+             conventions, domain terms, and concept associations. The agent \
+             can review and curate the output before saving.",
+            tool_schema(json!({}), &[]),
+        ),
+        Tool::new(
+            "list_entities",
+            "List Python objects (classes, functions) that instantiate domain concepts. \
+             Use when asked 'what loss functions exist', 'show me the network classes', \
+             or 'what uses concept X'. Returns entities with semantic roles and concept tags.",
+            tool_schema(
+                json!({
+                    "concept": {
+                        "type": "string",
+                        "description": "Filter by concept (e.g. 'loss')",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Filter by semantic role substring (e.g. 'module')",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["class", "function"],
+                        "description": "Filter by entity kind",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Max entities to return (default: 20)",
+                    }
+                }),
+                &[],
+            ),
+        ),
     ]
 }
 
@@ -355,6 +444,7 @@ impl ServerHandler for SemexServer {
                  - \"is this name correct\" → check_naming\n\
                  - \"what should I call this\" → suggest_name\n\
                  - \"describe function/class X\" → describe_symbol\n\
+                 - \"what loss functions exist\" / \"show me X classes\" → list_entities\n\
                  \n\
                  semex gives you semantic understanding (concepts, conventions, \
                  relationships) without reading files. Use file reading only as \
@@ -400,6 +490,8 @@ impl ServerHandler for SemexServer {
             "list_conventions" => self.handle_list_conventions(&args),
             "describe_symbol" => self.handle_describe_symbol(&args),
             "locate_concept" => self.handle_locate_concept(&args),
+            "list_entities" => self.handle_list_entities(&args),
+            "export_domain_pack" => self.handle_export_domain_pack(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -611,7 +703,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]

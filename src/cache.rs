@@ -1,7 +1,7 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
 use crate::types::{
-    CallSite, ClassInfo, Concept, Convention, Relationship, Signature,
+    CallSite, ClassInfo, Concept, Convention, Entity, Relationship, Signature,
 };
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -29,6 +29,7 @@ struct CachedGraph {
     signatures: Vec<Signature>,
     classes: Vec<ClassInfo>,
     call_sites: Vec<CallSite>,
+    entities: HashMap<u64, Entity>,
 }
 
 impl IndexCache {
@@ -92,6 +93,41 @@ impl IndexCache {
         let _ = fs::remove_file(self.lock_path());
     }
 
+    // --- Embedding lock: long-lived, held for the entire background
+    //     embedding run to prevent duplicate work across instances. ---
+
+    fn embedding_lock_path(&self) -> PathBuf {
+        self.db_path.with_extension("embedding.lock")
+    }
+
+    /// Try to acquire the embedding lock. Returns `true` if we got it,
+    /// `false` if another instance is already embedding (lock exists and
+    /// the PID in it is still alive, or lock is <10 min old).
+    pub fn try_acquire_embedding_lock(&self) -> bool {
+        let lock = self.embedding_lock_path();
+        if lock.exists() {
+            // Check if the holder is still alive
+            if let Ok(contents) = fs::read_to_string(&lock) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    let holder = nix::unistd::Pid::from_raw(pid);
+                    if nix::sys::signal::kill(holder, None).is_ok() {
+                        // Process is alive — another instance is embedding
+                        return false;
+                    }
+                    // Process is dead — stale lock, fall through to claim
+                }
+            }
+            // Can't parse or process dead — break stale lock
+            eprintln!("Warning: breaking stale embedding lock");
+        }
+        fs::write(&lock, format!("{}", std::process::id())).is_ok()
+    }
+
+    /// Release the embedding lock.
+    pub fn release_embedding_lock(&self) {
+        let _ = fs::remove_file(self.embedding_lock_path());
+    }
+
     /// Save full graph to cache.
     pub fn save(&self, graph: &ConceptGraph) -> Result<()> {
         self.acquire_lock()
@@ -111,6 +147,7 @@ impl IndexCache {
             signatures: graph.signatures.clone(),
             classes: graph.classes.clone(),
             call_sites: graph.call_sites.clone(),
+            entities: graph.entities.clone(),
         };
         let json = serde_json::to_vec(&cached)?;
 
@@ -185,6 +222,7 @@ impl IndexCache {
             signatures: cached.signatures,
             classes: cached.classes,
             call_sites: cached.call_sites,
+            entities: cached.entities,
         }))
     }
 }
@@ -219,6 +257,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            entities: HashMap::new(),
         }
     }
 
@@ -480,6 +519,7 @@ mod tests {
             signatures,
             classes,
             call_sites,
+            entities: HashMap::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -540,6 +580,198 @@ mod tests {
         let cache = IndexCache::open(dir).unwrap();
         let loaded = cache.load().unwrap();
         assert!(loaded.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Save a graph with only some concepts embedded, load back,
+    /// verify partial embeddings survive and concept count is intact.
+    #[test]
+    fn test_cache_roundtrip_partial_embeddings() {
+        let dir = std::path::Path::new(
+            "/tmp/semex_test_cache_partial_embed",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let mut concepts = HashMap::new();
+        for i in 0..10u64 {
+            concepts.insert(
+                i,
+                Concept {
+                    id: i,
+                    canonical: format!("concept_{i}"),
+                    subtokens: vec![format!("concept_{i}")],
+                    occurrences: vec![],
+                    entity_types: HashSet::new(),
+                    embedding: None,
+                    subconcepts: Vec::new(),
+                },
+            );
+        }
+
+        let mut embeddings = EmbeddingIndex::empty();
+        for i in 0..5u64 {
+            embeddings.insert_vector(i, vec![i as f32; 3]);
+        }
+
+        let graph = ConceptGraph {
+            concepts,
+            relationships: Vec::new(),
+            conventions: Vec::new(),
+            embeddings,
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            entities: HashMap::new(),
+            call_sites: Vec::new(),
+        };
+
+        let cache = IndexCache::open(dir).unwrap();
+        cache.save(&graph).unwrap();
+
+        let loaded = cache.load().unwrap().expect("cache should load");
+        assert_eq!(loaded.concepts.len(), 10);
+        assert_eq!(loaded.embeddings.nb_vectors(), 5);
+
+        for i in 0..5u64 {
+            assert!(
+                loaded.embeddings.get_vector(i).is_some(),
+                "vector {i} should be present"
+            );
+        }
+        for i in 5..10u64 {
+            assert!(
+                loaded.embeddings.get_vector(i).is_none(),
+                "vector {i} should be absent"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Simulate checkpoint accumulation: save with 3 embeddings,
+    /// load, add 4 more, save again, load — verify 7 total.
+    #[test]
+    fn test_cache_roundtrip_incremental_embeddings() {
+        let dir = std::path::Path::new(
+            "/tmp/semex_test_cache_incr_embed",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let mut concepts = HashMap::new();
+        for i in 0..10u64 {
+            concepts.insert(
+                i,
+                Concept {
+                    id: i,
+                    canonical: format!("concept_{i}"),
+                    subtokens: vec![format!("concept_{i}")],
+                    occurrences: vec![],
+                    entity_types: HashSet::new(),
+                    embedding: None,
+                    subconcepts: Vec::new(),
+                },
+            );
+        }
+
+        // First save: 3 embeddings
+        let mut embeddings = EmbeddingIndex::empty();
+        for i in 0..3u64 {
+            embeddings.insert_vector(i, vec![i as f32; 3]);
+        }
+
+        let graph = ConceptGraph {
+            concepts: concepts.clone(),
+            relationships: Vec::new(),
+            conventions: Vec::new(),
+            embeddings,
+            signatures: Vec::new(),
+            entities: HashMap::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+
+        let cache = IndexCache::open(dir).unwrap();
+        cache.save(&graph).unwrap();
+
+        // Load, add 4 more embeddings, save again
+        let mut loaded = cache.load().unwrap().expect("first load");
+        assert_eq!(loaded.embeddings.nb_vectors(), 3);
+
+        for i in 3..7u64 {
+            loaded.embeddings.insert_vector(i, vec![i as f32; 3]);
+        }
+        cache.save(&loaded).unwrap();
+
+        // Second load: should have 7
+        let reloaded = cache.load().unwrap().expect("second load");
+        assert_eq!(reloaded.concepts.len(), 10);
+        assert_eq!(reloaded.embeddings.nb_vectors(), 7);
+
+        for i in 0..7u64 {
+            assert!(
+                reloaded.embeddings.get_vector(i).is_some(),
+                "vector {i} should be present after incremental save"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_embedding_lock_acquire_release() {
+        let dir = std::path::Path::new(
+            "/tmp/semex_test_embed_lock_basic",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let cache = IndexCache::open(dir).unwrap();
+
+        assert!(cache.try_acquire_embedding_lock());
+        cache.release_embedding_lock();
+        assert!(cache.try_acquire_embedding_lock());
+        cache.release_embedding_lock();
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_embedding_lock_same_process_blocks() {
+        let dir = std::path::Path::new(
+            "/tmp/semex_test_embed_lock_block",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let cache = IndexCache::open(dir).unwrap();
+
+        assert!(cache.try_acquire_embedding_lock());
+        // Same PID is alive → second acquire should fail
+        assert!(!cache.try_acquire_embedding_lock());
+        cache.release_embedding_lock();
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_embedding_lock_stale_pid_breaks() {
+        let dir = std::path::Path::new(
+            "/tmp/semex_test_embed_lock_stale",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let cache = IndexCache::open(dir).unwrap();
+
+        // Write a lock file with a PID that almost certainly doesn't exist
+        let lock_path = dir.join(".semex").join("index.embedding.lock");
+        std::fs::write(&lock_path, "999999999").unwrap();
+
+        // Should break the stale lock and acquire
+        assert!(cache.try_acquire_embedding_lock());
+        cache.release_embedding_lock();
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[derive(Default)]
 pub struct EmbeddingIndex {
     model: Option<TextEmbedding>,
     vectors: HashMap<u64, Vec<f32>>,
@@ -33,16 +34,6 @@ impl EmbeddingIndex {
     }
 }
 
-impl Default for EmbeddingIndex {
-    fn default() -> Self {
-        Self {
-            model: None,
-            vectors: HashMap::new(),
-            cache_dir: None,
-        }
-    }
-}
-
 impl EmbeddingIndex {
     /// Load the embedding model into an index that was deserialized from
     /// cache (which has vectors but no model). Needed for runtime queries
@@ -61,14 +52,8 @@ impl EmbeddingIndex {
         Ok(())
     }
 
-    /// Embed a concept using its canonical name + subtokens + example identifiers.
-    pub fn embed_concept(&mut self, concept: &Concept) -> Result<Vec<f32>> {
-        let model = self
-            .model
-            .as_ref()
-            .ok_or_else(|| anyhow!("no embedding model loaded (index is empty)"))?;
-
-        // Build text: canonical + subtokens + up to 5 example identifier names
+    /// Build the text representation for a concept embedding.
+    fn concept_text(concept: &Concept) -> String {
         let mut parts = vec![concept.canonical.clone()];
         for subtoken in &concept.subtokens {
             if !parts.contains(subtoken) {
@@ -86,8 +71,18 @@ impl EmbeddingIndex {
                 parts.push(id.clone());
             }
         }
-        let text = parts.join(" ");
+        parts.join(" ")
+    }
 
+    /// Embed a single concept using its canonical name + subtokens + example identifiers.
+    #[allow(dead_code)]
+    pub fn embed_concept(&mut self, concept: &Concept) -> Result<Vec<f32>> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| anyhow!("no embedding model loaded (index is empty)"))?;
+
+        let text = Self::concept_text(concept);
         let embeddings = model.embed(vec![text], None)?;
         let vector = embeddings
             .into_iter()
@@ -96,6 +91,36 @@ impl EmbeddingIndex {
 
         self.vectors.insert(concept.id, vector.clone());
         Ok(vector)
+    }
+
+    /// Embed all concepts in a single batched model call.
+    pub fn embed_concepts_batch(&mut self, concepts: &[Concept]) -> Result<()> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| anyhow!("no embedding model loaded (index is empty)"))?;
+
+        if concepts.is_empty() {
+            return Ok(());
+        }
+
+        let texts: Vec<String> = concepts
+            .iter()
+            .map(Self::concept_text)
+            .collect();
+        let all_embeddings = model.embed(texts, None)?;
+
+        for (concept, vector) in concepts.iter().zip(all_embeddings) {
+            self.vectors.insert(concept.id, vector);
+        }
+        Ok(())
+    }
+
+    /// Embed multiple texts in a single batched model call.
+    /// Returns a Vec parallel to the input: one embedding per text.
+    pub fn embed_texts_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+        let model = self.model.as_ref()?;
+        model.embed(texts.to_vec(), None).ok()
     }
 
     /// Find top-k concepts most similar to the query by cosine similarity.
@@ -127,6 +152,21 @@ impl EmbeddingIndex {
     /// Set the model cache directory (used after deserialization from cache).
     pub fn set_cache_dir(&mut self, dir: PathBuf) {
         self.cache_dir = Some(dir);
+    }
+
+    /// Return the set of concept IDs that already have embeddings.
+    pub fn vector_ids(&self) -> std::collections::HashSet<u64> {
+        self.vectors.keys().copied().collect()
+    }
+
+    /// Insert a single embedding vector.
+    pub fn insert_vector(&mut self, id: u64, vector: Vec<f32>) {
+        self.vectors.insert(id, vector);
+    }
+
+    /// Number of stored embedding vectors.
+    pub fn nb_vectors(&self) -> usize {
+        self.vectors.len()
     }
 }
 

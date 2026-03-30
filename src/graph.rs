@@ -2,10 +2,10 @@ use crate::embeddings::EmbeddingIndex;
 use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::types::{
     AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
-    Convention, DescribeSymbolResult, LocateConceptResult, NameSuggestion,
-    NamingCheckResult, PatternKind, QueryConceptParams, RelatedConcept,
-    Relationship, RelationshipKind, SessionBriefing, Signature, Subconcept,
-    SymbolKind, Verdict,
+    Convention, DescribeSymbolResult, Entity, LocateConceptResult,
+    NameSuggestion, NamingCheckResult, PatternKind, QueryConceptParams,
+    RelatedConcept, Relationship, RelationshipKind, SessionBriefing,
+    Signature, Subconcept, SymbolKind, Verdict,
 };
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -28,13 +28,24 @@ pub struct ConceptGraph {
     pub signatures: Vec<Signature>,
     pub classes: Vec<ClassInfo>,
     pub call_sites: Vec<CallSite>,
+    pub entities: HashMap<u64, Entity>,
 }
 
 impl ConceptGraph {
-    /// Build graph from analysis results + embeddings.
+    /// Build graph from analysis results + embeddings + entities.
     pub fn build(
         analysis: AnalysisResult,
         embeddings: EmbeddingIndex,
+    ) -> Result<Self> {
+        Self::build_with_entities(analysis, embeddings, Vec::new(), Vec::new())
+    }
+
+    /// Build graph with pre-built entities and their relationships.
+    pub fn build_with_entities(
+        analysis: AnalysisResult,
+        embeddings: EmbeddingIndex,
+        entities: Vec<Entity>,
+        entity_relationships: Vec<Relationship>,
     ) -> Result<Self> {
         let concepts: HashMap<u64, Concept> = analysis
             .concepts
@@ -42,7 +53,7 @@ impl ConceptGraph {
             .map(|c| (c.id, c))
             .collect();
 
-        let relationships: Vec<Relationship> = analysis
+        let mut relationships: Vec<Relationship> = analysis
             .co_occurrence_matrix
             .into_iter()
             .map(|((src, tgt), weight)| Relationship {
@@ -53,6 +64,11 @@ impl ConceptGraph {
             })
             .collect();
 
+        relationships.extend(entity_relationships);
+
+        let entity_map: HashMap<u64, Entity> =
+            entities.into_iter().map(|e| (e.id, e)).collect();
+
         Ok(Self {
             concepts,
             relationships,
@@ -61,6 +77,7 @@ impl ConceptGraph {
             signatures: analysis.signatures,
             classes: analysis.classes,
             call_sites: analysis.call_sites,
+            entities: entity_map,
         })
     }
 
@@ -289,6 +306,15 @@ impl ConceptGraph {
             })
             .collect();
 
+        // Collect entities that instantiate this concept
+        let entities: Vec<_> = self
+            .entities
+            .values()
+            .filter(|e| e.concept_tags.contains(&concept.id))
+            .take(params.max_entities)
+            .map(|e| e.summary())
+            .collect();
+
         Some(ConceptQueryResult {
             concept: concept.clone(),
             variants,
@@ -299,6 +325,7 @@ impl ConceptGraph {
             classes: matching_classes,
             call_graph,
             subconcepts: concept.subconcepts.clone(),
+            entities,
         })
     }
 
@@ -677,6 +704,9 @@ impl ConceptGraph {
     /// Add SimilarTo relationship edges between concepts whose embeddings
     /// have cosine similarity above the given threshold.
     pub fn add_similarity_edges(&mut self, threshold: f32) {
+        // Clear existing similarity edges so this is idempotent.
+        self.relationships
+            .retain(|r| r.kind != RelationshipKind::SimilarTo);
         let ids: Vec<u64> = self.concepts.keys().copied().collect();
         for (i, &id_a) in ids.iter().enumerate() {
             let vec_a = match self.embeddings.get_vector(id_a) {
@@ -707,6 +737,53 @@ impl ConceptGraph {
             self.concepts.values().collect();
         concepts.sort_by(|a, b| b.occurrences.len().cmp(&a.occurrences.len()));
         concepts
+    }
+
+    /// List entities with optional filtering by concept, semantic role, and kind.
+    pub fn list_entities(
+        &self,
+        concept_filter: Option<&str>,
+        role_filter: Option<&str>,
+        kind_filter: Option<&crate::types::EntityKind>,
+        top_k: usize,
+    ) -> Vec<crate::types::EntitySummary> {
+        let concept_id: Option<u64> = concept_filter.and_then(|term| {
+            let term_lower = term.to_lowercase();
+            self.concepts
+                .values()
+                .find(|c| c.canonical == term_lower)
+                .map(|c| c.id)
+        });
+
+        let mut matched: Vec<_> = self
+            .entities
+            .values()
+            .filter(|e| {
+                if let Some(cid) = concept_id {
+                    if !e.concept_tags.contains(&cid) {
+                        return false;
+                    }
+                }
+                if let Some(role) = role_filter {
+                    let role_lower = role.to_lowercase();
+                    if !e.semantic_role.to_lowercase().contains(&role_lower) {
+                        return false;
+                    }
+                }
+                if let Some(kind) = kind_filter {
+                    if e.kind != *kind {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        matched.sort_by(|a, b| a.name.cmp(&b.name));
+        matched
+            .into_iter()
+            .take(top_k)
+            .map(|e| e.summary())
+            .collect()
     }
 
     /// Describe a symbol (function or class) by name.
@@ -780,6 +857,68 @@ impl ConceptGraph {
             .map(|c| c.canonical.clone())
             .collect();
 
+        // Entity enrichment — prefer exact case match, then case-insensitive,
+        // and prefer matching SymbolKind to avoid class/function confusion.
+        let entity = self
+            .entities
+            .values()
+            .find(|e| e.name == name)
+            .or_else(|| {
+                let kind_match = |e: &&Entity| {
+                    matches!(
+                        (&kind, &e.kind),
+                        (SymbolKind::Class, crate::types::EntityKind::Class)
+                            | (SymbolKind::Function, crate::types::EntityKind::Function)
+                            | (SymbolKind::Method, crate::types::EntityKind::Method)
+                    )
+                };
+                self.entities
+                    .values()
+                    .filter(|e| e.name.to_lowercase() == name_lower)
+                    .find(|e| kind_match(e))
+                    .or_else(|| {
+                        self.entities
+                            .values()
+                            .find(|e| e.name.to_lowercase() == name_lower)
+                    })
+            });
+
+        let semantic_role = entity
+            .map(|e| e.semantic_role.clone())
+            .unwrap_or_default();
+
+        let concept_tags: Vec<String> = entity
+            .map(|e| {
+                e.concept_tags
+                    .iter()
+                    .filter_map(|id| {
+                        self.concepts.get(id).map(|c| c.canonical.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let related_entities: Vec<_> = entity
+            .map(|e| {
+                self.relationships
+                    .iter()
+                    .filter(|r| {
+                        (r.kind == RelationshipKind::InheritsFrom
+                            || r.kind == RelationshipKind::Uses)
+                            && (r.source == e.id || r.target == e.id)
+                    })
+                    .filter_map(|r| {
+                        let other_id = if r.source == e.id {
+                            r.target
+                        } else {
+                            r.source
+                        };
+                        self.entities.get(&other_id).map(|e| e.summary())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Some(DescribeSymbolResult {
             name: name.to_string(),
             kind,
@@ -788,13 +927,67 @@ impl ConceptGraph {
             callers,
             callees,
             concepts,
+            semantic_role,
+            concept_tags,
+            related_entities,
         })
+    }
+
+    /// Detect abbreviation relationships between concepts and persist them
+    /// as AbbreviationOf edges. For each pair of concepts where one canonical
+    /// is shorter, calls find_abbreviation(short, &[long]). Must run BEFORE
+    /// add_contrastive_edges (which checks for AbbreviationOf to suppress
+    /// false contrastives).
+    pub fn add_abbreviation_edges(&mut self) {
+        self.relationships
+            .retain(|r| r.kind != RelationshipKind::AbbreviationOf);
+
+        let canonicals: Vec<(u64, String)> = self
+            .concepts
+            .values()
+            .map(|c| (c.id, c.canonical.clone()))
+            .collect();
+
+        let mut new_edges: Vec<Relationship> = Vec::new();
+
+        for (i, (id_a, canon_a)) in canonicals.iter().enumerate() {
+            for (id_b, canon_b) in &canonicals[i + 1..] {
+                let (short_id, short, long_id, long) =
+                    if canon_a.len() < canon_b.len() {
+                        (id_a, canon_a.as_str(), id_b, canon_b.clone())
+                    } else if canon_b.len() < canon_a.len() {
+                        (id_b, canon_b.as_str(), id_a, canon_a.clone())
+                    } else {
+                        continue;
+                    };
+
+                // Skip very short abbreviations — too noisy
+                if short.len() < 3 {
+                    continue;
+                }
+
+                let candidates = [long];
+                if find_abbreviation(short, &candidates).is_some() {
+                    new_edges.push(Relationship {
+                        source: *short_id,
+                        target: *long_id,
+                        kind: RelationshipKind::AbbreviationOf,
+                        weight: 1.0,
+                    });
+                }
+            }
+        }
+
+        self.relationships.extend(new_edges);
     }
 
     /// Detect contrastive concept pairs and add Contrastive edges.
     /// Must run AFTER add_similarity_edges. Suppresses conflicting
     /// SimilarTo edges.
     pub fn add_contrastive_edges(&mut self) {
+        // Clear existing contrastive edges so this is idempotent.
+        self.relationships
+            .retain(|r| r.kind != RelationshipKind::Contrastive);
         const KNOWN_PAIRS: &[(&str, &str)] = &[
             ("source", "target"),
             ("src", "trg"),
@@ -927,6 +1120,17 @@ impl ConceptGraph {
             let n = unique_ids.len();
             let mut affinity = vec![vec![0.0f32; n]; n];
 
+            // Batch-embed all unique identifiers up front
+            let id_embeddings: Vec<Option<Vec<f32>>> =
+                if let Some(batch) = self
+                    .embeddings
+                    .embed_texts_batch(&unique_ids)
+                {
+                    batch.into_iter().map(Some).collect()
+                } else {
+                    vec![None; n]
+                };
+
             #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 for j in (i + 1)..n {
@@ -956,13 +1160,9 @@ impl ConceptGraph {
                     }
 
                     // Signal 2: embedding similarity (weight 0.3)
-                    let emb_i = self
-                        .embeddings
-                        .embed_text(&unique_ids[i]);
-                    let emb_j = self
-                        .embeddings
-                        .embed_text(&unique_ids[j]);
-                    if let (Some(ei), Some(ej)) = (&emb_i, &emb_j) {
+                    if let (Some(ei), Some(ej)) =
+                        (&id_embeddings[i], &id_embeddings[j])
+                    {
                         let sim = cosine_similarity(ei, ej);
                         aff += 0.3 * sim.max(0.0);
                     }
@@ -1288,12 +1488,26 @@ impl ConceptGraph {
             })
             .collect();
 
+        // Key entities sorted by specificity (fewer concept tags = more specific)
+        let mut key_entities_vec: Vec<_> = self
+            .entities
+            .values()
+            .filter(|e| e.concept_tags.contains(&concept.id))
+            .collect::<Vec<_>>();
+        key_entities_vec.sort_by_key(|e| e.concept_tags.len());
+        let key_entities: Vec<_> = key_entities_vec
+            .into_iter()
+            .take(5)
+            .map(|e| e.summary())
+            .collect();
+
         Some(LocateConceptResult {
             concept: concept.canonical.clone(),
             exemplar_signatures,
             exemplar_classes,
             files,
             contrastive_concepts,
+            key_entities,
         })
     }
 
@@ -1369,12 +1583,37 @@ impl ConceptGraph {
             })
             .collect();
 
+        // Entity clusters grouped by semantic role (min 2 per cluster)
+        let mut role_groups: HashMap<&str, Vec<&str>> = HashMap::new();
+        for entity in self.entities.values() {
+            if !entity.semantic_role.is_empty() {
+                role_groups
+                    .entry(&entity.semantic_role)
+                    .or_default()
+                    .push(&entity.name);
+            }
+        }
+        let mut entity_clusters: Vec<_> = role_groups
+            .into_iter()
+            .filter(|(_, names)| names.len() >= 2)
+            .map(|(role, names)| {
+                use crate::types::EntityCluster;
+                EntityCluster {
+                    role: role.to_string(),
+                    count: names.len(),
+                    examples: names.into_iter().take(5).map(|s| s.to_string()).collect(),
+                }
+            })
+            .collect();
+        entity_clusters.sort_by(|a, b| b.count.cmp(&a.count));
+
         SessionBriefing {
             conventions,
             abbreviations,
             top_concepts,
             contrastive_pairs,
             vocabulary_warnings,
+            entity_clusters,
         }
     }
 }
@@ -1595,5 +1834,44 @@ mod tests {
         assert!(result.signature.is_some());
         assert_eq!(result.callers.len(), 1);
         assert!(result.concepts.contains(&"transform".to_string()));
+    }
+
+    #[test]
+    fn test_add_abbreviation_edges() {
+        let analysis = AnalysisResult {
+            concepts: vec![
+                make_concept(1, "trf", &["trf"]),
+                make_concept(2, "transform", &["transform"]),
+                make_concept(3, "seg", &["seg"]),
+                make_concept(4, "segmentation", &["segmentation"]),
+            ],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let mut graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty())
+                .unwrap();
+
+        assert!(graph
+            .relationships
+            .iter()
+            .all(|r| r.kind != RelationshipKind::AbbreviationOf));
+
+        graph.add_abbreviation_edges();
+
+        let abbrevs: Vec<_> = graph
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::AbbreviationOf)
+            .collect();
+        assert_eq!(abbrevs.len(), 2);
+
+        // trf → transform
+        assert!(abbrevs.iter().any(|r| r.source == 1 && r.target == 2));
+        // seg → segmentation
+        assert!(abbrevs.iter().any(|r| r.source == 3 && r.target == 4));
     }
 }
