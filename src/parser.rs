@@ -5,26 +5,186 @@ use crate::types::{
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Parse a single Python file and extract identifiers and docstrings.
-pub fn parse_file(path: &Path) -> Result<ParseResult> {
-    let source = std::fs::read_to_string(path)?;
-    parse_content(&source, path)
+/// Language-specific parsing strategy. Each implementation knows how to
+/// traverse its tree-sitter grammar and extract identifiers, docstrings,
+/// signatures, classes, and call sites into the shared types.
+#[allow(dead_code)]
+pub trait LanguageParser: Send + Sync {
+    /// File extensions this parser handles (without dots).
+    fn extensions(&self) -> &[&str];
+
+    /// Initialize a tree-sitter parser with the correct grammar.
+    fn make_parser(&self) -> Result<tree_sitter::Parser>;
+
+    /// Parameters to skip (e.g., `["self", "cls"]` for Python).
+    fn skip_params(&self) -> &[&str];
+
+    /// Strip language-specific doc comment syntax.
+    fn strip_doc_syntax<'a>(&self, raw: &'a str) -> &'a str;
+
+    /// Walk the AST and extract identifiers, doc text, signatures,
+    /// classes, and call sites.
+    #[allow(clippy::too_many_arguments)]
+    fn visit_node(
+        &self,
+        node: tree_sitter::Node,
+        source: &[u8],
+        path: &Path,
+        scope: &Option<String>,
+        identifiers: &mut Vec<RawIdentifier>,
+        doc_texts: &mut Vec<(PathBuf, usize, String)>,
+        signatures: &mut Vec<Signature>,
+        classes: &mut Vec<ClassInfo>,
+        call_sites: &mut Vec<CallSite>,
+    );
 }
 
-/// Parse Python source content and extract identifiers and docstrings.
+pub struct PythonParser;
+
+impl LanguageParser for PythonParser {
+    fn extensions(&self) -> &[&str] {
+        &["py"]
+    }
+
+    fn make_parser(&self) -> Result<tree_sitter::Parser> {
+        let mut parser = tree_sitter::Parser::new();
+        let language = tree_sitter_python::LANGUAGE;
+        parser
+            .set_language(&language.into())
+            .map_err(|e| anyhow::anyhow!("Error loading Python grammar: {e}"))?;
+        Ok(parser)
+    }
+
+    fn skip_params(&self) -> &[&str] {
+        &["self", "cls"]
+    }
+
+    fn strip_doc_syntax<'a>(&self, raw: &'a str) -> &'a str {
+        strip_docstring_quotes(raw)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_node(
+        &self,
+        node: tree_sitter::Node,
+        source: &[u8],
+        path: &Path,
+        scope: &Option<String>,
+        identifiers: &mut Vec<RawIdentifier>,
+        doc_texts: &mut Vec<(PathBuf, usize, String)>,
+        signatures: &mut Vec<Signature>,
+        classes: &mut Vec<ClassInfo>,
+        call_sites: &mut Vec<CallSite>,
+    ) {
+        match node.kind() {
+            "function_definition" => {
+                let skip = self.skip_params();
+                let func_name = extract_function(
+                    node, source, path, scope, identifiers, skip,
+                );
+                if let Some(sig) = extract_signature(
+                    node, source, path, scope, skip,
+                ) {
+                    signatures.push(sig);
+                }
+                let child_scope = func_name.map(|name| match scope {
+                    Some(parent) => format!("{parent}.{name}"),
+                    None => name,
+                });
+                visit_children(
+                    self,
+                    node,
+                    source,
+                    path,
+                    &child_scope,
+                    identifiers,
+                    doc_texts,
+                    signatures,
+                    classes,
+                    call_sites,
+                );
+                return;
+            }
+            "class_definition" => {
+                let class_name =
+                    extract_class(node, source, path, scope, identifiers);
+                if let Some(info) = extract_class_info(node, source, path) {
+                    classes.push(info);
+                }
+                let child_scope = class_name.or_else(|| scope.clone());
+                visit_children(
+                    self,
+                    node,
+                    source,
+                    path,
+                    &child_scope,
+                    identifiers,
+                    doc_texts,
+                    signatures,
+                    classes,
+                    call_sites,
+                );
+                return;
+            }
+            "decorated_definition" => {
+                extract_decorators(node, source, path, scope, identifiers);
+            }
+            "assignment" => {
+                extract_assignment(node, source, path, scope, identifiers);
+            }
+            "expression_statement" => {
+                try_extract_docstring(node, source, path, doc_texts);
+            }
+            "call" => {
+                if let Some(cs) =
+                    extract_call_site(node, source, path, scope)
+                {
+                    call_sites.push(cs);
+                }
+            }
+            _ => {}
+        }
+
+        visit_children(
+            self,
+            node,
+            source,
+            path,
+            scope,
+            identifiers,
+            doc_texts,
+            signatures,
+            classes,
+            call_sites,
+        );
+    }
+}
+
+/// Convenience constructor for a Python parser.
+pub fn python_parser() -> PythonParser {
+    PythonParser
+}
+
+/// Parse a single file and extract identifiers and docstrings.
+pub fn parse_file(path: &Path, parser: &dyn LanguageParser) -> Result<ParseResult> {
+    let source = std::fs::read_to_string(path)?;
+    parse_content(&source, path, parser)
+}
+
+/// Parse source content and extract identifiers and docstrings.
 ///
 /// Like `parse_file`, but takes source content directly instead of reading
 /// from disk. Used by the diff module to parse files from git tree objects.
-pub fn parse_content(source: &str, path: &Path) -> Result<ParseResult> {
-    let mut parser = tree_sitter::Parser::new();
-    let language = tree_sitter_python::LANGUAGE;
-    parser
-        .set_language(&language.into())
-        .expect("Error loading Python grammar");
+pub fn parse_content(
+    source: &str,
+    path: &Path,
+    parser: &dyn LanguageParser,
+) -> Result<ParseResult> {
+    let mut ts_parser = parser.make_parser()?;
 
-    let tree = parser
+    let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse {}", path.display()))?;
 
@@ -35,7 +195,7 @@ pub fn parse_content(source: &str, path: &Path) -> Result<ParseResult> {
     let mut classes = Vec::new();
     let mut call_sites = Vec::new();
 
-    visit_node(
+    parser.visit_node(
         tree.root_node(),
         source_bytes,
         path,
@@ -73,6 +233,7 @@ pub struct ParseOptions {
 pub fn parse_directory(
     root: &Path,
     opts: &ParseOptions,
+    parser: &dyn LanguageParser,
 ) -> Result<Vec<ParseResult>> {
     let mut builder = WalkBuilder::new(root);
     builder.standard_filters(opts.respect_gitignore);
@@ -97,7 +258,7 @@ pub fn parse_directory(
 
     let results: Vec<ParseResult> = paths
         .par_iter()
-        .filter_map(|p| parse_file(p).ok())
+        .filter_map(|p| parse_file(p, parser).ok())
         .collect();
 
     Ok(results)
@@ -105,121 +266,23 @@ pub fn parse_directory(
 
 // --- Private helpers ---
 
-const SKIP_PARAMS: &[&str] = &["self", "cls"];
-
-/// Recursively visit a tree-sitter node, extracting identifiers and docstrings.
-///
-/// `scope` tracks the enclosing class/function for co-occurrence analysis.
-#[allow(clippy::too_many_arguments)]
-fn visit_node(
-    node: tree_sitter::Node,
-    source: &[u8],
-    path: &Path,
-    scope: &Option<String>,
-    identifiers: &mut Vec<RawIdentifier>,
-    doc_texts: &mut Vec<(std::path::PathBuf, usize, String)>,
-    signatures: &mut Vec<Signature>,
-    classes: &mut Vec<ClassInfo>,
-    call_sites: &mut Vec<CallSite>,
-) {
-    match node.kind() {
-        "function_definition" => {
-            let func_name =
-                extract_function(node, source, path, scope, identifiers);
-            // L2: extract signature
-            if let Some(sig) = extract_signature(node, source, path, scope)
-            {
-                signatures.push(sig);
-            }
-            // Build new scope for children inside the function body
-            let child_scope = func_name.map(|name| match scope {
-                Some(parent) => format!("{parent}.{name}"),
-                None => name,
-            });
-            visit_children(
-                node,
-                source,
-                path,
-                &child_scope,
-                identifiers,
-                doc_texts,
-                signatures,
-                classes,
-                call_sites,
-            );
-            return;
-        }
-        "class_definition" => {
-            let class_name =
-                extract_class(node, source, path, scope, identifiers);
-            // L2: extract class info
-            if let Some(info) = extract_class_info(node, source, path) {
-                classes.push(info);
-            }
-            let child_scope = class_name.or_else(|| scope.clone());
-            visit_children(
-                node,
-                source,
-                path,
-                &child_scope,
-                identifiers,
-                doc_texts,
-                signatures,
-                classes,
-                call_sites,
-            );
-            return;
-        }
-        "decorated_definition" => {
-            extract_decorators(node, source, path, scope, identifiers);
-        }
-        "assignment" => {
-            extract_assignment(node, source, path, scope, identifiers);
-        }
-        "expression_statement" => {
-            try_extract_docstring(node, source, path, doc_texts);
-        }
-        "call" => {
-            // L2: extract call site
-            if let Some(cs) =
-                extract_call_site(node, source, path, scope)
-            {
-                call_sites.push(cs);
-            }
-            // Don't return — fall through to visit_children for nested calls
-        }
-        _ => {}
-    }
-
-    visit_children(
-        node,
-        source,
-        path,
-        scope,
-        identifiers,
-        doc_texts,
-        signatures,
-        classes,
-        call_sites,
-    );
-}
-
-/// Recurse into all children of a node.
+/// Recurse into all children of a node, dispatching through the parser trait.
 #[allow(clippy::too_many_arguments)]
 fn visit_children(
+    parser: &dyn LanguageParser,
     node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
     scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
-    doc_texts: &mut Vec<(std::path::PathBuf, usize, String)>,
+    doc_texts: &mut Vec<(PathBuf, usize, String)>,
     signatures: &mut Vec<Signature>,
     classes: &mut Vec<ClassInfo>,
     call_sites: &mut Vec<CallSite>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_node(
+        parser.visit_node(
             child,
             source,
             path,
@@ -241,6 +304,7 @@ fn extract_function(
     path: &Path,
     scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
+    skip_params: &[&str],
 ) -> Option<String> {
     let name_node = node.child_by_field_name("name")?;
     let name = name_node.utf8_text(source).ok()?;
@@ -254,7 +318,6 @@ fn extract_function(
     });
 
     if let Some(params_node) = node.child_by_field_name("parameters") {
-        // Parameters belong to the function's own scope
         let func_scope = Some(match scope {
             Some(parent) => format!("{parent}.{name}"),
             None => name.to_string(),
@@ -265,6 +328,7 @@ fn extract_function(
             path,
             &func_scope,
             identifiers,
+            skip_params,
         );
     }
 
@@ -278,21 +342,21 @@ fn extract_parameters(
     path: &Path,
     scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
+    skip_params: &[&str],
 ) {
     let mut cursor = params_node.walk();
     for child in params_node.named_children(&mut cursor) {
         match child.kind() {
             "identifier" => {
-                push_param_if_valid(child, source, path, scope, identifiers);
+                push_param_if_valid(
+                    child, source, path, scope, identifiers, skip_params,
+                );
             }
             "typed_parameter" | "typed_default_parameter" => {
                 if let Some(name_node) = find_first_identifier_child(child) {
                     push_param_if_valid(
-                        name_node,
-                        source,
-                        path,
-                        scope,
-                        identifiers,
+                        name_node, source, path, scope, identifiers,
+                        skip_params,
                     );
                 }
                 if let Some(type_node) = child.child_by_field_name("type")
@@ -305,11 +369,8 @@ fn extract_parameters(
             "default_parameter" => {
                 if let Some(name_node) = find_first_identifier_child(child) {
                     push_param_if_valid(
-                        name_node,
-                        source,
-                        path,
-                        scope,
-                        identifiers,
+                        name_node, source, path, scope, identifiers,
+                        skip_params,
                     );
                 }
             }
@@ -319,16 +380,17 @@ fn extract_parameters(
     }
 }
 
-/// Push a parameter identifier if it's not `self` or `cls`.
+/// Push a parameter identifier if it's not in the skip list.
 fn push_param_if_valid(
     name_node: tree_sitter::Node,
     source: &[u8],
     path: &Path,
     scope: &Option<String>,
     identifiers: &mut Vec<RawIdentifier>,
+    skip_params: &[&str],
 ) {
     if let Ok(name) = name_node.utf8_text(source) {
-        if !SKIP_PARAMS.contains(&name) {
+        if !skip_params.contains(&name) {
             identifiers.push(RawIdentifier {
                 name: name.to_string(),
                 entity_type: EntityType::Parameter,
@@ -654,6 +716,7 @@ fn extract_signature(
     source: &[u8],
     path: &Path,
     scope: &Option<String>,
+    skip_params: &[&str],
 ) -> Option<Signature> {
     let name_node = node.child_by_field_name("name")?;
     let name = name_node.utf8_text(source).ok()?.to_string();
@@ -663,7 +726,7 @@ fn extract_signature(
     if let Some(params_node) = node.child_by_field_name("parameters") {
         let mut cursor = params_node.walk();
         for child in params_node.named_children(&mut cursor) {
-            if let Some(param) = extract_param(child, source) {
+            if let Some(param) = extract_param(child, source, skip_params) {
                 params.push(param);
             }
         }
@@ -694,11 +757,12 @@ fn extract_signature(
 fn extract_param(
     node: tree_sitter::Node,
     source: &[u8],
+    skip_params: &[&str],
 ) -> Option<Param> {
     match node.kind() {
         "identifier" => {
             let name = node.utf8_text(source).ok()?.to_string();
-            if SKIP_PARAMS.contains(&name.as_str()) {
+            if skip_params.contains(&name.as_str()) {
                 return None;
             }
             Some(Param {
@@ -712,7 +776,7 @@ fn extract_param(
                 .utf8_text(source)
                 .ok()?
                 .to_string();
-            if SKIP_PARAMS.contains(&name.as_str()) {
+            if skip_params.contains(&name.as_str()) {
                 return None;
             }
             let type_ann = node
@@ -730,7 +794,7 @@ fn extract_param(
                 .utf8_text(source)
                 .ok()?
                 .to_string();
-            if SKIP_PARAMS.contains(&name.as_str()) {
+            if skip_params.contains(&name.as_str()) {
                 return None;
             }
             let default = node
@@ -748,7 +812,7 @@ fn extract_param(
                 .utf8_text(source)
                 .ok()?
                 .to_string();
-            if SKIP_PARAMS.contains(&name.as_str()) {
+            if skip_params.contains(&name.as_str()) {
                 return None;
             }
             let type_ann = node
@@ -961,7 +1025,8 @@ def spatial_transform(vol: Tensor, trf, nb_dims=3):
         RESULT.get_or_init(|| {
             let path = Path::new("/tmp/semex_test_parser.py");
             std::fs::write(path, FIXTURE).unwrap();
-            parse_file(path).unwrap()
+            let parser = PythonParser;
+            parse_file(path, &parser).unwrap()
         })
     }
 
@@ -1264,7 +1329,8 @@ def foo():
     obj.other()
 "#;
         let path = Path::new("test_calls.py");
-        let result = parse_content(source, path).unwrap();
+        let parser = PythonParser;
+        let result = parse_content(source, path, &parser).unwrap();
         assert!(
             !result.call_sites.is_empty(),
             "Expected call sites"
@@ -1296,7 +1362,8 @@ class Cls:
         helper()
 "#;
         let path = Path::new("test_scope_calls.py");
-        let result = parse_content(source, path).unwrap();
+        let parser = PythonParser;
+        let result = parse_content(source, path, &parser).unwrap();
         let inner_call = result
             .call_sites
             .iter()
