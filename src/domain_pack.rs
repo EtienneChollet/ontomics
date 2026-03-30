@@ -353,6 +353,8 @@ fn entity_type_to_string(et: &EntityType) -> String {
         EntityType::Decorator => "Decorator",
         EntityType::TypeAnnotation => "TypeAnnotation",
         EntityType::DocText => "DocText",
+        EntityType::Interface => "Interface",
+        EntityType::TypeAlias => "TypeAlias",
     }
     .to_string()
 }
@@ -367,6 +369,8 @@ fn parse_entity_type(s: &str) -> Option<EntityType> {
         "Decorator" => Some(EntityType::Decorator),
         "TypeAnnotation" => Some(EntityType::TypeAnnotation),
         "DocText" => Some(EntityType::DocText),
+        "Interface" => Some(EntityType::Interface),
+        "TypeAlias" => Some(EntityType::TypeAlias),
         _ => None,
     }
 }
