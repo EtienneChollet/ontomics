@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -59,6 +60,9 @@ pub enum RelationshipKind {
     AbbreviationOf,
     SharedPattern,
     Contrastive,
+    Instantiates,
+    InheritsFrom,
+    Uses,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +134,7 @@ pub struct QueryConceptParams {
     pub max_occurrences: usize,
     pub max_variants: usize,
     pub max_signatures: usize,
+    pub max_entities: usize,
 }
 
 impl Default for QueryConceptParams {
@@ -139,6 +144,7 @@ impl Default for QueryConceptParams {
             max_occurrences: 5,
             max_variants: 20,
             max_signatures: 5,
+            max_entities: 5,
         }
     }
 }
@@ -155,6 +161,8 @@ pub struct ConceptQueryResult {
     pub call_graph: Vec<(String, String)>,
     #[serde(default)]
     pub subconcepts: Vec<Subconcept>,
+    #[serde(default)]
+    pub entities: Vec<EntitySummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +199,8 @@ pub struct LocateConceptResult {
     pub exemplar_classes: Vec<ClassInfo>,
     pub files: Vec<(PathBuf, usize)>,
     pub contrastive_concepts: Vec<String>,
+    #[serde(default)]
+    pub key_entities: Vec<EntitySummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +210,8 @@ pub struct SessionBriefing {
     pub top_concepts: Vec<(String, usize)>,
     pub contrastive_pairs: Vec<(String, String)>,
     pub vocabulary_warnings: Vec<String>,
+    #[serde(default)]
+    pub entity_clusters: Vec<EntityCluster>,
 }
 
 // --- L2: Structural types ---
@@ -242,6 +254,67 @@ pub struct CallSite {
     pub line: usize,
 }
 
+// --- L3: Entity types ---
+
+/// A Python object promoted to a first-class node in the concept graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: u64,
+    pub name: String,
+    pub kind: EntityKind,
+    pub concept_tags: Vec<u64>,
+    pub semantic_role: String,
+    pub file: PathBuf,
+    pub line: usize,
+    pub signature_idx: Option<usize>,
+    pub class_info_idx: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntityKind {
+    Function,
+    Class,
+    Method,
+}
+
+/// Lightweight entity summary for inclusion in query results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntitySummary {
+    pub name: String,
+    pub kind: EntityKind,
+    pub semantic_role: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+/// Entity cluster for session briefing — groups entities by semantic role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityCluster {
+    pub role: String,
+    pub count: usize,
+    pub examples: Vec<String>,
+}
+
+impl Entity {
+    /// Compute a stable entity ID from its identity triple.
+    /// Uses "entity:{name}:{file}:{line}" to avoid collision with concept IDs.
+    pub fn hash_id(name: &str, file: &std::path::Path, line: usize) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("entity:{}:{}:{}", name, file.display(), line).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn summary(&self) -> EntitySummary {
+        EntitySummary {
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+            semantic_role: self.semantic_role.clone(),
+            file: self.file.clone(),
+            line: self.line,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeSymbolResult {
     pub name: String,
@@ -251,6 +324,12 @@ pub struct DescribeSymbolResult {
     pub callers: Vec<CallSite>,
     pub callees: Vec<CallSite>,
     pub concepts: Vec<String>,
+    #[serde(default)]
+    pub semantic_role: String,
+    #[serde(default)]
+    pub concept_tags: Vec<String>,
+    #[serde(default)]
+    pub related_entities: Vec<EntitySummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +356,51 @@ pub struct ConceptDelta {
     pub frequency_change: i64,
     pub new_variants: Vec<String>,
     pub removed_variants: Vec<String>,
+}
+
+// --- Domain pack types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainPack {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub abbreviations: Vec<AbbreviationMapping>,
+    #[serde(default)]
+    pub conventions: Vec<ConventionEntry>,
+    #[serde(default)]
+    pub domain_terms: Vec<DomainTerm>,
+    #[serde(default)]
+    pub concept_associations: Vec<ConceptAssociation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbbreviationMapping {
+    pub short: String,
+    pub long: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConventionEntry {
+    pub pattern: String,
+    pub value: String,
+    pub role: String,
+    #[serde(default)]
+    pub entity_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainTerm {
+    pub term: String,
+    #[serde(default)]
+    pub entity_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptAssociation {
+    pub concepts: Vec<String>,
+    pub kind: String,
 }
 
 #[cfg(test)]

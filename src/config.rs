@@ -8,9 +8,36 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     pub embeddings: EmbeddingsConfig,
     pub cache: CacheConfig,
+    pub resources: ResourcesConfig,
     /// Bootstrap conventions to seed detection (optional).
     #[serde(default)]
     pub conventions: Vec<ConventionConfig>,
+    /// Paths to domain pack YAML files, resolved relative to repo root.
+    #[serde(default)]
+    pub domain_packs: Vec<String>,
+    #[cfg(feature = "lsp")]
+    #[serde(default)]
+    pub lsp: LspConfig,
+}
+
+#[cfg(feature = "lsp")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub pyright_path: String,
+    pub timeout_secs: u64,
+}
+
+#[cfg(feature = "lsp")]
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pyright_path: "pyright".to_string(),
+            timeout_secs: 120,
+        }
+    }
 }
 
 /// A convention entry in the config file, matching the TOML `[[conventions]]`
@@ -105,6 +132,40 @@ impl Default for CacheConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ResourcesConfig {
+    /// Max rayon threads for parallel parsing (default: half CPU count).
+    pub max_threads: usize,
+    /// Concepts per embedding batch (default: 64). Smaller = less peak
+    /// memory, more frequent cache checkpoints.
+    pub embedding_batch_size: usize,
+}
+
+impl ResourcesConfig {
+    /// Ensure values are within sane bounds after deserialization.
+    pub fn clamp(&mut self) {
+        if self.max_threads == 0 {
+            self.max_threads = 1;
+        }
+        if self.embedding_batch_size == 0 {
+            self.embedding_batch_size = 1;
+        }
+    }
+}
+
+impl Default for ResourcesConfig {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            max_threads: (cpus / 2).max(1),
+            embedding_batch_size: 64,
+        }
+    }
+}
+
 impl Config {
     /// Load config from `.semex/config.toml` relative to repo_root.
     /// Returns default config if file doesn't exist.
@@ -114,7 +175,8 @@ impl Config {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&config_path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        config.resources.clamp();
         Ok(config)
     }
 }
