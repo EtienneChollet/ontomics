@@ -5,7 +5,7 @@ use crate::types::{
 };
 use crate::graph::ConceptGraph;
 use anyhow::{bail, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
@@ -103,72 +103,34 @@ fn export_associations(graph: &ConceptGraph) -> Vec<ConceptAssociation> {
         });
     }
 
-    // SimilarTo clusters (weight > 0.7, grouped into connected components)
-    let similar_edges: Vec<(u64, u64)> = graph
-        .relationships
-        .iter()
-        .filter(|r| r.kind == RelationshipKind::SimilarTo && r.weight > 0.7)
-        .map(|r| (r.source, r.target))
-        .collect();
-
-    let clusters = connected_components(&similar_edges);
-    for cluster in clusters {
-        if cluster.len() < 2 {
-            continue;
+    // Concept clusters (grouped by cluster_id from agglomerative clustering)
+    let mut cluster_groups: HashMap<usize, Vec<String>> = HashMap::new();
+    for concept in graph.concepts.values() {
+        if let Some(label) = concept.cluster_id {
+            cluster_groups
+                .entry(label)
+                .or_default()
+                .push(concept.canonical.clone());
         }
-        let names: Vec<String> = cluster
-            .iter()
-            .filter_map(|id| graph.concepts.get(id).map(|c| c.canonical.clone()))
-            .collect();
-        if names.len() >= 2 {
-            associations.push(ConceptAssociation {
-                concepts: names,
-                kind: "cluster".to_string(),
-            });
+    }
+
+    let mut sorted_labels: Vec<usize> = cluster_groups.keys().copied().collect();
+    sorted_labels.sort();
+
+    for label in sorted_labels {
+        if let Some(names) = cluster_groups.get(&label) {
+            if names.len() >= 2 {
+                let mut sorted_names = names.clone();
+                sorted_names.sort();
+                associations.push(ConceptAssociation {
+                    concepts: sorted_names,
+                    kind: "cluster".to_string(),
+                });
+            }
         }
     }
 
     associations
-}
-
-/// Find connected components in an edge list via union-find.
-fn connected_components(edges: &[(u64, u64)]) -> Vec<Vec<u64>> {
-    use std::collections::HashMap;
-
-    let mut parent: HashMap<u64, u64> = HashMap::new();
-
-    fn find(parent: &mut HashMap<u64, u64>, x: u64) -> u64 {
-        let p = *parent.get(&x).unwrap_or(&x);
-        if p == x {
-            return x;
-        }
-        let root = find(parent, p);
-        parent.insert(x, root);
-        root
-    }
-
-    fn union(parent: &mut HashMap<u64, u64>, a: u64, b: u64) {
-        let ra = find(parent, a);
-        let rb = find(parent, b);
-        if ra != rb {
-            parent.insert(ra, rb);
-        }
-    }
-
-    for &(a, b) in edges {
-        parent.entry(a).or_insert(a);
-        parent.entry(b).or_insert(b);
-        union(&mut parent, a, b);
-    }
-
-    let mut groups: HashMap<u64, Vec<u64>> = HashMap::new();
-    let keys: Vec<u64> = parent.keys().copied().collect();
-    for k in keys {
-        let root = find(&mut parent, k);
-        groups.entry(root).or_default().push(k);
-    }
-
-    groups.into_values().collect()
 }
 
 /// Load a domain pack from a YAML file.
@@ -463,6 +425,14 @@ mod tests {
             kind: RelationshipKind::SimilarTo,
             weight: 0.85,
         });
+
+        // Assign cluster_id so transform (2) and displacement (5) form a cluster
+        if let Some(c) = graph.concepts.get_mut(&2) {
+            c.cluster_id = Some(0);
+        }
+        if let Some(c) = graph.concepts.get_mut(&5) {
+            c.cluster_id = Some(0);
+        }
 
         graph
     }
