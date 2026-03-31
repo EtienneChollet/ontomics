@@ -1,6 +1,9 @@
-- name: Install OpenSSL build deps (manylinux)
+- name: Install OpenSSL dev libs (manylinux)
   if: runner.os == 'Linux'
   run: |
     if [ -f /etc/almalinux-release ]; then
-      yum install -y perl-IPC-Cmd openssl-devel
+      yum install -y openssl-devel
     fi
+- name: Use system OpenSSL instead of vendored
+  if: runner.os == 'Linux'
+  run: echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
