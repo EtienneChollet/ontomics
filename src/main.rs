@@ -398,7 +398,7 @@ fn build_graph(
 
     if config.embeddings.enabled {
         graph
-            .add_similarity_edges(config.embeddings.similarity_threshold);
+            .cluster_and_add_similarity_edges(config.embeddings.similarity_threshold);
     }
 
     graph.add_abbreviation_edges();
@@ -612,7 +612,7 @@ fn enrich_graph_with_embeddings_inner(
 
     // Add similarity edges now that embeddings are available
     if let Ok(mut g) = graph_handle.write() {
-        g.add_similarity_edges(work.similarity_threshold);
+        g.cluster_and_add_similarity_edges(work.similarity_threshold);
         g.add_abbreviation_edges();
         g.add_contrastive_edges();
         g.detect_subconcepts();
