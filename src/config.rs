@@ -12,6 +12,8 @@ pub enum Language {
     TypeScript,
     #[serde(alias = "js")]
     JavaScript,
+    #[serde(alias = "rs")]
+    Rust,
 }
 
 /// Directories to skip when counting file extensions for auto-detection.
@@ -35,9 +37,12 @@ impl Language {
         let mut py_count = 0u32;
         let mut ts_count = 0u32;
         let mut js_count = 0u32;
-        count_extensions(repo_root, &mut py_count, &mut ts_count, &mut js_count, 3);
+        let mut rs_count = 0u32;
+        count_extensions(repo_root, &mut py_count, &mut ts_count, &mut js_count, &mut rs_count, 3);
 
-        if ts_count > py_count && ts_count > js_count {
+        if rs_count > py_count && rs_count > ts_count && rs_count > js_count {
+            Language::Rust
+        } else if ts_count > py_count && ts_count > js_count {
             Language::TypeScript
         } else if js_count > py_count && js_count > ts_count {
             Language::JavaScript
@@ -52,6 +57,7 @@ impl Language {
             Language::Auto | Language::Python => "python",
             Language::TypeScript => "typescript",
             Language::JavaScript => "javascript",
+            Language::Rust => "rust",
         }
     }
 
@@ -75,6 +81,9 @@ impl Language {
             }
             Language::JavaScript => {
                 vec!["**/*.js".to_string(), "**/*.jsx".to_string()]
+            }
+            Language::Rust => {
+                vec!["**/*.rs".to_string()]
             }
         }
     }
@@ -101,6 +110,12 @@ impl Language {
                 "**/*.test.js".to_string(),
                 "**/*.spec.js".to_string(),
             ],
+            Language::Rust => vec![
+                "**/target/**".to_string(),
+                "**/tests/**".to_string(),
+                "**/benches/**".to_string(),
+                "**/build.rs".to_string(),
+            ],
         }
     }
 }
@@ -111,6 +126,7 @@ fn count_extensions(
     py: &mut u32,
     ts: &mut u32,
     js: &mut u32,
+    rs: &mut u32,
     remaining_depth: u32,
 ) {
     if remaining_depth == 0 {
@@ -130,7 +146,7 @@ fn count_extensions(
                 if DETECT_SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                count_extensions(&path, py, ts, js, remaining_depth - 1);
+                count_extensions(&path, py, ts, js, rs, remaining_depth - 1);
                 continue;
             }
         }
@@ -139,6 +155,7 @@ fn count_extensions(
                 "py" => *py += 1,
                 "ts" | "tsx" => *ts += 1,
                 "js" | "jsx" | "mjs" | "cjs" => *js += 1,
+                "rs" => *rs += 1,
                 _ => {}
             }
         }
@@ -601,6 +618,46 @@ entity_types = ["Function"]
         index.resolve_for_language(&Language::TypeScript);
         assert_eq!(index.include, vec!["**/*.ts", "**/*.tsx"]);
         assert!(index.exclude.contains(&"**/node_modules".to_string()));
+    }
+
+    #[test]
+    fn test_language_detect_rust() {
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_rs");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "").unwrap();
+        std::fs::write(dir.join("lib.rs"), "").unwrap();
+        std::fs::write(dir.join("utils.rs"), "").unwrap();
+
+        let detected = Language::detect(dir);
+        assert_eq!(detected, Language::Rust);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_alias_rs() {
+        let toml_str = r#"language = "rs""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Language::Rust);
+    }
+
+    #[test]
+    fn test_language_from_toml_rust() {
+        let toml_str = r#"language = "rust""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Language::Rust);
+    }
+
+    #[test]
+    fn test_rust_default_globs() {
+        let include = Language::Rust.default_include();
+        assert_eq!(include, vec!["**/*.rs"]);
+        let exclude = Language::Rust.default_exclude();
+        assert!(exclude.contains(&"**/target/**".to_string()));
+        assert!(exclude.contains(&"**/tests/**".to_string()));
+        assert!(exclude.contains(&"**/benches/**".to_string()));
+        assert!(exclude.contains(&"**/build.rs".to_string()));
     }
 
     #[test]

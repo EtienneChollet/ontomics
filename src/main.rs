@@ -49,13 +49,13 @@ fn spawn_parent_watchdog() {
 }
 
 #[derive(ClapParser)]
-#[command(name = "ontomics", about = "Domain ontology extraction for Python/TypeScript/JavaScript codebases")]
+#[command(name = "ontomics", about = "Domain ontology extraction for Python/TypeScript/JavaScript/Rust codebases")]
 struct Cli {
     /// Path to the repository to analyze (defaults to current directory)
     #[arg(long, default_value = ".")]
     repo: PathBuf,
 
-    /// Language to analyze: auto, python, typescript, javascript
+    /// Language to analyze: auto, python, typescript, javascript, rust
     #[arg(long, default_value = "auto")]
     language: String,
 
@@ -664,8 +664,9 @@ async fn main() -> anyhow::Result<()> {
         "python" | "py" => config::Language::Python,
         "typescript" | "ts" => config::Language::TypeScript,
         "javascript" | "js" => config::Language::JavaScript,
+        "rust" | "rs" => config::Language::Rust,
         other => anyhow::bail!(
-            "Unknown language: {other}. Use: auto, python, typescript, javascript"
+            "Unknown language: {other}. Use: auto, python, typescript, javascript, rust"
         ),
     };
     config.index.resolve_for_language(&language);
@@ -674,6 +675,7 @@ async fn main() -> anyhow::Result<()> {
         config::Language::Python => Box::new(parser::python_parser()),
         config::Language::TypeScript => Box::new(parser::typescript_parser()),
         config::Language::JavaScript => Box::new(parser::javascript_parser()),
+        config::Language::Rust => Box::new(parser::rust_parser()),
         config::Language::Auto => unreachable!("Language::Auto must be resolved before parser instantiation"),
     };
     eprintln!("Language: {language:?}");
