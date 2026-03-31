@@ -30,6 +30,9 @@ ontomics builds a semantic index of your project's domain — clustering related
 Install once, available in every project.
 
 ```bash
+npm install -g @ontomics/ontomics
+chmod +x $(npm root -g)/@ontomics/ontomics/node_modules/.bin_real/ontomics
+
 # Claude Code
 claude mcp add -s user ontomics -- npx -y @ontomics/ontomics
 

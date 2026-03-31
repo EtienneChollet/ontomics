@@ -19,10 +19,10 @@ pub enum EntityType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Occurrence {
-    pub file: PathBuf,
-    pub line: usize,
     pub identifier: String,
     pub entity_type: EntityType,
+    pub file: PathBuf,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
