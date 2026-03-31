@@ -23,7 +23,7 @@ ontomics extracts the domain knowledge embedded in your codebase — concepts, n
 
 Search tells you where a string appears. An LSP tells you where a symbol is defined and referenced. Neither answers: what are the domain concepts in this codebase? How do they relate? What naming conventions emerged? What changed in the domain vocabulary since last release?
 
-ontomics builds a semantic index — it clusters related symbols into concepts, detects naming conventions from usage frequency, resolves abbreviations, tracks how the domain vocabulary evolves over time, and exports that knowledge as a portable artifact.
+ontomics builds a semantic index of your project's domain — clustering related symbols into concepts, detecting naming conventions from usage frequency, resolving abbreviations, and tracking how the vocabulary evolves over time. That index can be exported as a portable artifact to bootstrap conventions in other repos.
 
 ## Install
 
