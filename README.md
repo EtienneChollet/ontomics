@@ -49,6 +49,16 @@ For structural navigation — finding all uses of a function, call graphs, impor
 
 ## Install
 
+**npm (recommended):**
+```bash
+# Claude Code
+claude mcp add -s user ontomics -- npx -y @ontomics/ontomics
+
+# Codex
+codex mcp add ontomics -- npx -y @ontomics/ontomics
+```
+
+**From source:**
 ```bash
 git clone https://github.com/EtienneChollet/ontomics.git
 cd ontomics
