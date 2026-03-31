@@ -157,8 +157,20 @@ fn build_graph(
     defer_embeddings: bool,
     lang: &dyn parser::LanguageParser,
     language_name: &str,
+    warnings: &mut Vec<String>,
 ) -> anyhow::Result<BuildResult> {
-    let cache = cache::IndexCache::open(repo)?;
+    let cache = match cache::IndexCache::open(repo) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            let msg = format!(
+                "Cache unavailable: {e}. \
+                 ontomics will work but won't persist the index across restarts."
+            );
+            eprintln!("{msg}");
+            warnings.push(msg);
+            None
+        }
+    };
 
     let model_cache_dir = resolve_cache_dir(&config.embeddings.model_cache_dir);
 
@@ -166,7 +178,10 @@ fn build_graph(
     // (fresh build, cache hit, watcher, background enrichment).
     let loaded_packs = load_domain_packs(repo, config);
 
-    if let Some(mut cached) = cache.load(language_name)? {
+    let cached_graph = cache.as_ref()
+        .and_then(|c| c.load(language_name).transpose())
+        .transpose()?;
+    if let Some(mut cached) = cached_graph {
         let nb_concepts = cached.concepts.len();
         let nb_embedded = cached.embeddings.nb_vectors();
         eprintln!(
@@ -201,9 +216,13 @@ fn build_graph(
             }
 
             if let Err(e) = cached.embeddings.load_model() {
-                eprintln!(
-                    "Warning: failed to load embedding model: {e}"
+                let msg = format!(
+                    "Embedding model unavailable: {e}. \
+                     Concept clustering and similarity search are disabled. \
+                     Restart ontomics to retry."
                 );
+                eprintln!("{msg}");
+                warnings.push(msg);
             }
         }
         cached.recompute_centroids();
@@ -351,8 +370,10 @@ fn build_graph(
             graph.entities.insert(ent.id, ent);
         }
 
-        if let Err(e) = cache.save(&graph, language_name) {
-            eprintln!("Warning: failed to cache initial index: {e}");
+        if let Some(ref cache) = cache {
+            if let Err(e) = cache.save(&graph, language_name) {
+                eprintln!("Warning: failed to cache initial index: {e}");
+            }
         }
 
         eprintln!("Graph ready (embeddings deferred to background)");
@@ -376,7 +397,13 @@ fn build_graph(
                 idx
             }
             Err(e) => {
-                eprintln!("Warning: failed to load embeddings: {e}");
+                let msg = format!(
+                    "Embedding model unavailable: {e}. \
+                     Concept clustering and similarity search are disabled. \
+                     Restart ontomics to retry."
+                );
+                eprintln!("{msg}");
+                warnings.push(msg);
                 embeddings::EmbeddingIndex::empty()
             }
         }
@@ -447,10 +474,12 @@ fn build_graph(
         }
     }
 
-    if let Err(e) = cache.save(&graph, language_name) {
-        eprintln!("Warning: failed to cache index: {e}");
-    } else {
-        eprintln!("Cached index to .ontomics/index.db");
+    if let Some(ref cache) = cache {
+        if let Err(e) = cache.save(&graph, language_name) {
+            eprintln!("Warning: failed to cache index: {e}");
+        } else {
+            eprintln!("Cached index to .ontomics/index.db");
+        }
     }
 
     Ok(BuildResult {
@@ -660,17 +689,26 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut config = config::Config::load(&cli.repo)?;
 
+    let mut startup_warnings: Vec<String> = Vec::new();
+
     // Resolve language: CLI flag > config file > auto-detection
-    let language = match cli.language.as_str() {
+    let (language, detected_file_count) = match cli.language.as_str() {
         "auto" => config.language.resolve(&cli.repo),
-        "python" | "py" => config::Language::Python,
-        "typescript" | "ts" => config::Language::TypeScript,
-        "javascript" | "js" => config::Language::JavaScript,
-        "rust" | "rs" => config::Language::Rust,
+        "python" | "py" => (config::Language::Python, u32::MAX),
+        "typescript" | "ts" => (config::Language::TypeScript, u32::MAX),
+        "javascript" | "js" => (config::Language::JavaScript, u32::MAX),
+        "rust" | "rs" => (config::Language::Rust, u32::MAX),
         other => anyhow::bail!(
             "Unknown language: {other}. Use: auto, python, typescript, javascript, rust"
         ),
     };
+    if detected_file_count == 0 {
+        startup_warnings.push(format!(
+            "No supported source files found in {}. \
+             ontomics supports Python, TypeScript, JavaScript, and Rust.",
+            cli.repo.display(),
+        ));
+    }
     config.index.resolve_for_language(&language);
 
     let active_parser: Box<dyn parser::LanguageParser> = match &language {
@@ -697,7 +735,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve
     );
     let lang_name = language.name().to_string();
-    let result = build_graph(&cli.repo, &config, is_serve, &*active_parser, &lang_name)?;
+    let result = build_graph(
+        &cli.repo, &config, is_serve, &*active_parser, &lang_name,
+        &mut startup_warnings,
+    )?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
@@ -709,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
                 &config,
                 active_parser,
                 lang_name,
+                startup_warnings,
             )
             .await
         }
@@ -929,6 +971,7 @@ fn print_json(value: &impl serde::Serialize) {
 
 // --- MCP server ---
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server(
     graph: graph::ConceptGraph,
     embedding_work: Option<EmbeddingWork>,
@@ -937,6 +980,7 @@ async fn run_server(
     config: &config::Config,
     active_parser: Box<dyn parser::LanguageParser>,
     language_name: String,
+    startup_warnings: Vec<String>,
 ) -> anyhow::Result<()> {
     spawn_parent_watchdog();
 
@@ -945,6 +989,7 @@ async fn run_server(
         graph,
         repo.to_path_buf(),
         Arc::clone(&active_parser),
+        startup_warnings,
     );
 
     let graph_handle = server.graph_handle();

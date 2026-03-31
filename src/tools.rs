@@ -11,13 +11,14 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct OntomicsServer {
     graph: Arc<RwLock<ConceptGraph>>,
     repo_root: PathBuf,
     parser: Arc<dyn LanguageParser>,
+    warnings: Arc<Mutex<Vec<String>>>,
 }
 
 impl OntomicsServer {
@@ -25,17 +26,20 @@ impl OntomicsServer {
         graph: ConceptGraph,
         repo_root: PathBuf,
         parser: Arc<dyn LanguageParser>,
+        warnings: Vec<String>,
     ) -> Self {
         Self {
             graph: Arc::new(RwLock::new(graph)),
             repo_root,
             parser,
+            warnings: Arc::new(Mutex::new(warnings)),
         }
     }
 
     pub fn graph_handle(&self) -> Arc<RwLock<ConceptGraph>> {
         Arc::clone(&self.graph)
     }
+
 
     fn handle_query_concept(&self, args: &Value) -> Result<Value, String> {
         use crate::types::QueryConceptParams;
@@ -157,7 +161,17 @@ impl OntomicsServer {
             })
             .collect();
 
-        Ok(json!(summary))
+        let warnings = self.warnings.lock()
+            .map(|w| w.clone())
+            .unwrap_or_default();
+        if warnings.is_empty() {
+            Ok(json!(summary))
+        } else {
+            Ok(json!({
+                "warnings": warnings,
+                "concepts": summary,
+            }))
+        }
     }
 
     fn handle_describe_symbol(&self, args: &Value) -> Result<Value, String> {
@@ -574,7 +588,13 @@ impl ServerHandler for OntomicsServer {
         let result = if request.uri == "ontomics://briefing" {
             match self.graph.read() {
                 Ok(graph) => {
-                    let briefing = graph.session_briefing();
+                    let mut briefing = graph.session_briefing();
+                    let warnings = self.warnings.lock()
+                        .map(|w| w.clone())
+                        .unwrap_or_default();
+                    for w in warnings {
+                        briefing.vocabulary_warnings.push(w);
+                    }
                     let json = serde_json::to_string_pretty(&briefing)
                         .unwrap_or_default();
                     Ok(ReadResourceResult {
@@ -665,6 +685,7 @@ mod tests {
             graph,
             PathBuf::from("/tmp"),
             Arc::new(crate::parser::python_parser()),
+            Vec::new(),
         )
     }
 

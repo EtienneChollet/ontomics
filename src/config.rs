@@ -33,14 +33,17 @@ const DETECT_SKIP_DIRS: &[&str] = &[
 impl Language {
     /// Auto-detect language from file extensions in the repo root.
     /// Walks up to `max_depth` levels, skipping common non-source dirs.
-    pub fn detect(repo_root: &Path) -> Language {
+    /// Returns `(language, total_files_found)` so the caller can
+    /// distinguish "no files, defaulted to Python" from "found Python files".
+    pub fn detect(repo_root: &Path) -> (Language, u32) {
         let mut py_count = 0u32;
         let mut ts_count = 0u32;
         let mut js_count = 0u32;
         let mut rs_count = 0u32;
         count_extensions(repo_root, &mut py_count, &mut ts_count, &mut js_count, &mut rs_count, 3);
 
-        if rs_count > py_count && rs_count > ts_count && rs_count > js_count {
+        let total = py_count + ts_count + js_count + rs_count;
+        let lang = if rs_count > py_count && rs_count > ts_count && rs_count > js_count {
             Language::Rust
         } else if ts_count > py_count && ts_count > js_count {
             Language::TypeScript
@@ -48,7 +51,8 @@ impl Language {
             Language::JavaScript
         } else {
             Language::Python
-        }
+        };
+        (lang, total)
     }
 
     /// Stable string name for cache tagging.
@@ -62,11 +66,12 @@ impl Language {
     }
 
     /// Resolve auto-detection: if `Auto`, detect from repo. Otherwise
-    /// return self.
-    pub fn resolve(&self, repo_root: &Path) -> Language {
+    /// return self. Returns `(language, files_found)` — for explicit
+    /// languages, `files_found` is `u32::MAX` (not meaningful).
+    pub fn resolve(&self, repo_root: &Path) -> (Language, u32) {
         match self {
             Language::Auto => Language::detect(repo_root),
-            other => other.clone(),
+            other => (other.clone(), u32::MAX),
         }
     }
 
@@ -507,8 +512,9 @@ entity_types = ["Function"]
         std::fs::write(dir.join("bar.py"), "").unwrap();
         std::fs::write(dir.join("baz.py"), "").unwrap();
 
-        let detected = Language::detect(dir);
+        let (detected, count) = Language::detect(dir);
         assert_eq!(detected, Language::Python);
+        assert_eq!(count, 3);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -522,8 +528,9 @@ entity_types = ["Function"]
         std::fs::write(dir.join("app.tsx"), "").unwrap();
         std::fs::write(dir.join("utils.ts"), "").unwrap();
 
-        let detected = Language::detect(dir);
+        let (detected, count) = Language::detect(dir);
         assert_eq!(detected, Language::TypeScript);
+        assert_eq!(count, 3);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -537,8 +544,9 @@ entity_types = ["Function"]
         std::fs::write(dir.join("app.jsx"), "").unwrap();
         std::fs::write(dir.join("utils.js"), "").unwrap();
 
-        let detected = Language::detect(dir);
+        let (detected, count) = Language::detect(dir);
         assert_eq!(detected, Language::JavaScript);
+        assert_eq!(count, 3);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -559,7 +567,7 @@ entity_types = ["Function"]
         std::fs::write(dir.join("main.py"), "").unwrap();
         std::fs::write(dir.join("utils.py"), "").unwrap();
 
-        let detected = Language::detect(dir);
+        let (detected, _count) = Language::detect(dir);
         assert_eq!(detected, Language::Python);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -573,8 +581,9 @@ entity_types = ["Function"]
         std::fs::write(dir.join("a.ts"), "").unwrap();
         std::fs::write(dir.join("b.ts"), "").unwrap();
 
-        let resolved = Language::Auto.resolve(dir);
+        let (resolved, count) = Language::Auto.resolve(dir);
         assert_eq!(resolved, Language::TypeScript);
+        assert_eq!(count, 2);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -587,8 +596,9 @@ entity_types = ["Function"]
         // Even though there are TS files, explicit Python stays Python
         std::fs::write(dir.join("a.ts"), "").unwrap();
 
-        let resolved = Language::Python.resolve(dir);
+        let (resolved, count) = Language::Python.resolve(dir);
         assert_eq!(resolved, Language::Python);
+        assert_eq!(count, u32::MAX);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -629,8 +639,23 @@ entity_types = ["Function"]
         std::fs::write(dir.join("lib.rs"), "").unwrap();
         std::fs::write(dir.join("utils.rs"), "").unwrap();
 
-        let detected = Language::detect(dir);
+        let (detected, count) = Language::detect(dir);
         assert_eq!(detected, Language::Rust);
+        assert_eq!(count, 3);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_language_detect_empty_dir() {
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_empty");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let (detected, count) = Language::detect(dir);
+        // Falls back to Python, but count is 0
+        assert_eq!(detected, Language::Python);
+        assert_eq!(count, 0);
 
         let _ = std::fs::remove_dir_all(dir);
     }

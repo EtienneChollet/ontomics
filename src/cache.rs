@@ -41,7 +41,13 @@ impl IndexCache {
     /// Open or create cache at `<repo_root>/.ontomics/index.db`.
     pub fn open(repo_root: &Path) -> Result<Self> {
         let ontomics_dir = repo_root.join(".ontomics");
-        std::fs::create_dir_all(&ontomics_dir)?;
+        std::fs::create_dir_all(&ontomics_dir).with_context(|| {
+            format!(
+                "Cannot create cache directory '{}'. Check permissions on '{}'.",
+                ontomics_dir.display(),
+                repo_root.display(),
+            )
+        })?;
 
         let db_path = ontomics_dir.join("index.db");
         {
