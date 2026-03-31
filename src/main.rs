@@ -134,7 +134,6 @@ enum Command {
 struct BuildResult {
     graph: graph::ConceptGraph,
     needs_embedding: Option<EmbeddingWork>,
-    loaded_packs: Vec<types::DomainPack>,
 }
 
 /// Work deferred to a background thread for embedding enrichment.
@@ -211,7 +210,6 @@ fn build_graph(
                             .embedding_batch_size,
                         domain_packs: loaded_packs.clone(),
                     }),
-                    loaded_packs,
                 });
             }
 
@@ -229,7 +227,6 @@ fn build_graph(
         return Ok(BuildResult {
             graph: cached,
             needs_embedding: None,
-            loaded_packs,
         });
     }
 
@@ -386,7 +383,6 @@ fn build_graph(
                 batch_size: config.resources.embedding_batch_size,
                 domain_packs: loaded_packs.clone(),
             }),
-            loaded_packs,
         });
     }
 
@@ -485,7 +481,6 @@ fn build_graph(
     Ok(BuildResult {
         graph,
         needs_embedding: None,
-        loaded_packs,
     })
 }
 
@@ -730,22 +725,12 @@ async fn main() -> anyhow::Result<()> {
         config.resources.embedding_batch_size,
     );
 
-    let is_serve = matches!(
-        cli.command.as_ref().unwrap_or(&Command::Serve),
-        Command::Serve
-    );
     let lang_name = language.name().to_string();
-    let result = build_graph(
-        &cli.repo, &config, is_serve, &*active_parser, &lang_name,
-        &mut startup_warnings,
-    )?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
+            // Defer graph building to background — start MCP immediately
             run_server(
-                result.graph,
-                result.needs_embedding,
-                result.loaded_packs,
                 &cli.repo,
                 &config,
                 active_parser,
@@ -754,31 +739,45 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Query { term } => cmd_query(&result.graph, &term),
-        Command::Check { identifier } => {
-            cmd_check(&result.graph, &identifier)
+        cmd => {
+            // CLI subcommands build the graph synchronously
+            let result = build_graph(
+                &cli.repo, &config, false, &*active_parser, &lang_name,
+                &mut startup_warnings,
+            )?;
+            match cmd {
+                Command::Serve => unreachable!(),
+                Command::Query { term } => cmd_query(&result.graph, &term),
+                Command::Check { identifier } => {
+                    cmd_check(&result.graph, &identifier)
+                }
+                Command::Suggest { description } => {
+                    cmd_suggest(&result.graph, &description)
+                }
+                Command::Diff { since } => {
+                    cmd_diff(&cli.repo, &result.graph, &since, &*active_parser)
+                }
+                Command::Concepts { top_k } => {
+                    cmd_concepts(&result.graph, top_k)
+                }
+                Command::Conventions => cmd_conventions(&result.graph),
+                Command::Describe { name } => {
+                    cmd_describe(&result.graph, &name)
+                }
+                Command::Locate { term } => cmd_locate(&result.graph, &term),
+                Command::Briefing => cmd_briefing(&result.graph),
+                Command::Export { output } => {
+                    cmd_export(&result.graph, output.as_deref())
+                }
+                Command::Entities {
+                    concept,
+                    role,
+                    top_k,
+                } => cmd_entities(
+                    &result.graph, concept.as_deref(), role.as_deref(), top_k,
+                ),
+            }
         }
-        Command::Suggest { description } => {
-            cmd_suggest(&result.graph, &description)
-        }
-        Command::Diff { since } => {
-            cmd_diff(&cli.repo, &result.graph, &since, &*active_parser)
-        }
-        Command::Concepts { top_k } => {
-            cmd_concepts(&result.graph, top_k)
-        }
-        Command::Conventions => cmd_conventions(&result.graph),
-        Command::Describe { name } => {
-            cmd_describe(&result.graph, &name)
-        }
-        Command::Locate { term } => cmd_locate(&result.graph, &term),
-        Command::Briefing => cmd_briefing(&result.graph),
-        Command::Export { output } => cmd_export(&result.graph, output.as_deref()),
-        Command::Entities {
-            concept,
-            role,
-            top_k,
-        } => cmd_entities(&result.graph, concept.as_deref(), role.as_deref(), top_k),
     }
 }
 
@@ -971,11 +970,7 @@ fn print_json(value: &impl serde::Serialize) {
 
 // --- MCP server ---
 
-#[allow(clippy::too_many_arguments)]
 async fn run_server(
-    graph: graph::ConceptGraph,
-    embedding_work: Option<EmbeddingWork>,
-    loaded_packs: Vec<types::DomainPack>,
     repo: &Path,
     config: &config::Config,
     active_parser: Box<dyn parser::LanguageParser>,
@@ -985,37 +980,90 @@ async fn run_server(
     spawn_parent_watchdog();
 
     let active_parser: Arc<dyn parser::LanguageParser> = Arc::from(active_parser);
-    let server = tools::OntomicsServer::new(
-        graph,
-        repo.to_path_buf(),
-        Arc::clone(&active_parser),
-        startup_warnings,
-    );
 
-    let graph_handle = server.graph_handle();
-    let repo_root = repo.to_path_buf();
+    // Shared state — graph starts empty, populated by background thread
+    let graph_handle = Arc::new(std::sync::RwLock::new(
+        graph::ConceptGraph::empty(),
+    ));
+    let warnings = Arc::new(std::sync::Mutex::new(startup_warnings));
+    let indexing_ready = Arc::new(
+        std::sync::atomic::AtomicBool::new(false),
+    );
     let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Spawn background embedding enrichment if needed
-    if let Some(work) = embedding_work {
-        let bg_handle = Arc::clone(&graph_handle);
-        let bg_gen = Arc::clone(&generation);
+    let server = tools::OntomicsServer::new_deferred(
+        Arc::clone(&graph_handle),
+        repo.to_path_buf(),
+        Arc::clone(&active_parser),
+        Arc::clone(&warnings),
+        Arc::clone(&indexing_ready),
+    );
+
+    let repo_root = repo.to_path_buf();
+
+    // Spawn background graph building
+    {
         let bg_repo = repo_root.clone();
+        let bg_config = config.clone();
+        let bg_parser = Arc::clone(&active_parser);
         let bg_lang_name = language_name.clone();
+        let bg_graph_handle = Arc::clone(&graph_handle);
+        let bg_generation = Arc::clone(&generation);
+        let bg_warnings = Arc::clone(&warnings);
+        let bg_indexing_ready = Arc::clone(&indexing_ready);
         std::thread::spawn(move || {
-            enrich_graph_with_embeddings(
-                work, bg_handle, bg_gen, bg_repo, bg_lang_name,
-            );
+            let mut bg_startup_warnings = Vec::new();
+            match build_graph(
+                &bg_repo, &bg_config, true, &*bg_parser, &bg_lang_name,
+                &mut bg_startup_warnings,
+            ) {
+                Ok(result) => {
+                    if let Ok(mut g) = bg_graph_handle.write() {
+                        *g = result.graph;
+                    }
+                    if let Ok(mut w) = bg_warnings.lock() {
+                        w.extend(bg_startup_warnings);
+                    }
+                    bg_indexing_ready.store(
+                        true,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    eprintln!("Background: graph ready");
+
+                    // Spawn embedding enrichment if needed
+                    if let Some(work) = result.needs_embedding {
+                        enrich_graph_with_embeddings(
+                            work,
+                            bg_graph_handle,
+                            bg_generation,
+                            bg_repo,
+                            bg_lang_name,
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Background: build_graph failed: {e}");
+                    if let Ok(mut w) = bg_warnings.lock() {
+                        w.push(format!("Indexing failed: {e}"));
+                    }
+                    bg_indexing_ready.store(
+                        true,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                }
+            }
         });
     }
+
+    // File watcher
     let watcher_config = config.clone();
-    let watcher_packs = loaded_packs;
     let watcher_language_name = language_name;
     let watcher_extensions: Vec<String> = active_parser
         .extensions()
         .iter()
         .map(|e| e.to_string())
         .collect();
+    let watcher_indexing_ready = Arc::clone(&indexing_ready);
     tokio::task::spawn_blocking(move || {
         let watcher_cache = match cache::IndexCache::open(&repo_root) {
             Ok(c) => c,
@@ -1032,6 +1080,10 @@ async fn run_server(
                 return;
             }
         };
+
+        // Load domain packs for watcher re-indexing
+        let watcher_packs = load_domain_packs(&repo_root, &watcher_config);
+
         eprintln!("File watcher started");
         loop {
             match rx.recv_timeout(Duration::from_secs(2)) {
@@ -1154,6 +1206,10 @@ async fn run_server(
                     match graph_handle.write() {
                         Ok(mut g) => {
                             *g = new_graph;
+                            watcher_indexing_ready.store(
+                                true,
+                                std::sync::atomic::Ordering::Release,
+                            );
                             eprintln!("Graph updated (re-embedding in background)");
                         }
                         Err(e) => {
@@ -1201,6 +1257,7 @@ async fn run_server(
         }
     });
 
+    // Start MCP immediately — don't wait for graph building
     eprintln!("Starting MCP server on stdio...");
     let running = server
         .serve(rmcp::transport::io::stdio())

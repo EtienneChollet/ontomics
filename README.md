@@ -34,10 +34,10 @@ npm install -g @ontomics/ontomics
 chmod +x $(npm root -g)/@ontomics/ontomics/node_modules/.bin_real/ontomics
 
 # Claude Code
-claude mcp add -s user ontomics -- npx -y @ontomics/ontomics
+claude mcp add -s user ontomics -- ontomics
 
 # Codex
-codex mcp add ontomics -- npx -y @ontomics/ontomics
+codex mcp add ontomics -- ontomics
 ```
 
 **From source:**

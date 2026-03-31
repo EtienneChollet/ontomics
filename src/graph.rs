@@ -46,6 +46,22 @@ impl ConceptGraph {
         occ_sum as f64 / subtokens as f64
     }
 
+    /// Create an empty graph (no concepts, relationships, or entities).
+    /// Used as placeholder during deferred startup.
+    pub fn empty() -> Self {
+        Self {
+            concepts: HashMap::new(),
+            relationships: Vec::new(),
+            conventions: Vec::new(),
+            embeddings: EmbeddingIndex::empty(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+            entities: HashMap::new(),
+            cluster_centroids: HashMap::new(),
+        }
+    }
+
     /// Build graph from analysis results + embeddings + entities.
     pub fn build(
         analysis: AnalysisResult,

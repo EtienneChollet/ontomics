@@ -11,6 +11,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub struct OntomicsServer {
     repo_root: PathBuf,
     parser: Arc<dyn LanguageParser>,
     warnings: Arc<Mutex<Vec<String>>>,
+    indexing_ready: Arc<AtomicBool>,
 }
 
 impl OntomicsServer {
@@ -33,6 +35,25 @@ impl OntomicsServer {
             repo_root,
             parser,
             warnings: Arc::new(Mutex::new(warnings)),
+            indexing_ready: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Create a server with shared handles for deferred startup.
+    /// The graph starts empty and is populated by a background thread.
+    pub fn new_deferred(
+        graph: Arc<RwLock<ConceptGraph>>,
+        repo_root: PathBuf,
+        parser: Arc<dyn LanguageParser>,
+        warnings: Arc<Mutex<Vec<String>>>,
+        indexing_ready: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            graph,
+            repo_root,
+            parser,
+            warnings,
+            indexing_ready,
         }
     }
 
@@ -523,6 +544,19 @@ impl ServerHandler for OntomicsServer {
            + Send
            + '_ {
         let name: &str = &request.name;
+
+        if !self.indexing_ready.load(Ordering::Acquire) {
+            let msg = json!({
+                "status": "indexing_in_progress",
+                "message": "ontomics is still indexing this codebase. \
+                    Results will be available shortly. Please try again in a moment.",
+                "tool": name,
+            });
+            return std::future::ready(Ok(CallToolResult::success(vec![
+                Content::text(serde_json::to_string_pretty(&msg).unwrap_or_default()),
+            ])));
+        }
+
         let args = request
             .arguments
             .as_ref()
@@ -585,7 +619,19 @@ impl ServerHandler for OntomicsServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::Error>>
            + Send
            + '_ {
-        let result = if request.uri == "ontomics://briefing" {
+        let result = if !self.indexing_ready.load(Ordering::Acquire) {
+            let msg = json!({
+                "status": "indexing_in_progress",
+                "message": "ontomics is still indexing this codebase. \
+                    The briefing will be available shortly.",
+            });
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(
+                    serde_json::to_string_pretty(&msg).unwrap_or_default(),
+                    "ontomics://briefing",
+                )],
+            })
+        } else if request.uri == "ontomics://briefing" {
             match self.graph.read() {
                 Ok(graph) => {
                     let mut briefing = graph.session_briefing();
