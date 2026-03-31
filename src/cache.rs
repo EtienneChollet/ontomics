@@ -278,6 +278,7 @@ impl IndexCache {
             classes: cached.classes,
             call_sites: cached.call_sites,
             entities: cached.entities,
+            cluster_centroids: HashMap::new(),
         }))
     }
 }
@@ -314,6 +315,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             entities: HashMap::new(),
+            cluster_centroids: HashMap::new(),
         }
     }
 
@@ -489,6 +491,16 @@ mod tests {
                     entity_type: crate::types::EntityType::Function,
                 });
             }
+            // Assign cluster_id to concepts 0-9 (3 clusters) to test round-trip
+            let cluster_id = if i < 4 {
+                Some(0)
+            } else if i < 8 {
+                Some(1)
+            } else if i < 10 {
+                Some(2)
+            } else {
+                None
+            };
             concepts.insert(
                 i as u64,
                 Concept {
@@ -498,7 +510,7 @@ mod tests {
                     occurrences: occs,
                     entity_types: HashSet::new(),
                     embedding: None,
-                    cluster_id: None,
+                    cluster_id,
                     subconcepts: Vec::new(),
                 },
             );
@@ -577,6 +589,7 @@ mod tests {
             classes,
             call_sites,
             entities: HashMap::new(),
+            cluster_centroids: HashMap::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -624,6 +637,12 @@ mod tests {
         assert_eq!(co_occurs, 40, "CoOccurs edges lost");
         assert_eq!(similar, 10, "SimilarTo edges lost");
         assert_eq!(contrastive, 1, "Contrastive edges lost");
+
+        // Verify cluster_id survives round-trip
+        assert_eq!(loaded.concepts[&0].cluster_id, Some(0));
+        assert_eq!(loaded.concepts[&5].cluster_id, Some(1));
+        assert_eq!(loaded.concepts[&9].cluster_id, Some(2));
+        assert_eq!(loaded.concepts[&10].cluster_id, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -682,6 +701,7 @@ mod tests {
             classes: Vec::new(),
             entities: HashMap::new(),
             call_sites: Vec::new(),
+            cluster_centroids: HashMap::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -749,6 +769,7 @@ mod tests {
             entities: HashMap::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            cluster_centroids: HashMap::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();

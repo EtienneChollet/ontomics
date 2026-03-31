@@ -262,9 +262,12 @@ fn tool_definitions() -> Vec<Tool> {
     vec![
         Tool::new(
             "query_concept",
-            "Look up a domain concept. Use when asked 'what is X', 'what does X mean', \
-             or 'where is X used'. Returns variants, related concepts, conventions, \
-             signatures, and occurrences.",
+            "Semantic concept lookup — returns all variants (including abbreviations \
+             like trf for transform), related concepts, naming conventions, function \
+             signatures, and file locations in one call. Richer than grep: querying \
+             'transform' also finds 'trf', 'spatial_transform', 'apply_transform', \
+             and related concepts like 'displacement'. Use when asked 'what is X', \
+             'what does X mean', or 'where is X used'.",
             tool_schema(
                 json!({
                     "term": {
@@ -293,9 +296,11 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "check_naming",
-            "Check if an identifier follows project conventions. Use when \
-             writing new code or reviewing names. Returns consistent/inconsistent \
-             verdict with suggestions.",
+            "Check if an identifier follows project naming conventions — detects \
+             inconsistencies like 'n_dims' vs the project's 'ndim' convention, or \
+             'numFeatures' vs 'nb_features'. Returns a consistent/inconsistent \
+             verdict with the canonical form and suggestions. Use before committing \
+             new code or when reviewing identifier names.",
             tool_schema(
                 json!({
                     "identifier": {
@@ -308,8 +313,11 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "suggest_name",
-            "Suggest an identifier name from a description. Use when naming \
-             new functions, variables, or parameters to match project style.",
+            "Generate project-consistent identifier names from a natural language \
+             description. Uses the project's actual conventions (prefixes like nb_, \
+             patterns like is_/has_, conversion patterns like x_to_y) to suggest \
+             names that fit the existing codebase style. Use when naming new \
+             functions, variables, or parameters.",
             tool_schema(
                 json!({
                     "description": {
@@ -322,8 +330,10 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "ontology_diff",
-            "Compare the domain ontology between two git revisions. Shows \
-             added, removed, and changed concepts.",
+            "Compare the domain ontology between two git revisions — shows \
+             concepts that were added, removed, or changed. Useful for \
+             understanding how the project's vocabulary evolved across commits \
+             or for reviewing whether a PR introduced naming inconsistencies.",
             tool_schema(
                 json!({
                     "since": {
@@ -336,9 +346,12 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "list_concepts",
-            "List the project's domain concepts by frequency. Use when asked \
-             'what is this project about' or 'what are the main concepts'. \
-             Returns concept names with occurrence counts.",
+            "List the project's domain vocabulary ranked by importance — a \
+             semantic overview of what this codebase is about that reading \
+             individual files cannot provide. Returns concept names with \
+             occurrence counts and entity counts. Use when asked 'what is \
+             this project about', 'what are the main concepts', or when \
+             orienting in an unfamiliar codebase.",
             tool_schema(
                 json!({
                     "top_k": {
@@ -351,16 +364,22 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "list_conventions",
-            "List the project's naming conventions. Use when asked about coding \
-             style or before writing new code. Shows prefix, suffix, and \
-             conversion patterns with examples.",
+            "List the project's actual naming conventions detected from code — \
+             prefix patterns (nb_, is_, has_), suffix patterns, conversion \
+             patterns (x_to_y), and casing rules, each with real examples from \
+             the codebase. More accurate than guessing from a few files. Use \
+             when asked about coding style, before writing new code, or when \
+             onboarding to a project.",
             tool_schema(json!({}), &[]),
         ),
         Tool::new(
             "describe_symbol",
-            "Describe a function or class without reading its file. Use when asked \
-             'what does function X do' or 'what is class X'. Returns signature, \
-             parameters, callers, callees, and related concepts.",
+            "Describe a function or class WITHOUT reading its source file — \
+             returns signature, parameters, callers, callees, semantic role, \
+             and related domain concepts. Faster and more informative than \
+             Read for understanding what a symbol does and how it fits into \
+             the codebase. Use when asked 'what does function X do' or \
+             'what is class X'.",
             tool_schema(
                 json!({
                     "name": {
@@ -373,9 +392,12 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "locate_concept",
-            "Find where to start reading about a concept. Use when asked 'how does X work' \
-             or 'where should I look for X'. Returns ranked signatures, classes, and files \
-             — the minimum context needed to understand a concept.",
+            "Find the best entry points for understanding a concept — returns \
+             a ranked shortlist of key functions, classes, and files to read, \
+             plus contrastive concepts that clarify boundaries. Saves reading \
+             dozens of grep matches by surfacing the most important locations \
+             first. Use when asked 'how does X work', 'where should I look \
+             for X', or 'where are X defined'.",
             tool_schema(
                 json!({
                     "term": {
@@ -388,18 +410,22 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "export_domain_pack",
-            "Export the project's domain knowledge as a portable YAML pack. \
-             Use when asked to 'export conventions', 'create a domain pack', \
-             or 'share naming rules'. Returns YAML containing abbreviations, \
-             conventions, domain terms, and concept associations. The agent \
-             can review and curate the output before saving.",
+            "Export the project's full domain knowledge as a portable YAML \
+             pack — abbreviations, conventions, domain terms, and concept \
+             associations. Use when asked to 'export conventions', 'create \
+             a domain pack', or 'share naming rules'. The output can be \
+             reviewed, curated, and saved for use in other projects or tools.",
             tool_schema(json!({}), &[]),
         ),
         Tool::new(
             "list_entities",
-            "List code entities (classes, functions) that instantiate domain concepts. \
-             Use when asked 'what loss functions exist', 'show me the network classes', \
-             or 'what uses concept X'. Returns entities with semantic roles and concept tags.",
+            "Find all classes and functions matching a semantic role or concept — \
+             e.g. all loss functions, all network architectures, all transform \
+             utilities. Returns entities with semantic roles and concept tags. \
+             Impossible with grep alone because it understands which functions \
+             *implement* a concept, not just mention it. Use when asked 'what \
+             loss functions exist', 'show me the network classes', 'what uses \
+             concept X', or 'list all X'.",
             tool_schema(
                 json!({
                     "concept": {
@@ -441,22 +467,22 @@ impl ServerHandler for OntomicsServer {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             instructions: Some(
-                "ontomics extracts domain ontologies from codebases (Python, TypeScript, JavaScript). \
-                 Use it BEFORE reading files when exploring unfamiliar code.\n\
+                "ontomics is a SEMANTIC INDEX of this codebase. It knows every domain \
+                 concept, naming convention, abbreviation, and function relationship. \
+                 It resolves abbreviations (trf → transform, nb_ → count prefix), finds \
+                 related concepts, and gives semantic context that text search cannot.\n\
                  \n\
-                 WHEN TO USE:\n\
+                 ALWAYS try ontomics BEFORE grep/glob/read for these questions:\n\
+                 - \"what is this codebase about\" / \"what are the main concepts\" → list_concepts\n\
                  - \"what is X\" / \"what does X mean\" → query_concept\n\
-                 - \"how does X work\" / \"where is X\" → locate_concept + describe_symbol\n\
-                 - \"what are the main concepts\" → list_concepts\n\
-                 - \"what naming conventions\" → list_conventions\n\
-                 - \"is this name correct\" → check_naming\n\
+                 - \"where is X\" / \"how does X work\" / \"where are X defined\" → locate_concept\n\
+                 - \"what does function/class X do\" → describe_symbol\n\
+                 - \"what X functions/classes exist\" / \"list all X\" → list_entities\n\
+                 - \"what naming conventions\" / \"what style\" → list_conventions\n\
+                 - \"is this name right\" → check_naming\n\
                  - \"what should I call this\" → suggest_name\n\
-                 - \"describe function/class X\" → describe_symbol\n\
-                 - \"what loss functions exist\" / \"show me X classes\" → list_entities\n\
                  \n\
-                 ontomics gives you semantic understanding (concepts, conventions, \
-                 relationships) without reading files. Use file reading only as \
-                 fallback when ontomics returns insufficient detail."
+                 Fall back to file reading ONLY when ontomics returns insufficient detail."
                     .to_string(),
             ),
         }

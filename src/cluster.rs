@@ -3,6 +3,7 @@
 // threshold approach that caused transitive chaining.
 
 use crate::embeddings::EmbeddingIndex;
+use rayon::prelude::*;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -26,18 +27,9 @@ impl PartialOrd for Dist {
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
-}
-
 pub struct ClusterResult {
     pub assignments: HashMap<u64, usize>,
+    #[allow(dead_code)]
     pub nb_clusters: usize,
 }
 
@@ -83,21 +75,58 @@ pub fn agglomerative_cluster(
     // Phase 1: Build initial state
     // cluster_of[i] = cluster label for concept at index i
     let mut cluster_of: Vec<usize> = (0..n).collect();
-    // cluster_members[label] = set of concept indices in that cluster
-    let mut cluster_members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+    let mut cluster_size: Vec<usize> = vec![1; n];
     let mut active_clusters: HashSet<usize> = (0..n).collect();
 
-    // Precompute NxN pairwise cosine distance matrix (flat)
+    // Pre-extract, L2-normalize, and pack embeddings into a contiguous flat
+    // array for cache-friendly dot products. After normalization,
+    // cosine_sim(a, b) = dot(a, b), avoiding sqrt per pair.
+    let dim = concept_ids
+        .iter()
+        .find_map(|&id| embeddings.get_vector(id).map(|v| v.len()))
+        .unwrap_or(0);
+    let mut has_emb = vec![false; n];
+    let mut flat = vec![0.0_f32; n * dim];
+    for (i, &id) in concept_ids.iter().enumerate() {
+        if let Some(v) = embeddings.get_vector(id) {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                has_emb[i] = true;
+                let row = &mut flat[i * dim..(i + 1) * dim];
+                for (dst, src) in row.iter_mut().zip(v.iter()) {
+                    *dst = src / norm;
+                }
+            }
+        }
+    }
+
+    // Precompute NxN pairwise cosine distance matrix (flat).
+    // Parallelized across rows via rayon. Contiguous embedding layout
+    // enables auto-vectorization and good cache utilization.
+    // After clustering, entries are updated via the Lance-Williams formula.
+    let row_distances: Vec<Vec<(usize, f32)>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut pairs = Vec::new();
+            if has_emb[i] {
+                let a = &flat[i * dim..(i + 1) * dim];
+                for j in (i + 1)..n {
+                    if has_emb[j] {
+                        let b = &flat[j * dim..(j + 1) * dim];
+                        let dot: f32 =
+                            a.iter().zip(b).map(|(x, y)| x * y).sum();
+                        pairs.push((j, 1.0 - dot));
+                    }
+                }
+            }
+            pairs
+        })
+        .collect();
+
     let mut dist = vec![1.0_f32; n * n];
     for i in 0..n {
         dist[i * n + i] = 0.0;
-        let emb_i = embeddings.get_vector(concept_ids[i]);
-        for j in (i + 1)..n {
-            let emb_j = embeddings.get_vector(concept_ids[j]);
-            let d = match (emb_i, emb_j) {
-                (Some(a), Some(b)) => 1.0 - cosine_similarity(a, b),
-                _ => 1.0,
-            };
+        for &(j, d) in &row_distances[i] {
             dist[i * n + j] = d;
             dist[j * n + i] = d;
         }
@@ -115,53 +144,53 @@ pub fn agglomerative_cluster(
 
     // Phase 3: Merge loop
     while let Some(Reverse((_d, ca, cb))) = heap.pop() {
-        // Skip stale entries
+        // Skip stale entries (clusters already merged into something else)
         if !active_clusters.contains(&ca) || !active_clusters.contains(&cb) {
             continue;
         }
 
-        // Recompute average linkage between current cluster members
-        let members_a = &cluster_members[ca];
-        let members_b = &cluster_members[cb];
-        let mut sum = 0.0_f32;
-        let count = members_a.len() * members_b.len();
-        for &i in members_a {
-            for &j in members_b {
-                sum += dist[i * n + j];
-            }
-        }
-        let actual_dist = sum / count as f32;
-
-        if actual_dist > distance_threshold {
+        // Check current cluster-level distance (heap entry may be stale
+        // if either cluster was updated by an earlier merge)
+        let current_dist = dist[ca * n + cb];
+        if current_dist > distance_threshold {
             continue;
         }
 
         // Merge cb into ca
-        let cb_members: Vec<usize> = cluster_members[cb].clone();
-        for &idx in &cb_members {
-            cluster_of[idx] = ca;
+        let size_a = cluster_size[ca];
+        let size_b = cluster_size[cb];
+        let new_size = size_a + size_b;
+
+        // Update cluster_of for all members of cb
+        for label in cluster_of.iter_mut() {
+            if *label == cb {
+                *label = ca;
+            }
         }
-        cluster_members[ca].extend(cb_members);
-        cluster_members[cb].clear();
+        cluster_size[ca] = new_size;
+        cluster_size[cb] = 0;
         active_clusters.remove(&cb);
 
-        // Push updated distances from merged cluster to all remaining
-        let ca_members = cluster_members[ca].clone();
+        // Lance-Williams update for average linkage:
+        //   d(A∪B, C) = (|A| * d(A,C) + |B| * d(B,C)) / (|A| + |B|)
+        // This is O(1) per cluster pair instead of O(|A∪B| * |C|).
         for &other in &active_clusters {
             if other == ca {
                 continue;
             }
-            let other_members = &cluster_members[other];
-            let mut s = 0.0_f32;
-            let c = ca_members.len() * other_members.len();
-            for &i in &ca_members {
-                for &j in other_members {
-                    s += dist[i * n + j];
-                }
-            }
-            let avg_d = s / c as f32;
-            if avg_d < distance_threshold {
-                heap.push(Reverse((Dist(avg_d), ca, other)));
+            let d_ca = dist[ca * n + other];
+            let d_cb = dist[cb * n + other];
+            let new_d = (size_a as f32 * d_ca + size_b as f32 * d_cb)
+                / new_size as f32;
+            dist[ca * n + other] = new_d;
+            dist[other * n + ca] = new_d;
+            if new_d < distance_threshold {
+                let (lo, hi) = if ca < other {
+                    (ca, other)
+                } else {
+                    (other, ca)
+                };
+                heap.push(Reverse((Dist(new_d), lo, hi)));
             }
         }
     }

@@ -206,6 +206,7 @@ fn build_graph(
                 );
             }
         }
+        cached.recompute_centroids();
         return Ok(BuildResult {
             graph: cached,
             needs_embedding: None,
