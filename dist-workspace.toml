@@ -23,6 +23,8 @@ npm-scope = "@ontomics"
 pr-run-mode = "plan"
 # Publish npm package to registry (requires NPM_TOKEN secret in GitHub)
 publish-jobs = ["npm"]
+# Run setup script inside containers before building
+github-build-setup = "build-setup.yml"
 
 # Build Linux binaries in older-glibc container for broad compatibility
 [dist.github-custom-runners.x86_64-unknown-linux-gnu]
