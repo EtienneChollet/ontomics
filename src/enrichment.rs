@@ -62,6 +62,7 @@ mod tests {
             }],
             entity_types: HashSet::from([EntityType::Function]),
             embedding: None,
+            cluster_id: None,
             subconcepts: Vec::new(),
         }
     }

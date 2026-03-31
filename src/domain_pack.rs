@@ -387,6 +387,7 @@ fn make_synthetic_concept(term: &str, entity_types: HashSet<EntityType>) -> Conc
         occurrences: Vec::new(),
         entity_types,
         embedding: None,
+        cluster_id: None,
         subconcepts: Vec::new(),
     }
 }
@@ -414,6 +415,7 @@ mod tests {
                 .collect(),
             entity_types: HashSet::from([EntityType::Function]),
             embedding: None,
+            cluster_id: None,
             subconcepts: Vec::new(),
         }
     }
