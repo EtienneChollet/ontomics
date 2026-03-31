@@ -10,7 +10,7 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "npm"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
@@ -23,3 +23,9 @@ npm-scope = "@ontomics"
 pr-run-mode = "plan"
 # Publish npm package to registry (requires NPM_TOKEN secret in GitHub)
 publish-jobs = ["npm"]
+
+# Build Linux binaries in older-glibc container for broad compatibility
+[dist.github-custom-runners.x86_64-unknown-linux-gnu]
+container = { image = "quay.io/pypa/manylinux_2_28_x86_64", host = "x86_64-unknown-linux-gnu" }
+[dist.github-custom-runners.aarch64-unknown-linux-gnu]
+container = { image = "quay.io/pypa/manylinux_2_28_aarch64", host = "x86_64-unknown-linux-gnu" }
