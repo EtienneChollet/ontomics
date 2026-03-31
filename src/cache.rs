@@ -301,6 +301,7 @@ mod tests {
                 occurrences: vec![],
                 entity_types: HashSet::new(),
                 embedding: None,
+                cluster_id: None,
                 subconcepts: Vec::new(),
             },
         );
@@ -497,6 +498,7 @@ mod tests {
                     occurrences: occs,
                     entity_types: HashSet::new(),
                     embedding: None,
+                    cluster_id: None,
                     subconcepts: Vec::new(),
                 },
             );
@@ -660,6 +662,7 @@ mod tests {
                     occurrences: vec![],
                     entity_types: HashSet::new(),
                     embedding: None,
+                    cluster_id: None,
                     subconcepts: Vec::new(),
                 },
             );
@@ -725,6 +728,7 @@ mod tests {
                     occurrences: vec![],
                     entity_types: HashSet::new(),
                     embedding: None,
+                    cluster_id: None,
                     subconcepts: Vec::new(),
                 },
             );

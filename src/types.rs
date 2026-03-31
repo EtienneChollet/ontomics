@@ -34,6 +34,8 @@ pub struct Concept {
     pub entity_types: HashSet<EntityType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<usize>,
     #[serde(default)]
     pub subconcepts: Vec<Subconcept>,
 }

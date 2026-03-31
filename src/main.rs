@@ -1,5 +1,6 @@
 mod analyzer;
 mod cache;
+mod cluster;
 mod config;
 mod diff;
 mod domain_pack;
