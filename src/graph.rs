@@ -29,75 +29,8 @@ pub struct ConceptGraph {
     pub classes: Vec<ClassInfo>,
     pub call_sites: Vec<CallSite>,
     pub entities: HashMap<u64, Entity>,
-}
-
-/// Jaccard similarity between two sets of strings.
-fn jaccard_str(a: &[String], b: &[String]) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let set_a: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
-    let set_b: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
-    let intersection = set_a.intersection(&set_b).count();
-    let union = set_a.union(&set_b).count();
-    intersection as f64 / union as f64
-}
-
-/// Jaccard similarity between two concept tag sets.
-fn jaccard_u64(a: &[u64], b: &[u64]) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
-    let set_a: HashSet<u64> = a.iter().copied().collect();
-    let set_b: HashSet<u64> = b.iter().copied().collect();
-    let intersection = set_a.intersection(&set_b).count();
-    let union = set_a.union(&set_b).count();
-    intersection as f64 / union as f64
-}
-
-/// Entity similarity: max of concept tag Jaccard and name subtoken Jaccard.
-fn entity_similarity(a: &Entity, b: &Entity) -> f64 {
-    let concept_sim = jaccard_u64(&a.concept_tags, &b.concept_tags);
-    let subtokens_a = split_identifier(&a.name);
-    let subtokens_b = split_identifier(&b.name);
-    let name_sim = jaccard_str(&subtokens_a, &subtokens_b);
-    concept_sim.max(name_sim)
-}
-
-/// MMR selection: pick top_k entities balancing relevance and diversity.
-/// lambda controls the tradeoff (1.0 = pure relevance, 0.0 = pure diversity).
-/// Scores are normalized to [0, 1] internally so relevance and similarity
-/// contribute on the same scale.
-fn select_diverse<'a>(
-    candidates: &mut Vec<&'a Entity>,
-    scores: &HashMap<u64, f64>,
-    top_k: usize,
-    lambda: f64,
-) -> Vec<&'a Entity> {
-    let max_score = scores.values().copied().fold(0.0_f64, f64::max);
-    let norm = if max_score > 0.0 { max_score } else { 1.0 };
-
-    let mut selected: Vec<&Entity> = Vec::with_capacity(top_k);
-    while selected.len() < top_k && !candidates.is_empty() {
-        let best_idx = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, candidate)| {
-                let relevance =
-                    scores.get(&candidate.id).copied().unwrap_or(0.0) / norm;
-                let max_sim = selected
-                    .iter()
-                    .map(|s| entity_similarity(candidate, s))
-                    .fold(0.0_f64, f64::max);
-                let mmr = lambda * relevance - (1.0 - lambda) * max_sim;
-                (i, mmr)
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap();
-        selected.push(candidates.remove(best_idx));
-    }
-    selected
+    /// Mean embedding per cluster label, computed after clustering.
+    pub cluster_centroids: HashMap<usize, Vec<f32>>,
 }
 
 impl ConceptGraph {
@@ -159,6 +92,7 @@ impl ConceptGraph {
             classes: analysis.classes,
             call_sites: analysis.call_sites,
             entities: entity_map,
+            cluster_centroids: HashMap::new(),
         })
     }
 
@@ -696,7 +630,7 @@ impl ConceptGraph {
         }
 
         // Find matching concepts by word overlap
-        let matched_concepts: Vec<&Concept> = self
+        let mut matched_concepts: Vec<&Concept> = self
             .concepts
             .values()
             .filter(|c| {
@@ -708,6 +642,24 @@ impl ConceptGraph {
                 })
             })
             .collect();
+
+        // Supplement with embedding-based search for semantic matches
+        // that word overlap misses (e.g., "volume dimensions" → ndim)
+        if let Some(query_vec) = self.embeddings.embed_text(description) {
+            let matched_ids: HashSet<u64> =
+                matched_concepts.iter().map(|c| c.id).collect();
+            for (cid, score) in self.embeddings.find_similar(&query_vec, 5) {
+                if score < 0.5 {
+                    continue;
+                }
+                if matched_ids.contains(&cid) {
+                    continue;
+                }
+                if let Some(concept) = self.concepts.get(&cid) {
+                    matched_concepts.push(concept);
+                }
+            }
+        }
 
         // Generate suggestions by combining convention prefix with concept
         if let Some(conv) = matched_convention {
@@ -786,9 +738,13 @@ impl ConceptGraph {
     /// with average linkage, then add SimilarTo edges between cluster members.
     /// Replaces the naive pairwise threshold approach that caused transitive chaining.
     pub fn cluster_and_add_similarity_edges(&mut self, threshold: f32) {
-        // Clear existing SimilarTo edges (idempotent)
+        // Clear existing SimilarTo edges, cluster labels, and centroids (idempotent)
         self.relationships
             .retain(|r| r.kind != RelationshipKind::SimilarTo);
+        for concept in self.concepts.values_mut() {
+            concept.cluster_id = None;
+        }
+        self.cluster_centroids.clear();
 
         let ids: Vec<u64> = self.concepts.keys().copied().collect();
         if ids.is_empty() {
@@ -836,6 +792,63 @@ impl ConceptGraph {
                 }
             }
         }
+
+        // Compute cluster centroids (mean embedding per cluster)
+        for (&label, members) in &clusters {
+            let vecs: Vec<&Vec<f32>> = members
+                .iter()
+                .filter_map(|&id| self.embeddings.get_vector(id))
+                .collect();
+            if vecs.is_empty() {
+                continue;
+            }
+            let dim = vecs[0].len();
+            let mut centroid = vec![0.0_f32; dim];
+            for v in &vecs {
+                for (c, &val) in centroid.iter_mut().zip(v.iter()) {
+                    *c += val;
+                }
+            }
+            let n = vecs.len() as f32;
+            for c in &mut centroid {
+                *c /= n;
+            }
+            self.cluster_centroids.insert(label, centroid);
+        }
+    }
+
+    /// Recompute cluster centroids from existing cluster_id assignments.
+    /// Use after cache load when cluster_ids are present but centroids
+    /// were not serialized.
+    pub fn recompute_centroids(&mut self) {
+        self.cluster_centroids.clear();
+        let mut groups: HashMap<usize, Vec<u64>> = HashMap::new();
+        for concept in self.concepts.values() {
+            if let Some(label) = concept.cluster_id {
+                groups.entry(label).or_default().push(concept.id);
+            }
+        }
+        for (label, members) in &groups {
+            let vecs: Vec<&Vec<f32>> = members
+                .iter()
+                .filter_map(|&id| self.embeddings.get_vector(id))
+                .collect();
+            if vecs.is_empty() {
+                continue;
+            }
+            let dim = vecs[0].len();
+            let mut centroid = vec![0.0_f32; dim];
+            for v in &vecs {
+                for (c, &val) in centroid.iter_mut().zip(v.iter()) {
+                    *c += val;
+                }
+            }
+            let n = vecs.len() as f32;
+            for c in &mut centroid {
+                *c /= n;
+            }
+            self.cluster_centroids.insert(*label, centroid);
+        }
     }
 
     /// List all concepts, ordered by frequency (descending).
@@ -846,7 +859,113 @@ impl ConceptGraph {
         concepts
     }
 
-    /// List entities with optional filtering, ranked by MMR (domain density + diversity).
+    /// Assign an entity to a cluster via embedding centroid distance.
+    /// Averages the entity's concept tag embeddings and finds the nearest
+    /// cluster centroid. Returns None if no concept tags have embeddings
+    /// or no centroids exist.
+    fn entity_cluster(&self, entity: &Entity) -> Option<usize> {
+        if self.cluster_centroids.is_empty() {
+            return None;
+        }
+        let vecs: Vec<&Vec<f32>> = entity
+            .concept_tags
+            .iter()
+            .filter_map(|&id| self.embeddings.get_vector(id))
+            .collect();
+        if vecs.is_empty() {
+            return None;
+        }
+        let dim = vecs[0].len();
+        let mut mean = vec![0.0_f32; dim];
+        for v in &vecs {
+            for (m, &val) in mean.iter_mut().zip(v.iter()) {
+                *m += val;
+            }
+        }
+        let n = vecs.len() as f32;
+        for m in &mut mean {
+            *m /= n;
+        }
+        self.cluster_centroids
+            .iter()
+            .map(|(&label, centroid)| {
+                (label, cosine_similarity(&mean, centroid))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(label, _)| label)
+    }
+
+    /// Select up to `top_k` entities via cluster-aware round-robin.
+    /// Largest cluster first, highest domain-density entity per cluster,
+    /// cycling until top_k is filled. Falls back to domain density
+    /// sorting when no clusters exist.
+    fn select_by_cluster(
+        &self,
+        candidates: &[&Entity],
+        top_k: usize,
+    ) -> Vec<crate::types::EntitySummary> {
+        let mut clustered: HashMap<usize, Vec<&Entity>> = HashMap::new();
+        let mut unclustered: Vec<&Entity> = Vec::new();
+        for &entity in candidates {
+            match self.entity_cluster(entity) {
+                Some(label) => clustered.entry(label).or_default().push(entity),
+                None => unclustered.push(entity),
+            }
+        }
+
+        for entities in clustered.values_mut() {
+            entities.sort_by(|a, b| {
+                self.domain_density(b)
+                    .partial_cmp(&self.domain_density(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        unclustered.sort_by(|a, b| {
+            self.domain_density(b)
+                .partial_cmp(&self.domain_density(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut cluster_labels: Vec<usize> = clustered.keys().copied().collect();
+        cluster_labels.sort_by(|a, b| {
+            clustered[b].len().cmp(&clustered[a].len())
+        });
+
+        let mut result: Vec<crate::types::EntitySummary> =
+            Vec::with_capacity(top_k);
+        let mut cursors: HashMap<usize, usize> = HashMap::new();
+        let mut unclustered_cursor = 0;
+
+        loop {
+            if result.len() >= top_k {
+                break;
+            }
+            let mut made_progress = false;
+            for &label in &cluster_labels {
+                if result.len() >= top_k {
+                    break;
+                }
+                let cursor = cursors.entry(label).or_insert(0);
+                if let Some(entity) = clustered[&label].get(*cursor) {
+                    result.push(entity.summary());
+                    *cursor += 1;
+                    made_progress = true;
+                }
+            }
+            if result.len() < top_k && unclustered_cursor < unclustered.len() {
+                result.push(unclustered[unclustered_cursor].summary());
+                unclustered_cursor += 1;
+                made_progress = true;
+            }
+            if !made_progress {
+                break;
+            }
+        }
+        result
+    }
+
+    /// List entities with optional filtering, ranked by cluster-diverse
+    /// round-robin.
     pub fn list_entities(
         &self,
         concept_filter: Option<&str>,
@@ -862,7 +981,7 @@ impl ConceptGraph {
                 .map(|c| c.id)
         });
 
-        let mut matched: Vec<_> = self
+        let matched: Vec<&Entity> = self
             .entities
             .values()
             .filter(|e| {
@@ -885,12 +1004,8 @@ impl ConceptGraph {
                 true
             })
             .collect();
-        let scores: HashMap<u64, f64> = matched
-            .iter()
-            .map(|e| (e.id, self.domain_density(e)))
-            .collect();
-        let diverse = select_diverse(&mut matched, &scores, top_k, 0.7);
-        diverse.into_iter().map(|e| e.summary()).collect()
+
+        self.select_by_cluster(&matched, top_k)
     }
 
     /// Describe a symbol (function or class) by name.
@@ -1089,8 +1204,8 @@ impl ConceptGraph {
     }
 
     /// Detect contrastive concept pairs and add Contrastive edges.
-    /// Must run AFTER add_similarity_edges. Suppresses conflicting
-    /// SimilarTo edges.
+    /// Must run AFTER cluster_and_add_similarity_edges. Suppresses
+    /// conflicting SimilarTo edges.
     pub fn add_contrastive_edges(&mut self) {
         // Clear existing contrastive edges so this is idempotent.
         self.relationships
@@ -1595,20 +1710,13 @@ impl ConceptGraph {
             })
             .collect();
 
-        let mut key_candidates: Vec<_> = self
+        // Select key entities via cluster round-robin for diversity
+        let key_candidates: Vec<&Entity> = self
             .entities
             .values()
             .filter(|e| e.concept_tags.contains(&concept.id))
             .collect();
-        let key_scores: HashMap<u64, f64> = key_candidates
-            .iter()
-            .map(|e| (e.id, self.domain_density(e)))
-            .collect();
-        let key_entities: Vec<_> =
-            select_diverse(&mut key_candidates, &key_scores, 5, 0.7)
-                .into_iter()
-                .map(|e| e.summary())
-                .collect();
+        let key_entities = self.select_by_cluster(&key_candidates, 5);
 
         Some(LocateConceptResult {
             concept: concept.canonical.clone(),
@@ -1986,8 +2094,94 @@ mod tests {
     }
 
     #[test]
-    fn test_list_entities_diverse_mmr() {
-        // transform: 3 occurrences, spatial: 1 occurrence, loss: 1 occurrence
+    fn test_list_entities_cluster_round_robin() {
+        // Two clusters: transform-domain near [1,0,0], loss-domain near [0,1,0]
+        // Embeddings go into EmbeddingIndex (matching production path),
+        // NOT Concept.embedding.
+        let concepts = vec![
+            make_concept(
+                1,
+                "transform",
+                &["transform", "apply_transform", "transform"],
+            ),
+            make_concept(2, "spatial", &["spatial_transform"]),
+            make_concept(3, "loss", &["dice_loss"]),
+        ];
+        let entities = vec![
+            // density = (3 + 1) / 2 = 2.0
+            Entity {
+                id: 10,
+                name: "spatial_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1, 2],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("utils.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            // density = (3 + 1) / 3 = 1.33
+            Entity {
+                id: 11,
+                name: "compute_spatial_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1, 2],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("utils.py"),
+                line: 20,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            // density = 1 / 2 = 0.5
+            Entity {
+                id: 12,
+                name: "dice_loss".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![3],
+                semantic_role: "loss".to_string(),
+                file: PathBuf::from("losses.py"),
+                line: 1,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+
+        let analysis = AnalysisResult {
+            concepts,
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let mut embeddings = EmbeddingIndex::empty();
+        embeddings.insert_vector(1, vec![1.0, 0.0, 0.0]);
+        embeddings.insert_vector(2, vec![0.95, 0.05, 0.0]);
+        embeddings.insert_vector(3, vec![0.0, 1.0, 0.0]);
+        let mut graph = ConceptGraph::build_with_entities(
+            analysis,
+            embeddings,
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+        graph.cluster_and_add_similarity_edges(0.75);
+
+        let results = graph.list_entities(None, None, None, 10);
+        assert_eq!(results.len(), 3);
+
+        // Transform cluster has 2 entities (larger), loss cluster has 1.
+        // Round-robin: transform first (spatial_transform, highest density),
+        // then loss (dice_loss), then back to transform
+        // (compute_spatial_transform).
+        assert_eq!(results[0].name, "spatial_transform");
+        assert_eq!(results[1].name, "dice_loss");
+        assert_eq!(results[2].name, "compute_spatial_transform");
+    }
+
+    #[test]
+    fn test_list_entities_no_clusters_fallback() {
+        // No embeddings → no clusters → sorted by domain density
         let analysis = AnalysisResult {
             concepts: vec![
                 make_concept(
@@ -2005,7 +2199,6 @@ mod tests {
             call_sites: Vec::new(),
         };
         let entities = vec![
-            // density = (3 + 1) / 2 = 2.0
             Entity {
                 id: 10,
                 name: "spatial_transform".to_string(),
@@ -2017,19 +2210,6 @@ mod tests {
                 signature_idx: None,
                 class_info_idx: None,
             },
-            // density = (3 + 1) / 3 = 1.33, Jaccard=1.0 with spatial_transform
-            Entity {
-                id: 11,
-                name: "compute_spatial_transform".to_string(),
-                kind: EntityKind::Function,
-                concept_tags: vec![1, 2],
-                semantic_role: "transform".to_string(),
-                file: PathBuf::from("utils.py"),
-                line: 20,
-                signature_idx: None,
-                class_info_idx: None,
-            },
-            // density = 1 / 2 = 0.5, Jaccard=0.0 with transform entities
             Entity {
                 id: 12,
                 name: "dice_loss".to_string(),
@@ -2038,17 +2218,6 @@ mod tests {
                 semantic_role: "loss".to_string(),
                 file: PathBuf::from("losses.py"),
                 line: 1,
-                signature_idx: None,
-                class_info_idx: None,
-            },
-            Entity {
-                id: 13,
-                name: "helper".to_string(),
-                kind: EntityKind::Function,
-                concept_tags: vec![],
-                semantic_role: "utility".to_string(),
-                file: PathBuf::from("utils.py"),
-                line: 50,
                 signature_idx: None,
                 class_info_idx: None,
             },
@@ -2062,77 +2231,208 @@ mod tests {
         .unwrap();
 
         let results = graph.list_entities(None, None, None, 10);
-        assert_eq!(results.len(), 4);
-        // Highest density first
+        assert_eq!(results.len(), 2);
+        // Pure density sort: spatial_transform (2.0) > dice_loss (0.5)
         assert_eq!(results[0].name, "spatial_transform");
-        // dice_loss (different concepts) beats compute_spatial_transform
-        // (same concepts as spatial_transform, penalized by MMR)
         assert_eq!(results[1].name, "dice_loss");
-        assert_eq!(results[2].name, "compute_spatial_transform");
+    }
+
+    fn make_graph_with_embeddings(
+        concepts: Vec<Concept>,
+        embedding_pairs: Vec<(u64, Vec<f32>)>,
+    ) -> ConceptGraph {
+        let analysis = AnalysisResult {
+            concepts,
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let mut embeddings = EmbeddingIndex::empty();
+        for (id, vec) in embedding_pairs {
+            embeddings.insert_vector(id, vec);
+        }
+        ConceptGraph::build(analysis, embeddings).unwrap()
     }
 
     #[test]
-    fn test_jaccard_u64() {
-        assert_eq!(jaccard_u64(&[1, 2], &[1, 2]), 1.0);
-        assert_eq!(jaccard_u64(&[1], &[2]), 0.0);
-        assert_eq!(jaccard_u64(&[1, 2], &[2, 3]), 1.0 / 3.0);
-        assert_eq!(jaccard_u64(&[], &[]), 1.0);
-        assert_eq!(jaccard_u64(&[], &[1]), 0.0);
+    fn test_cluster_and_add_similarity_edges_basic() {
+        // Group 1 (IDs 1,2,3): near [1,0,0], cosine sim ~0.99 within group.
+        // Group 2 (IDs 4,5,6): near [0,1,0], cosine sim ~0.99 within group.
+        // Cross-group sim ~0.0, so distance ~1.0 >> threshold distance 0.25.
+        let concepts = vec![
+            make_concept(1, "alpha", &["alpha"]),
+            make_concept(2, "beta", &["beta"]),
+            make_concept(3, "gamma", &["gamma"]),
+            make_concept(4, "delta", &["delta"]),
+            make_concept(5, "epsilon", &["epsilon"]),
+            make_concept(6, "zeta", &["zeta"]),
+        ];
+        let embeddings = vec![
+            (1, vec![1.0_f32, 0.0, 0.0]),
+            (2, vec![0.98_f32, 0.1, 0.0]),
+            (3, vec![0.95_f32, 0.15, 0.0]),
+            (4, vec![0.0_f32, 1.0, 0.0]),
+            (5, vec![0.1_f32, 0.98, 0.0]),
+            (6, vec![0.15_f32, 0.95, 0.0]),
+        ];
+        let mut graph = make_graph_with_embeddings(concepts, embeddings);
+        graph.cluster_and_add_similarity_edges(0.75);
+
+        // All concepts must have a cluster_id assigned
+        for id in 1u64..=6 {
+            assert!(
+                graph.concepts[&id].cluster_id.is_some(),
+                "concept {id} missing cluster_id"
+            );
+        }
+
+        let cid = |id: u64| graph.concepts[&id].cluster_id.unwrap();
+
+        // Group 1 shares a cluster_id
+        assert_eq!(cid(1), cid(2), "concepts 1 and 2 must share cluster");
+        assert_eq!(cid(1), cid(3), "concepts 1 and 3 must share cluster");
+
+        // Group 2 shares a cluster_id
+        assert_eq!(cid(4), cid(5), "concepts 4 and 5 must share cluster");
+        assert_eq!(cid(4), cid(6), "concepts 4 and 6 must share cluster");
+
+        // The two groups have different cluster_ids
+        assert_ne!(cid(1), cid(4), "groups 1 and 2 must have different cluster_ids");
+
+        // SimilarTo edges must only connect within-group pairs
+        let similar_edges: Vec<_> = graph
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::SimilarTo)
+            .collect();
+        assert!(!similar_edges.is_empty(), "expected some SimilarTo edges");
+
+        let group1: HashSet<u64> = [1, 2, 3].into();
+        let group2: HashSet<u64> = [4, 5, 6].into();
+        for edge in &similar_edges {
+            let src_in_g1 = group1.contains(&edge.source);
+            let tgt_in_g1 = group1.contains(&edge.target);
+            let src_in_g2 = group2.contains(&edge.source);
+            let tgt_in_g2 = group2.contains(&edge.target);
+            let within_group = (src_in_g1 && tgt_in_g1) || (src_in_g2 && tgt_in_g2);
+            assert!(
+                within_group,
+                "cross-group SimilarTo edge: {} → {}",
+                edge.source, edge.target
+            );
+        }
     }
 
     #[test]
-    fn test_entity_similarity_uses_name_subtokens() {
-        // Same name, different concept tags → similarity = 1.0 via name
-        let a = Entity {
-            id: 1,
-            name: "Tensor".to_string(),
-            kind: EntityKind::Class,
-            concept_tags: vec![10],
-            semantic_role: String::new(),
-            file: PathBuf::from("a.py"),
-            line: 1,
-            signature_idx: None,
-            class_info_idx: None,
-        };
-        let b = Entity {
-            id: 2,
-            name: "Tensor".to_string(),
-            kind: EntityKind::Class,
-            concept_tags: vec![10, 20],
-            semantic_role: String::new(),
-            file: PathBuf::from("b.py"),
-            line: 1,
-            signature_idx: None,
-            class_info_idx: None,
-        };
-        assert_eq!(entity_similarity(&a, &b), 1.0);
+    fn test_cluster_idempotent() {
+        let concepts = vec![
+            make_concept(1, "transform", &["transform"]),
+            make_concept(2, "spatial", &["spatial"]),
+            make_concept(3, "volume", &["volume"]),
+        ];
+        let embeddings = vec![
+            (1, vec![1.0_f32, 0.0, 0.0]),
+            (2, vec![0.98_f32, 0.1, 0.0]),
+            (3, vec![0.0_f32, 1.0, 0.0]),
+        ];
+        let mut graph = make_graph_with_embeddings(concepts, embeddings);
 
-        // Different name, same concept tags → similarity = 1.0 via concepts
-        let c = Entity {
-            id: 3,
-            name: "Module".to_string(),
-            kind: EntityKind::Class,
-            concept_tags: vec![10],
-            semantic_role: String::new(),
-            file: PathBuf::from("c.py"),
-            line: 1,
-            signature_idx: None,
-            class_info_idx: None,
-        };
-        assert_eq!(entity_similarity(&a, &c), 1.0);
+        graph.cluster_and_add_similarity_edges(0.75);
+        let edge_count_first = graph
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::SimilarTo)
+            .count();
+        let cluster_ids_first: Vec<Option<usize>> = (1u64..=3)
+            .map(|id| graph.concepts[&id].cluster_id)
+            .collect();
 
-        // Different name, different concept tags → low similarity
-        let d = Entity {
-            id: 4,
-            name: "Optimizer".to_string(),
-            kind: EntityKind::Class,
-            concept_tags: vec![30],
-            semantic_role: String::new(),
-            file: PathBuf::from("d.py"),
-            line: 1,
-            signature_idx: None,
-            class_info_idx: None,
-        };
-        assert_eq!(entity_similarity(&a, &d), 0.0);
+        graph.cluster_and_add_similarity_edges(0.75);
+        let edge_count_second = graph
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::SimilarTo)
+            .count();
+        let cluster_ids_second: Vec<Option<usize>> = (1u64..=3)
+            .map(|id| graph.concepts[&id].cluster_id)
+            .collect();
+
+        assert_eq!(
+            edge_count_first, edge_count_second,
+            "SimilarTo edge count must be identical on second call"
+        );
+        assert_eq!(
+            cluster_ids_first, cluster_ids_second,
+            "cluster_id assignments must be stable across calls"
+        );
     }
+
+    #[test]
+    fn test_cluster_contrastive_interaction() {
+        // "source" and "target" are a KNOWN_PAIR in add_contrastive_edges,
+        // scoring 3 points → Contrastive edge emitted.
+        // Give them similar embeddings so clustering puts them in the same
+        // cluster and emits a SimilarTo edge. After add_contrastive_edges,
+        // that SimilarTo edge must be suppressed.
+        //
+        // "alpha" and "beta" are also similar but NOT in KNOWN_PAIRS →
+        // they keep their SimilarTo edge after add_contrastive_edges.
+        let concepts = vec![
+            make_concept(1, "source", &["source"]),
+            make_concept(2, "target", &["target"]),
+            make_concept(3, "alpha", &["alpha"]),
+            make_concept(4, "beta", &["beta"]),
+        ];
+        let embeddings = vec![
+            (1, vec![1.0_f32, 0.0, 0.0]),
+            (2, vec![0.98_f32, 0.1, 0.0]),
+            (3, vec![0.0_f32, 1.0, 0.0]),
+            (4, vec![0.1_f32, 0.98, 0.0]),
+        ];
+        let mut graph = make_graph_with_embeddings(concepts, embeddings);
+
+        graph.cluster_and_add_similarity_edges(0.75);
+
+        // After clustering: source+target share a cluster, alpha+beta share a cluster.
+        let cid = |id: u64| graph.concepts[&id].cluster_id.unwrap();
+        assert_eq!(cid(1), cid(2), "source and target must share cluster");
+        assert_eq!(cid(3), cid(4), "alpha and beta must share cluster");
+
+        // SimilarTo edges must exist within each cluster before contrastive.
+        let similar_before: HashSet<(u64, u64)> = graph
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::SimilarTo)
+            .map(|r| (r.source.min(r.target), r.source.max(r.target)))
+            .collect();
+        assert!(similar_before.contains(&(1, 2)), "SimilarTo(source, target) expected before contrastive");
+        assert!(similar_before.contains(&(3, 4)), "SimilarTo(alpha, beta) expected before contrastive");
+
+        graph.add_contrastive_edges();
+
+        let similar_after: HashSet<(u64, u64)> = graph
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::SimilarTo)
+            .map(|r| (r.source.min(r.target), r.source.max(r.target)))
+            .collect();
+
+        // SimilarTo(source, target) must be suppressed — replaced by Contrastive.
+        assert!(
+            !similar_after.contains(&(1, 2)),
+            "SimilarTo(source, target) must be removed after contrastive"
+        );
+        let has_contrastive = graph.relationships.iter().any(|r| {
+            r.kind == RelationshipKind::Contrastive
+                && ((r.source == 1 && r.target == 2)
+                    || (r.source == 2 && r.target == 1))
+        });
+        assert!(has_contrastive, "Contrastive(source, target) expected");
+
+        // SimilarTo(alpha, beta) must survive — no contrastive suppression.
+        assert!(similar_after.contains(&(3, 4)), "SimilarTo(alpha, beta) must survive after contrastive");
+    }
+
 }

@@ -80,6 +80,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             entities: std::collections::HashMap::new(),
+            cluster_centroids: std::collections::HashMap::new(),
         }
     }
 
