@@ -782,25 +782,51 @@ impl ConceptGraph {
         &self.conventions
     }
 
-    /// Add SimilarTo relationship edges between concepts whose embeddings
-    /// have cosine similarity above the given threshold.
-    pub fn add_similarity_edges(&mut self, threshold: f32) {
-        // Clear existing similarity edges so this is idempotent.
+    /// Cluster concepts by embedding similarity using agglomerative clustering
+    /// with average linkage, then add SimilarTo edges between cluster members.
+    /// Replaces the naive pairwise threshold approach that caused transitive chaining.
+    pub fn cluster_and_add_similarity_edges(&mut self, threshold: f32) {
+        // Clear existing SimilarTo edges (idempotent)
         self.relationships
             .retain(|r| r.kind != RelationshipKind::SimilarTo);
+
         let ids: Vec<u64> = self.concepts.keys().copied().collect();
-        for (i, &id_a) in ids.iter().enumerate() {
-            let vec_a = match self.embeddings.get_vector(id_a) {
-                Some(v) => v.clone(),
-                None => continue,
-            };
-            for &id_b in &ids[i + 1..] {
-                let vec_b = match self.embeddings.get_vector(id_b) {
-                    Some(v) => v,
+        if ids.is_empty() {
+            return;
+        }
+
+        let distance_threshold = 1.0 - threshold;
+        let result = crate::cluster::agglomerative_cluster(
+            &ids,
+            &self.embeddings,
+            distance_threshold,
+        );
+
+        // Assign cluster labels to concepts
+        for (&concept_id, &cluster_label) in &result.assignments {
+            if let Some(concept) = self.concepts.get_mut(&concept_id) {
+                concept.cluster_id = Some(cluster_label);
+            }
+        }
+
+        // Emit SimilarTo edges between all pairs within each cluster
+        let mut clusters: HashMap<usize, Vec<u64>> = HashMap::new();
+        for (&concept_id, &label) in &result.assignments {
+            clusters.entry(label).or_default().push(concept_id);
+        }
+
+        for members in clusters.values() {
+            for (i, &id_a) in members.iter().enumerate() {
+                let vec_a = match self.embeddings.get_vector(id_a) {
+                    Some(v) => v.clone(),
                     None => continue,
                 };
-                let sim = cosine_similarity(&vec_a, vec_b);
-                if sim > threshold {
+                for &id_b in &members[i + 1..] {
+                    let vec_b = match self.embeddings.get_vector(id_b) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let sim = cosine_similarity(&vec_a, vec_b);
                     self.relationships.push(Relationship {
                         source: id_a,
                         target: id_b,
