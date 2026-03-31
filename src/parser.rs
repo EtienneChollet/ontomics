@@ -189,6 +189,11 @@ pub fn javascript_parser() -> JavaScriptParser {
     JavaScriptParser
 }
 
+#[allow(dead_code)]
+pub fn rust_parser() -> RustParser {
+    RustParser
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers used across language parsers
 // ---------------------------------------------------------------------------
@@ -1354,6 +1359,870 @@ impl LanguageParser for JavaScriptParser {
             signatures, classes, call_sites,
         );
     }
+}
+
+// =========================================================================
+// RustParser
+// =========================================================================
+
+#[allow(dead_code)]
+pub struct RustParser;
+
+const RS_SKIP_PARAMS: &[&str] = &["self"];
+
+impl LanguageParser for RustParser {
+    fn extensions(&self) -> &[&str] {
+        &["rs"]
+    }
+
+    fn make_parser(&self) -> Result<tree_sitter::Parser> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .map_err(|e| {
+                anyhow::anyhow!("Error loading Rust grammar: {e}")
+            })?;
+        Ok(parser)
+    }
+
+    fn skip_params(&self) -> &[&str] {
+        RS_SKIP_PARAMS
+    }
+
+    fn strip_doc_syntax<'a>(&self, raw: &'a str) -> &'a str {
+        let s = raw.trim();
+        let s = s.strip_prefix("///").unwrap_or(s);
+        let s = s.strip_prefix("//!").unwrap_or(s);
+        let s = s.strip_prefix("/**").unwrap_or(s);
+        let s = s.strip_suffix("*/").unwrap_or(s);
+        let s = s.strip_prefix(" * ").unwrap_or(s);
+        let s = s.strip_prefix("* ").unwrap_or(s);
+        s.trim()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_node(
+        &self,
+        node: tree_sitter::Node,
+        source: &[u8],
+        path: &Path,
+        scope: &Option<String>,
+        identifiers: &mut Vec<RawIdentifier>,
+        doc_texts: &mut Vec<(PathBuf, usize, String)>,
+        signatures: &mut Vec<Signature>,
+        classes: &mut Vec<ClassInfo>,
+        call_sites: &mut Vec<CallSite>,
+    ) {
+        match node.kind() {
+            "function_item" | "function_signature_item" => {
+                let func_name = rs_extract_function(
+                    node, source, path, scope, identifiers, signatures,
+                    doc_texts,
+                );
+                let child_scope = func_name.map(|name| match scope {
+                    Some(parent) => format!("{parent}.{name}"),
+                    None => name,
+                });
+                visit_children(
+                    self, node, source, path, &child_scope,
+                    identifiers, doc_texts, signatures, classes,
+                    call_sites,
+                );
+                return;
+            }
+            "struct_item" => {
+                rs_extract_struct(
+                    node, source, path, scope, identifiers, classes,
+                    doc_texts,
+                );
+            }
+            "enum_item" => {
+                rs_extract_enum(
+                    node, source, path, scope, identifiers, classes,
+                    doc_texts,
+                );
+            }
+            "trait_item" => {
+                rs_extract_trait(
+                    node, source, path, scope, identifiers,
+                    signatures, classes, doc_texts,
+                );
+                return;
+            }
+            "impl_item" => {
+                rs_extract_impl(
+                    self, node, source, path, identifiers, signatures,
+                    classes, call_sites, doc_texts,
+                );
+                return;
+            }
+            "const_item" | "static_item" => {
+                rs_extract_const_or_static(
+                    node, source, path, scope, identifiers,
+                );
+            }
+            "type_item" => {
+                rs_extract_type_alias(
+                    node, source, path, scope, identifiers,
+                );
+            }
+            "call_expression" => {
+                if let Some(cs) =
+                    rs_extract_call_expression(node, source, path, scope)
+                {
+                    call_sites.push(cs);
+                }
+            }
+            "macro_invocation" => {
+                if let Some(cs) =
+                    rs_extract_call_expression(node, source, path, scope)
+                {
+                    call_sites.push(cs);
+                }
+            }
+            "let_declaration" => {
+                if let Some(pat) = node.child_by_field_name("pattern") {
+                    // Simple identifier pattern
+                    if pat.kind() == "identifier" {
+                        if let Ok(name) = pat.utf8_text(source) {
+                            identifiers.push(RawIdentifier {
+                                name: name.to_string(),
+                                entity_type: EntityType::Variable,
+                                file: path.to_path_buf(),
+                                line: pat.start_position().row + 1,
+                                scope: scope.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            "field_expression" => {
+                // self.foo — extract as Attribute
+                if let Some(value_node) =
+                    node.child_by_field_name("value")
+                {
+                    if value_node.utf8_text(source).ok()
+                        == Some("self")
+                    {
+                        if let Some(field_node) =
+                            node.child_by_field_name("field")
+                        {
+                            if let Ok(field) =
+                                field_node.utf8_text(source)
+                            {
+                                identifiers.push(RawIdentifier {
+                                    name: field.to_string(),
+                                    entity_type: EntityType::Attribute,
+                                    file: path.to_path_buf(),
+                                    line: field_node
+                                        .start_position()
+                                        .row
+                                        + 1,
+                                    scope: scope.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "line_comment" => {
+                let text = node.utf8_text(source).unwrap_or("");
+                if let Some(stripped) = text.strip_prefix("//!") {
+                    let stripped = stripped.trim();
+                    if !stripped.is_empty() {
+                        doc_texts.push((
+                            path.to_path_buf(),
+                            node.start_position().row + 1,
+                            stripped.to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        visit_children(
+            self, node, source, path, scope, identifiers, doc_texts,
+            signatures, classes, call_sites,
+        );
+    }
+}
+
+// --- Rust-specific helpers ---
+
+fn rs_extract_function(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+    signatures: &mut Vec<Signature>,
+    doc_texts: &mut Vec<(PathBuf, usize, String)>,
+) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = name_node.utf8_text(source).ok()?;
+    let line = name_node.start_position().row + 1;
+
+    identifiers.push(RawIdentifier {
+        name: name.to_string(),
+        entity_type: EntityType::Function,
+        file: path.to_path_buf(),
+        line,
+        scope: scope.clone(),
+    });
+
+    let func_scope = Some(match scope {
+        Some(parent) => format!("{parent}.{name}"),
+        None => name.to_string(),
+    });
+
+    let mut params = Vec::new();
+    if let Some(params_node) = node.child_by_field_name("parameters") {
+        params = rs_extract_parameters(
+            params_node, source, path, &func_scope, identifiers,
+        );
+    }
+
+    let return_type = rs_extract_return_type(node, source);
+    let decorators = rs_extract_attributes(node, source);
+    let docstring_first_line =
+        rs_collect_preceding_doc_comments(node, source);
+
+    // Also push doc comments as doc_texts
+    if let Some(ref doc) = docstring_first_line {
+        doc_texts.push((
+            path.to_path_buf(),
+            node.start_position().row + 1,
+            doc.clone(),
+        ));
+    }
+
+    signatures.push(Signature {
+        name: name.to_string(),
+        params,
+        return_type,
+        decorators,
+        docstring_first_line,
+        file: path.to_path_buf(),
+        line,
+        scope: scope.clone(),
+    });
+
+    Some(name.to_string())
+}
+
+fn rs_extract_parameters(
+    params_node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+) -> Vec<Param> {
+    let mut params = Vec::new();
+    let mut cursor = params_node.walk();
+    for child in params_node.named_children(&mut cursor) {
+        match child.kind() {
+            "self_parameter" => {
+                // Skip self
+            }
+            "parameter" => {
+                let pat_node = child.child_by_field_name("pattern");
+                let type_node = child.child_by_field_name("type");
+
+                let name = pat_node
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+
+                identifiers.push(RawIdentifier {
+                    name: name.to_string(),
+                    entity_type: EntityType::Parameter,
+                    file: path.to_path_buf(),
+                    line: child.start_position().row + 1,
+                    scope: scope.clone(),
+                });
+
+                let type_annotation = type_node
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+
+                params.push(Param {
+                    name: name.to_string(),
+                    type_annotation,
+                    default: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    params
+}
+
+fn rs_extract_struct(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+    classes: &mut Vec<ClassInfo>,
+    doc_texts: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return,
+    };
+    let name = match name_node.utf8_text(source) {
+        Ok(n) => n.to_string(),
+        Err(_) => return,
+    };
+    let line = name_node.start_position().row + 1;
+
+    identifiers.push(RawIdentifier {
+        name: name.clone(),
+        entity_type: EntityType::Class,
+        file: path.to_path_buf(),
+        line,
+        scope: scope.clone(),
+    });
+
+    // Extract field names from field_declaration_list
+    let mut attributes = Vec::new();
+    if let Some(body) =
+        find_named_child_by_kind(node, "field_declaration_list")
+    {
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            if child.kind() == "field_declaration" {
+                if let Some(field_name) =
+                    child.child_by_field_name("name")
+                {
+                    if let Ok(fname) = field_name.utf8_text(source) {
+                        attributes.push(fname.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let docstring_first_line =
+        rs_collect_preceding_doc_comments(node, source);
+
+    if let Some(ref doc) = docstring_first_line {
+        doc_texts.push((
+            path.to_path_buf(),
+            node.start_position().row + 1,
+            doc.clone(),
+        ));
+    }
+
+    // Merge into existing ClassInfo if one was created by a preceding impl block
+    if let Some(existing) = classes
+        .iter_mut()
+        .find(|c| c.name == name && c.file == path)
+    {
+        existing.attributes = attributes;
+        if existing.docstring_first_line.is_none() {
+            existing.docstring_first_line = docstring_first_line;
+        }
+        existing.line = line;
+    } else {
+        classes.push(ClassInfo {
+            name,
+            bases: Vec::new(),
+            methods: Vec::new(),
+            attributes,
+            docstring_first_line,
+            file: path.to_path_buf(),
+            line,
+        });
+    }
+}
+
+fn rs_extract_enum(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+    classes: &mut Vec<ClassInfo>,
+    doc_texts: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return,
+    };
+    let name = match name_node.utf8_text(source) {
+        Ok(n) => n.to_string(),
+        Err(_) => return,
+    };
+    let line = name_node.start_position().row + 1;
+
+    identifiers.push(RawIdentifier {
+        name: name.clone(),
+        entity_type: EntityType::Class,
+        file: path.to_path_buf(),
+        line,
+        scope: scope.clone(),
+    });
+
+    // Extract variant names
+    let mut attributes = Vec::new();
+    if let Some(body) =
+        find_named_child_by_kind(node, "enum_variant_list")
+    {
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            if child.kind() == "enum_variant" {
+                if let Some(variant_name) =
+                    child.child_by_field_name("name")
+                {
+                    if let Ok(vname) = variant_name.utf8_text(source) {
+                        attributes.push(vname.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let docstring_first_line =
+        rs_collect_preceding_doc_comments(node, source);
+
+    if let Some(ref doc) = docstring_first_line {
+        doc_texts.push((
+            path.to_path_buf(),
+            node.start_position().row + 1,
+            doc.clone(),
+        ));
+    }
+
+    // Merge into existing ClassInfo if one was created by a preceding impl block
+    if let Some(existing) = classes
+        .iter_mut()
+        .find(|c| c.name == name && c.file == path)
+    {
+        existing.attributes = attributes;
+        if existing.docstring_first_line.is_none() {
+            existing.docstring_first_line = docstring_first_line;
+        }
+        existing.line = line;
+    } else {
+        classes.push(ClassInfo {
+            name,
+            bases: Vec::new(),
+            methods: Vec::new(),
+            attributes,
+            docstring_first_line,
+            file: path.to_path_buf(),
+            line,
+        });
+    }
+}
+
+/// Extract a trait definition, including its body methods.
+///
+/// This function handles its own body traversal (like `rs_extract_impl`)
+/// to avoid double-extraction from a subsequent `visit_children` call.
+#[allow(clippy::too_many_arguments)]
+fn rs_extract_trait(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+    signatures: &mut Vec<Signature>,
+    classes: &mut Vec<ClassInfo>,
+    doc_texts: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let name_node = match node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return,
+    };
+    let name = match name_node.utf8_text(source) {
+        Ok(n) => n.to_string(),
+        Err(_) => return,
+    };
+    let line = name_node.start_position().row + 1;
+
+    identifiers.push(RawIdentifier {
+        name: name.clone(),
+        entity_type: EntityType::Interface,
+        file: path.to_path_buf(),
+        line,
+        scope: scope.clone(),
+    });
+
+    let trait_scope = Some(match scope {
+        Some(parent) => format!("{parent}.{name}"),
+        None => name.clone(),
+    });
+
+    // Extract methods from the declaration_list body
+    let mut methods = Vec::new();
+    if let Some(body) =
+        find_named_child_by_kind(node, "declaration_list")
+    {
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            if child.kind() == "function_item"
+                || child.kind() == "function_signature_item"
+            {
+                if let Some(fn_name) = rs_extract_function(
+                    child, source, path, &trait_scope,
+                    identifiers, signatures, doc_texts,
+                ) {
+                    methods.push(fn_name);
+                }
+            }
+        }
+    }
+
+    let docstring_first_line =
+        rs_collect_preceding_doc_comments(node, source);
+
+    if let Some(ref doc) = docstring_first_line {
+        doc_texts.push((
+            path.to_path_buf(),
+            node.start_position().row + 1,
+            doc.clone(),
+        ));
+    }
+
+    classes.push(ClassInfo {
+        name,
+        bases: Vec::new(),
+        methods,
+        attributes: Vec::new(),
+        docstring_first_line,
+        file: path.to_path_buf(),
+        line,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rs_extract_impl(
+    lang: &dyn LanguageParser,
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    identifiers: &mut Vec<RawIdentifier>,
+    signatures: &mut Vec<Signature>,
+    classes: &mut Vec<ClassInfo>,
+    call_sites: &mut Vec<CallSite>,
+    doc_texts: &mut Vec<(PathBuf, usize, String)>,
+) {
+    // Get the implementing type name
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|n| {
+            // May be type_identifier directly, or generic_type wrapping it
+            if n.kind() == "type_identifier" {
+                n.utf8_text(source).ok().map(|s| s.to_string())
+            } else if n.kind() == "generic_type" {
+                // Get the base type from the generic
+                find_named_child_by_kind(n, "type_identifier")
+                    .and_then(|ti| {
+                        ti.utf8_text(source).ok().map(|s| s.to_string())
+                    })
+            } else {
+                n.utf8_text(source).ok().map(|s| s.to_string())
+            }
+        });
+
+    let type_name = match type_name {
+        Some(n) => n,
+        None => return,
+    };
+
+    // Get trait name (None for inherent impls)
+    let trait_name = node
+        .child_by_field_name("trait")
+        .and_then(|n| {
+            if n.kind() == "type_identifier" {
+                n.utf8_text(source).ok().map(|s| s.to_string())
+            } else if n.kind() == "scoped_type_identifier" {
+                // e.g. fmt::Display — get last segment
+                let text = n.utf8_text(source).ok()?;
+                text.rsplit("::").next().map(|s| s.to_string())
+            } else if n.kind() == "generic_type" {
+                find_named_child_by_kind(n, "type_identifier")
+                    .and_then(|ti| {
+                        ti.utf8_text(source).ok().map(|s| s.to_string())
+                    })
+            } else {
+                n.utf8_text(source).ok().map(|s| s.to_string())
+            }
+        });
+
+    // Find or create ClassInfo for this type
+    let class_idx = classes
+        .iter()
+        .position(|c| c.name == type_name && c.file == path);
+
+    let class_idx = match class_idx {
+        Some(idx) => idx,
+        None => {
+            classes.push(ClassInfo {
+                name: type_name.clone(),
+                bases: Vec::new(),
+                methods: Vec::new(),
+                attributes: Vec::new(),
+                docstring_first_line: None,
+                file: path.to_path_buf(),
+                line: node.start_position().row + 1,
+            });
+            classes.len() - 1
+        }
+    };
+
+    // Add trait to bases if present
+    if let Some(ref tname) = trait_name {
+        if !classes[class_idx].bases.contains(tname) {
+            classes[class_idx].bases.push(tname.clone());
+        }
+    }
+
+    // Process body
+    let impl_scope = Some(type_name.clone());
+
+    if let Some(body) =
+        find_named_child_by_kind(node, "declaration_list")
+    {
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            match child.kind() {
+                "function_item" => {
+                    let func_name = rs_extract_function(
+                        child, source, path, &impl_scope,
+                        identifiers, signatures, doc_texts,
+                    );
+                    if let Some(ref fname) = func_name {
+                        if !classes[class_idx]
+                            .methods
+                            .contains(fname)
+                        {
+                            classes[class_idx]
+                                .methods
+                                .push(fname.clone());
+                        }
+                    }
+                    // Recurse into function body for calls, etc.
+                    let child_scope =
+                        func_name.map(|name| match &impl_scope {
+                            Some(parent) => {
+                                format!("{parent}.{name}")
+                            }
+                            None => name,
+                        });
+                    visit_children(
+                        lang, child, source, path, &child_scope,
+                        identifiers, doc_texts, signatures, classes,
+                        call_sites,
+                    );
+                }
+                "function_signature_item" => {
+                    let func_name = rs_extract_function(
+                        child, source, path, &impl_scope,
+                        identifiers, signatures, doc_texts,
+                    );
+                    if let Some(ref fname) = func_name {
+                        if !classes[class_idx]
+                            .methods
+                            .contains(fname)
+                        {
+                            classes[class_idx]
+                                .methods
+                                .push(fname.clone());
+                        }
+                    }
+                }
+                _ => {
+                    // Recurse for call expressions, etc.
+                    visit_children(
+                        lang, child, source, path, &impl_scope,
+                        identifiers, doc_texts, signatures, classes,
+                        call_sites,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn rs_extract_const_or_static(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+) {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(name) = name_node.utf8_text(source) {
+            identifiers.push(RawIdentifier {
+                name: name.to_string(),
+                entity_type: EntityType::Variable,
+                file: path.to_path_buf(),
+                line: name_node.start_position().row + 1,
+                scope: scope.clone(),
+            });
+        }
+    }
+}
+
+fn rs_extract_type_alias(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+    identifiers: &mut Vec<RawIdentifier>,
+) {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(name) = name_node.utf8_text(source) {
+            identifiers.push(RawIdentifier {
+                name: name.to_string(),
+                entity_type: EntityType::TypeAlias,
+                file: path.to_path_buf(),
+                line: name_node.start_position().row + 1,
+                scope: scope.clone(),
+            });
+        }
+    }
+}
+
+fn rs_collect_preceding_doc_comments(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut sibling = node.prev_sibling();
+    while let Some(sib) = sibling {
+        if sib.kind() == "line_comment" {
+            if let Ok(text) = sib.utf8_text(source) {
+                if let Some(rest) = text.strip_prefix("///") {
+                    lines.push(rest.trim().to_string());
+                    sibling = sib.prev_sibling();
+                    continue;
+                }
+                if let Some(rest) = text.strip_prefix("//!") {
+                    lines.push(rest.trim().to_string());
+                    sibling = sib.prev_sibling();
+                    continue;
+                }
+            }
+        }
+        // Skip attribute_item nodes between doc comments
+        if sib.kind() == "attribute_item" {
+            sibling = sib.prev_sibling();
+            continue;
+        }
+        break;
+    }
+    lines.reverse();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines[0].clone())
+}
+
+fn rs_extract_attributes(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Vec<String> {
+    let mut attrs = Vec::new();
+    let mut sibling = node.prev_sibling();
+    while let Some(sib) = sibling {
+        if sib.kind() == "attribute_item" {
+            if let Ok(text) = sib.utf8_text(source) {
+                let text = text.trim();
+                if let Some(inner) = text
+                    .strip_prefix("#[")
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    attrs.push(inner.to_string());
+                }
+            }
+            sibling = sib.prev_sibling();
+            continue;
+        }
+        if sib.kind() == "line_comment" {
+            // Doc comments can appear between attributes
+            sibling = sib.prev_sibling();
+            continue;
+        }
+        break;
+    }
+    attrs.reverse();
+    attrs
+}
+
+fn rs_extract_call_expression(
+    node: tree_sitter::Node,
+    source: &[u8],
+    path: &Path,
+    scope: &Option<String>,
+) -> Option<CallSite> {
+    let line = node.start_position().row + 1;
+
+    if node.kind() == "macro_invocation" {
+        // First named child is typically the macro name
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "identifier"
+                || child.kind() == "scoped_identifier"
+            {
+                let text = child.utf8_text(source).ok()?;
+                let callee = format!("{text}!");
+                return Some(CallSite {
+                    caller_scope: scope.clone(),
+                    callee,
+                    file: path.to_path_buf(),
+                    line,
+                });
+            }
+        }
+        return None;
+    }
+
+    // call_expression
+    let func_node = node.child_by_field_name("function")?;
+    let callee = match func_node.kind() {
+        "field_expression" => {
+            // Method call like self.process() or obj.method()
+            func_node
+                .child_by_field_name("field")
+                .and_then(|f| f.utf8_text(source).ok())
+                .map(|s| s.to_string())?
+        }
+        "scoped_identifier" => {
+            // Path like Config::new() — extract last segment
+            let text = func_node.utf8_text(source).ok()?;
+            text.rsplit("::")
+                .next()
+                .unwrap_or(text)
+                .to_string()
+        }
+        _ => func_node.utf8_text(source).ok()?.to_string(),
+    };
+
+    Some(CallSite {
+        caller_scope: scope.clone(),
+        callee,
+        file: path.to_path_buf(),
+        line,
+    })
+}
+
+fn rs_extract_return_type(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<String> {
+    node.child_by_field_name("return_type")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(|s| {
+            let s = s.trim();
+            s.strip_prefix("->").unwrap_or(s).trim().to_string()
+        })
 }
 
 // =========================================================================
@@ -3748,6 +4617,985 @@ VolumeProcessor.prototype.process = function(volume) {
         assert!(
             fns.contains(&"VolumeProcessor".to_string()),
             "Missing constructor fn VolumeProcessor. Got: {fns:?}"
+        );
+    }
+}
+
+// =========================================================================
+// Rust parser tests
+// =========================================================================
+
+#[cfg(test)]
+mod rs_tests {
+    use super::*;
+    use crate::types::EntityType;
+    use std::sync::OnceLock;
+
+    const RS_FIXTURE: &str = r#"//! Module-level documentation
+
+use std::fmt;
+
+/// Computes the hash of data.
+#[inline]
+fn compute_hash(data: &[u8]) -> u64 {
+    42
+}
+
+/// Configuration for the system.
+#[derive(Debug, Clone)]
+struct Config {
+    name: String,
+    count: usize,
+}
+
+struct Point(f64, f64);
+
+struct Marker;
+
+/// Direction enum.
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+}
+
+/// Serializable trait.
+trait Serializable {
+    fn serialize(&self) -> Vec<u8>;
+}
+
+const MAX_SIZE: usize = 1024;
+static GLOBAL_NAME: &str = "ontomics";
+
+type NodeId = u64;
+
+impl Config {
+    /// Creates a new config.
+    fn new(name: String) -> Self {
+        Self { name, count: 0 }
+    }
+
+    fn update(&mut self, value: usize) {
+        self.count = value;
+    }
+}
+
+impl Config {
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+}
+
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+async fn fetch_data(url: &str) -> Result<Vec<u8>, String> {
+    Ok(Vec::new())
+}
+
+fn main() {
+    let cfg = Config::new("test".to_string());
+    cfg.update(5);
+    compute_hash(b"hello");
+    println!("{}", cfg);
+    vec![1, 2, 3];
+}
+"#;
+
+    fn rs_fixture_result() -> &'static ParseResult {
+        static RESULT: OnceLock<ParseResult> = OnceLock::new();
+        RESULT.get_or_init(|| {
+            let path = Path::new("/tmp/ontomics_test_rs_parser.rs");
+            std::fs::write(path, RS_FIXTURE).unwrap();
+            parse_file_with(path, &RustParser).unwrap()
+        })
+    }
+
+    fn rs_names_of(
+        result: &ParseResult,
+        entity_type: EntityType,
+    ) -> Vec<String> {
+        result
+            .identifiers
+            .iter()
+            .filter(|id| id.entity_type == entity_type)
+            .map(|id| id.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_rs_functions_found() {
+        let result = rs_fixture_result();
+        let functions = rs_names_of(result, EntityType::Function);
+        for expected in &[
+            "compute_hash", "new", "update", "reset", "fmt", "main",
+            "serialize",
+        ] {
+            assert!(
+                functions.contains(&expected.to_string()),
+                "Missing function: {expected}. Got: {functions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_parameters_found() {
+        let result = rs_fixture_result();
+        let params = rs_names_of(result, EntityType::Parameter);
+        for expected in &["data", "name", "value", "f"] {
+            assert!(
+                params.contains(&expected.to_string()),
+                "Missing parameter: {expected}. Got: {params:?}"
+            );
+        }
+        assert!(
+            !params.contains(&"self".to_string()),
+            "self should be excluded. Got: {params:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_structs_found() {
+        let result = rs_fixture_result();
+        let classes = rs_names_of(result, EntityType::Class);
+        for expected in &["Config", "Point", "Marker"] {
+            assert!(
+                classes.contains(&expected.to_string()),
+                "Missing struct: {expected}. Got: {classes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_struct_fields() {
+        let result = rs_fixture_result();
+        let config = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Config")
+            .expect("Config ClassInfo not found");
+        assert!(
+            config.attributes.contains(&"name".to_string()),
+            "Config missing field 'name'. Got: {:?}",
+            config.attributes
+        );
+        assert!(
+            config.attributes.contains(&"count".to_string()),
+            "Config missing field 'count'. Got: {:?}",
+            config.attributes
+        );
+    }
+
+    #[test]
+    fn test_rs_enum_found() {
+        let result = rs_fixture_result();
+        let classes = rs_names_of(result, EntityType::Class);
+        for expected in &["Direction", "Shape"] {
+            assert!(
+                classes.contains(&expected.to_string()),
+                "Missing enum: {expected}. Got: {classes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_enum_variants() {
+        let result = rs_fixture_result();
+        let direction = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Direction")
+            .expect("Direction ClassInfo not found");
+        for variant in &["North", "South", "East", "West"] {
+            assert!(
+                direction
+                    .attributes
+                    .contains(&variant.to_string()),
+                "Direction missing variant '{variant}'. Got: {:?}",
+                direction.attributes
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_trait_found() {
+        let result = rs_fixture_result();
+        let interfaces =
+            rs_names_of(result, EntityType::Interface);
+        assert!(
+            interfaces.contains(&"Serializable".to_string()),
+            "Missing trait: Serializable. Got: {interfaces:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_impl_aggregation() {
+        let result = rs_fixture_result();
+        let config = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Config")
+            .expect("Config ClassInfo not found");
+        for method in &["new", "update", "reset", "fmt"] {
+            assert!(
+                config.methods.contains(&method.to_string()),
+                "Config missing method '{method}'. Got: {:?}",
+                config.methods
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_trait_impl_bases() {
+        let result = rs_fixture_result();
+        let config = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Config")
+            .expect("Config ClassInfo not found");
+        assert!(
+            config.bases.contains(&"Display".to_string()),
+            "Config should have Display in bases. Got: {:?}",
+            config.bases
+        );
+    }
+
+    #[test]
+    fn test_rs_doc_comments() {
+        let result = rs_fixture_result();
+        assert!(
+            !result.doc_texts.is_empty(),
+            "doc_texts should not be empty"
+        );
+        let doc_strings: Vec<&str> = result
+            .doc_texts
+            .iter()
+            .map(|(_, _, text)| text.as_str())
+            .collect();
+        assert!(
+            doc_strings.contains(&"Computes the hash of data."),
+            "Missing doc: 'Computes the hash of data.'. Got: {doc_strings:?}"
+        );
+        assert!(
+            doc_strings.contains(&"Module-level documentation"),
+            "Missing doc: 'Module-level documentation'. Got: {doc_strings:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_attributes() {
+        let result = rs_fixture_result();
+        let compute_hash_sig = result
+            .signatures
+            .iter()
+            .find(|s| s.name == "compute_hash")
+            .expect("compute_hash signature not found");
+        assert!(
+            compute_hash_sig
+                .decorators
+                .contains(&"inline".to_string()),
+            "compute_hash missing attribute 'inline'. Got: {:?}",
+            compute_hash_sig.decorators
+        );
+
+        let new_sig = result
+            .signatures
+            .iter()
+            .find(|s| {
+                s.name == "new"
+                    && s.scope == Some("Config".to_string())
+            })
+            .expect("Config::new signature not found");
+        assert_eq!(
+            new_sig.docstring_first_line.as_deref(),
+            Some("Creates a new config."),
+            "Config::new missing docstring"
+        );
+    }
+
+    #[test]
+    fn test_rs_const_static() {
+        let result = rs_fixture_result();
+        let vars = rs_names_of(result, EntityType::Variable);
+        assert!(
+            vars.contains(&"MAX_SIZE".to_string()),
+            "Missing const: MAX_SIZE. Got: {vars:?}"
+        );
+        assert!(
+            vars.contains(&"GLOBAL_NAME".to_string()),
+            "Missing static: GLOBAL_NAME. Got: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_type_alias() {
+        let result = rs_fixture_result();
+        let aliases = rs_names_of(result, EntityType::TypeAlias);
+        assert!(
+            aliases.contains(&"NodeId".to_string()),
+            "Missing type alias: NodeId. Got: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_call_sites() {
+        let result = rs_fixture_result();
+        let callees: Vec<&str> = result
+            .call_sites
+            .iter()
+            .map(|cs| cs.callee.as_str())
+            .collect();
+        assert!(
+            callees.contains(&"compute_hash"),
+            "Missing call: compute_hash. Got: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"println!"),
+            "Missing call: println!. Got: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"vec!"),
+            "Missing call: vec!. Got: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_let_variables() {
+        let result = rs_fixture_result();
+        let vars = rs_names_of(result, EntityType::Variable);
+        assert!(
+            vars.contains(&"cfg".to_string()),
+            "Missing let variable: cfg. Got: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_async_function() {
+        let result = rs_fixture_result();
+        let fns = rs_names_of(result, EntityType::Function);
+        assert!(
+            fns.contains(&"fetch_data".to_string()),
+            "Missing async fn: fetch_data. Got: {fns:?}"
+        );
+        let sig = result
+            .signatures
+            .iter()
+            .find(|s| s.name == "fetch_data")
+            .expect("Missing signature for fetch_data");
+        assert_eq!(
+            sig.return_type.as_deref(),
+            Some("Result<Vec<u8>, String>"),
+            "async fn return type should include Result<Vec<u8>, String>"
+        );
+        assert_eq!(sig.params.len(), 1);
+        assert_eq!(sig.params[0].name, "url");
+    }
+
+    #[test]
+    fn test_rs_trait_methods() {
+        let result = rs_fixture_result();
+        let trait_info = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Serializable")
+            .expect("Missing ClassInfo for Serializable");
+        assert!(
+            trait_info.methods.contains(&"serialize".to_string()),
+            "Trait Serializable should have method 'serialize'. Got: {:?}",
+            trait_info.methods
+        );
+    }
+
+    #[test]
+    fn test_rs_method_call_site() {
+        let result = rs_fixture_result();
+        let callees: Vec<&str> = result
+            .call_sites
+            .iter()
+            .map(|cs| cs.callee.as_str())
+            .collect();
+        // cfg.update(5) should produce a call site with callee "update"
+        assert!(
+            callees.contains(&"update"),
+            "Missing method call site: update. Got: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_impl_before_struct() {
+        // Verify that impl appearing before struct still produces a
+        // single merged ClassInfo with both methods and fields.
+        let code = r#"
+impl Widget {
+    fn activate(&self) {}
+}
+
+struct Widget {
+    label: String,
+    width: u32,
+}
+"#;
+        let path = Path::new("/tmp/ontomics_test_rs_impl_order.rs");
+        std::fs::write(path, code).unwrap();
+        let result = parse_file_with(path, &rust_parser()).unwrap();
+
+        let widget_classes: Vec<&ClassInfo> = result
+            .classes
+            .iter()
+            .filter(|c| c.name == "Widget")
+            .collect();
+        assert_eq!(
+            widget_classes.len(),
+            1,
+            "Should have exactly one ClassInfo for Widget, got {}",
+            widget_classes.len()
+        );
+        let widget = widget_classes[0];
+        assert!(
+            widget.methods.contains(&"activate".to_string()),
+            "Widget should have method 'activate'. Got: {:?}",
+            widget.methods
+        );
+        assert!(
+            widget.attributes.contains(&"label".to_string()),
+            "Widget should have field 'label'. Got: {:?}",
+            widget.attributes
+        );
+        assert!(
+            widget.attributes.contains(&"width".to_string()),
+            "Widget should have field 'width'. Got: {:?}",
+            widget.attributes
+        );
+    }
+
+}
+
+// =========================================================================
+// Rust parser cross-feature integration tests
+// =========================================================================
+
+#[cfg(test)]
+mod rs_integration_tests {
+    use super::*;
+    use crate::types::EntityType;
+    use std::path::Path;
+
+    // Realistic multi-pattern fixture: generics, builder, trait, enum,
+    // const/static, type alias, async fn, doc comments, derive attrs.
+    const COMPLEX_FIXTURE: &str = r#"//! Crate-level docs
+
+use std::collections::HashMap;
+
+/// A complex struct with generics.
+#[derive(Debug, Clone, Serialize)]
+pub struct Registry<T: Clone> {
+    entries: HashMap<String, T>,
+    count: usize,
+}
+
+/// Builder for Registry.
+pub struct RegistryBuilder<T: Clone> {
+    entries: Vec<(String, T)>,
+}
+
+impl<T: Clone> RegistryBuilder<T> {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    pub fn with_entry(mut self, key: String, value: T) -> Self {
+        self.entries.push((key, value));
+        self
+    }
+
+    pub fn build(self) -> Registry<T> {
+        let mut map = HashMap::new();
+        for (k, v) in self.entries {
+            map.insert(k, v);
+        }
+        Registry { entries: map, count: 0 }
+    }
+}
+
+impl<T: Clone> Registry<T> {
+    pub fn get(&self, key: &str) -> Option<&T> {
+        self.entries.get(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<T: Clone + std::fmt::Debug> std::fmt::Display for Registry<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Registry({} entries)", self.count)
+    }
+}
+
+/// Error type for registry operations.
+#[derive(Debug)]
+pub enum RegistryError {
+    NotFound(String),
+    DuplicateKey { key: String, existing: String },
+    Internal(Box<dyn std::error::Error>),
+}
+
+pub trait Validatable {
+    fn validate(&self) -> Result<(), RegistryError>;
+    fn is_valid(&self) -> bool {
+        self.validate().is_ok()
+    }
+}
+
+pub const MAX_ENTRIES: usize = 10000;
+pub static DEFAULT_NAME: &str = "default";
+pub type EntryId = u64;
+
+fn helper_function(data: &[u8], threshold: f64) -> bool {
+    data.len() as f64 > threshold
+}
+
+async fn fetch_entries(url: &str) -> Result<Vec<String>, RegistryError> {
+    Ok(vec![url.to_string()])
+}
+"#;
+
+    fn complex_result() -> &'static ParseResult {
+        static RESULT: std::sync::OnceLock<ParseResult> =
+            std::sync::OnceLock::new();
+        RESULT.get_or_init(|| {
+            let path = Path::new(
+                "/tmp/ontomics_test_rs_complex_real_world.rs",
+            );
+            std::fs::write(path, COMPLEX_FIXTURE).unwrap();
+            parse_file_with(path, &rust_parser()).unwrap()
+        })
+    }
+
+    fn names_of(result: &ParseResult, et: EntityType) -> Vec<String> {
+        result
+            .identifiers
+            .iter()
+            .filter(|id| id.entity_type == et)
+            .map(|id| id.name.clone())
+            .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // test_rs_complex_real_world
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rs_complex_real_world_structs() {
+        let result = complex_result();
+        let classes = names_of(&result, EntityType::Class);
+
+        for expected in &["Registry", "RegistryBuilder", "RegistryError"] {
+            assert!(
+                classes.contains(&expected.to_string()),
+                "Missing Class identifier: {expected}. Got: {classes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_struct_fields() {
+        let result = complex_result();
+
+        let registry = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Registry")
+            .expect("Registry ClassInfo not found");
+        assert!(
+            registry.attributes.contains(&"entries".to_string()),
+            "Registry missing field 'entries'. Got: {:?}",
+            registry.attributes
+        );
+        assert!(
+            registry.attributes.contains(&"count".to_string()),
+            "Registry missing field 'count'. Got: {:?}",
+            registry.attributes
+        );
+
+        let builder = result
+            .classes
+            .iter()
+            .find(|c| c.name == "RegistryBuilder")
+            .expect("RegistryBuilder ClassInfo not found");
+        assert!(
+            builder.attributes.contains(&"entries".to_string()),
+            "RegistryBuilder missing field 'entries'. Got: {:?}",
+            builder.attributes
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_enum_variants() {
+        let result = complex_result();
+
+        let err = result
+            .classes
+            .iter()
+            .find(|c| c.name == "RegistryError")
+            .expect("RegistryError ClassInfo not found");
+        for variant in &["NotFound", "DuplicateKey", "Internal"] {
+            assert!(
+                err.attributes.contains(&variant.to_string()),
+                "RegistryError missing variant '{variant}'. Got: {:?}",
+                err.attributes
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_trait_as_interface() {
+        let result = complex_result();
+
+        // Trait identifier should be Interface, not Class
+        let interfaces = names_of(&result, EntityType::Interface);
+        assert!(
+            interfaces.contains(&"Validatable".to_string()),
+            "Validatable should be Interface. Got: {interfaces:?}"
+        );
+        // Validatable must NOT appear as Class in identifiers
+        let classes = names_of(&result, EntityType::Class);
+        assert!(
+            !classes.contains(&"Validatable".to_string()),
+            "Validatable must not be Class. Got: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_trait_methods() {
+        let result = complex_result();
+
+        let trait_info = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Validatable")
+            .expect("Validatable ClassInfo not found");
+        assert!(
+            trait_info.methods.contains(&"validate".to_string()),
+            "Validatable missing method 'validate'. Got: {:?}",
+            trait_info.methods
+        );
+        assert!(
+            trait_info.methods.contains(&"is_valid".to_string()),
+            "Validatable missing method 'is_valid'. Got: {:?}",
+            trait_info.methods
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_impl_aggregation() {
+        let result = complex_result();
+
+        // Registry should have methods from both inherent impls merged
+        let registry = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Registry")
+            .expect("Registry ClassInfo not found");
+        for method in &["get", "len", "fmt"] {
+            assert!(
+                registry.methods.contains(&method.to_string()),
+                "Registry missing method '{method}'. Got: {:?}",
+                registry.methods
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_trait_impl_base() {
+        let result = complex_result();
+
+        let registry = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Registry")
+            .expect("Registry ClassInfo not found");
+        assert!(
+            registry.bases.contains(&"Display".to_string()),
+            "Registry should list Display in bases. Got: {:?}",
+            registry.bases
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_builder_methods() {
+        let result = complex_result();
+
+        let builder = result
+            .classes
+            .iter()
+            .find(|c| c.name == "RegistryBuilder")
+            .expect("RegistryBuilder ClassInfo not found");
+        for method in &["new", "with_entry", "build"] {
+            assert!(
+                builder.methods.contains(&method.to_string()),
+                "RegistryBuilder missing method '{method}'. Got: {:?}",
+                builder.methods
+            );
+        }
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_consts() {
+        let result = complex_result();
+        let vars = names_of(&result, EntityType::Variable);
+
+        assert!(
+            vars.contains(&"MAX_ENTRIES".to_string()),
+            "Missing const MAX_ENTRIES. Got: {vars:?}"
+        );
+        assert!(
+            vars.contains(&"DEFAULT_NAME".to_string()),
+            "Missing static DEFAULT_NAME. Got: {vars:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_type_alias() {
+        let result = complex_result();
+        let aliases = names_of(&result, EntityType::TypeAlias);
+
+        assert!(
+            aliases.contains(&"EntryId".to_string()),
+            "Missing type alias EntryId. Got: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_functions() {
+        let result = complex_result();
+        let fns = names_of(&result, EntityType::Function);
+
+        assert!(
+            fns.contains(&"helper_function".to_string()),
+            "Missing function helper_function. Got: {fns:?}"
+        );
+        assert!(
+            fns.contains(&"fetch_entries".to_string()),
+            "Missing async function fetch_entries. Got: {fns:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_async_return_type() {
+        let result = complex_result();
+
+        let sig = result
+            .signatures
+            .iter()
+            .find(|s| s.name == "fetch_entries")
+            .expect("Missing signature for fetch_entries");
+        let ret = sig.return_type.as_deref().unwrap_or("");
+        assert!(
+            ret.contains("Result") && ret.contains("Vec<String>"),
+            "fetch_entries return type should contain Result<Vec<String>, \
+             ...>. Got: {ret:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_doc_comments() {
+        let result = complex_result();
+
+        let doc_strings: Vec<&str> = result
+            .doc_texts
+            .iter()
+            .map(|(_, _, t)| t.as_str())
+            .collect();
+        assert!(
+            doc_strings.iter().any(|t| t.contains("Crate-level docs")),
+            "Missing crate-level doc. Got: {doc_strings:?}"
+        );
+        assert!(
+            doc_strings
+                .iter()
+                .any(|t| t.contains("A complex struct with generics")),
+            "Missing Registry doc. Got: {doc_strings:?}"
+        );
+        assert!(
+            doc_strings
+                .iter()
+                .any(|t| t.contains("Error type for registry operations")),
+            "Missing RegistryError doc. Got: {doc_strings:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_registry_doc_on_classinfo() {
+        let result = complex_result();
+
+        let registry = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Registry")
+            .expect("Registry ClassInfo not found");
+        assert_eq!(
+            registry.docstring_first_line.as_deref(),
+            Some("A complex struct with generics."),
+            "Registry ClassInfo should carry its doc comment"
+        );
+
+        let err = result
+            .classes
+            .iter()
+            .find(|c| c.name == "RegistryError")
+            .expect("RegistryError ClassInfo not found");
+        assert_eq!(
+            err.docstring_first_line.as_deref(),
+            Some("Error type for registry operations."),
+            "RegistryError ClassInfo should carry its doc comment"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_call_sites() {
+        let result = complex_result();
+        let callees: Vec<&str> = result
+            .call_sites
+            .iter()
+            .map(|cs| cs.callee.as_str())
+            .collect();
+
+        // HashMap::new and Vec::new come through as "new" (last segment)
+        assert!(
+            callees.contains(&"new"),
+            "Missing call site: new. Got: {callees:?}"
+        );
+        // self.entries.get(key) — method call on field
+        assert!(
+            callees.contains(&"get"),
+            "Missing call site: get. Got: {callees:?}"
+        );
+        // write! macro
+        assert!(
+            callees.contains(&"write!"),
+            "Missing macro call: write!. Got: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn test_rs_complex_real_world_no_duplicate_registry() {
+        let result = complex_result();
+
+        let registry_count =
+            result.classes.iter().filter(|c| c.name == "Registry").count();
+        assert_eq!(
+            registry_count, 1,
+            "Expected exactly one ClassInfo for Registry, got \
+             {registry_count}"
+        );
+
+        let builder_count = result
+            .classes
+            .iter()
+            .filter(|c| c.name == "RegistryBuilder")
+            .count();
+        assert_eq!(
+            builder_count, 1,
+            "Expected exactly one ClassInfo for RegistryBuilder, got \
+             {builder_count}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // test_rs_no_duplicate_signatures_in_trait
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rs_no_duplicate_signatures_in_trait() {
+        let code = r#"
+trait Transformer {
+    fn encode(&self, input: &str) -> String;
+    fn decode(&self, data: &[u8]) -> String;
+    fn reset(&mut self);
+}
+"#;
+        let path =
+            Path::new("/tmp/ontomics_test_rs_trait_sigs.rs");
+        std::fs::write(path, code).unwrap();
+        let result = parse_file_with(path, &rust_parser()).unwrap();
+
+        for method in &["encode", "decode", "reset"] {
+            let count = result
+                .signatures
+                .iter()
+                .filter(|s| s.name == *method)
+                .count();
+            assert_eq!(
+                count, 1,
+                "Trait method '{method}' should appear exactly once in \
+                 signatures, got {count}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // test_rs_self_field_access
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rs_self_field_access() {
+        let code = r#"
+struct Counter {
+    value: u64,
+    step: u64,
+}
+
+impl Counter {
+    fn increment(&mut self) {
+        self.value += self.step;
+    }
+
+    fn reset(&mut self) {
+        self.value = 0;
+    }
+
+    fn current(&self) -> u64 {
+        self.value
+    }
+}
+"#;
+        let path =
+            Path::new("/tmp/ontomics_test_rs_self_fields.rs");
+        std::fs::write(path, code).unwrap();
+        let result = parse_file_with(path, &rust_parser()).unwrap();
+
+        let attr_names: Vec<&str> = result
+            .identifiers
+            .iter()
+            .filter(|id| id.entity_type == EntityType::Attribute)
+            .map(|id| id.name.as_str())
+            .collect();
+
+        // self.value appears in increment, reset, current = at least 3
+        let value_count =
+            attr_names.iter().filter(|&&n| n == "value").count();
+        assert!(
+            value_count >= 3,
+            "self.value should produce at least 3 Attribute identifiers \
+             (one per access). Got {value_count}: {attr_names:?}"
+        );
+
+        // self.step appears once (in increment)
+        assert!(
+            attr_names.contains(&"step"),
+            "self.step should produce an Attribute identifier. \
+             Got: {attr_names:?}"
         );
     }
 }
