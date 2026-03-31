@@ -1,44 +1,34 @@
 # ontomics
 
-Every codebase develops its own vocabulary — abbreviations, naming patterns, domain terms that make sense to longtime contributors but are opaque to newcomers. `trf` means "transform". `nb_` means "count of". `ndim` not `n_dims`. You learn this by reading thousands of lines of code, or by asking someone who already has.
+ontomics extracts the domain knowledge embedded in your codebase — concepts, naming conventions, vocabulary, and relationships — and makes it queryable. It serves this knowledge to AI coding assistants and developers through [MCP](https://modelcontextprotocol.io/).
 
-ontomics learns it automatically. It reads your codebase, discovers the domain vocabulary and naming conventions, and makes that knowledge available to AI assistants (or any tool that speaks [MCP](https://modelcontextprotocol.io/)).
+## Examples
 
-## What can it do?
+**"What are the main concepts in this codebase?"**
+> Top concepts: `transform` (spatial_transform, apply_transform, TransformLayer, trf), `segmentation` (seg, labels, one_hot), `displacement` (disp, flow, vel). 847 symbols across 12 concept clusters.
 
-**Understand your project's vocabulary:**
-> "What does `trf` mean in this codebase?"
->
+**"What does `trf` mean in this codebase?"**
 > `trf` is an abbreviation for `transform` — related symbols include `spatial_transform`, `apply_transform`, and `TransformLayer`.
 
-**Check names against project conventions:**
-> "Is `n_dims` the right name?"
->
+**"What does `SpatialTransformer` do?"**
+> Class in `layers.py:45`. Applies a spatial transformation to an image tensor. Related concepts: `transform`, `interpolation`. Called by `VxmDense`, `VxmAffine`.
+
+**"Is `n_dims` the right name?"**
 > Inconsistent. This project uses `ndim` (42 occurrences across 15 files). `n_dims` appears 0 times.
 
-**Suggest names that fit the project's style:**
-> "What should I call a variable that counts features?"
->
-> `nb_features` — this project uses the `nb_` prefix for counts (`nb_bins`, `nb_steps`, `nb_features`).
+**"What changed in the domain since last week?"**
+> 2 new concepts: `prompt`, `click_map`. 1 renamed: `mask` cluster absorbed `binary_mask`. Convention `nb_` prefix extended to `nb_prompts`.
 
-**Find where concepts live:**
-> "Where should I start reading about transforms?"
->
-> `SpatialTransformer` in `layers.py:45`, `spatial_transform()` in `utils.py:112`, `apply_transform()` in `utils.py:203`.
+## What it does that search can't
 
-## How is this different from search?
+Search tells you where a string appears. An LSP tells you where a symbol is defined and referenced. Neither answers: what are the domain concepts in this codebase? How do they relate? What naming conventions emerged? What changed in the domain vocabulary since last release?
 
-Grep answers "where does this exact string appear?" — but only if you already know the string.
-
-ontomics answers "what does this project call things?" It discovers that `spatial_transform`, `apply_transform`, `TransformLayer`, and `trf` are all the same underlying concept. It detects that `nb_` is a project-wide prefix meaning "count of" by observing `nb_features`, `nb_bins`, and `nb_steps` appearing 40+ times. No search tool can derive conventions from usage patterns — ontomics does this through statistical analysis of the codebase.
-
-For structural code navigation (call graphs, find-all-references, go-to-definition), use an LSP. ontomics is specifically for **domain knowledge**: the naming conventions and vocabulary of a codebase, derived from the code itself.
+ontomics builds a semantic index — it clusters related symbols into concepts, detects naming conventions from usage frequency, resolves abbreviations, tracks how the domain vocabulary evolves over time, and exports that knowledge as a portable artifact.
 
 ## Install
 
-ontomics is an [MCP](https://modelcontextprotocol.io/) server — it gives AI coding assistants access to your project's domain knowledge. Install it once and it's available in every project.
+Install once, available in every project.
 
-**npm (recommended):**
 ```bash
 # Claude Code
 claude mcp add -s user ontomics -- npx -y @ontomics/ontomics
@@ -55,23 +45,13 @@ cargo build --release
 claude mcp add -s user ontomics ./target/release/ontomics
 ```
 
-No configuration needed. ontomics auto-detects the repo from its working directory and indexes it on first run.
+No configuration needed. ontomics auto-detects the repo and indexes it on first run.
 
 ## Supported languages
 
-| Language | Extensions |
-|----------|-----------|
-| Python | `.py` |
-| TypeScript | `.ts`, `.tsx` |
-| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
-| Rust | `.rs` |
+Python, TypeScript, JavaScript, Rust. Auto-detected from file extensions.
 
-Language is auto-detected from file extensions. To override, create `.ontomics/config.toml` in your repo:
-```toml
-language = "python"
-```
-
-## Full tool reference
+## Tools
 
 | Tool | What it does |
 |------|--------------|
@@ -88,6 +68,6 @@ language = "python"
 
 ## How it works
 
-ontomics indexes your codebase into `<repo>/.ontomics/index.db`. On first run it parses every file, extracts identifiers and docstrings, clusters related terms using embedding similarity, and detects naming conventions through frequency analysis. Subsequent startups load from cache and watch for file changes.
+ontomics parses every file in your repo, extracts identifiers and docstrings, clusters related terms by embedding similarity, and detects naming conventions through frequency analysis. The index lives at `<repo>/.ontomics/index.db` — subsequent startups load from cache and watch for changes.
 
-All configuration lives in `.ontomics/config.toml` — every field has sensible defaults. See `SPEC.md` for the full design contract.
+Configuration via `.ontomics/config.toml` in the repo root. All fields have sensible defaults. See `SPEC.md` for the full design contract.
