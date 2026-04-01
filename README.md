@@ -26,23 +26,6 @@ Tested with Claude Sonnet — same question, with and without ontomics.
 
 Both conditions produced complete, correct answers. ontomics got there in one call.
 
-## Examples
-
-**"What are the main concepts in this codebase?"**
-> Top concepts: `transform` (spatial_transform, apply_transform, TransformLayer, trf), `segmentation` (seg, labels, one_hot), `displacement` (disp, flow, vel). 847 symbols across 12 concept clusters.
-
-**"What does `trf` mean in this codebase?"**
-> `trf` is an abbreviation for `transform` — related symbols include `spatial_transform`, `apply_transform`, and `TransformLayer`.
-
-**"What does `SpatialTransformer` do?"**
-> Class in `layers.py:45`. Applies a spatial transformation to an image tensor. Related concepts: `transform`, `interpolation`. Called by `VxmDense`, `VxmAffine`.
-
-**"Is `n_dims` the right name?"**
-> Inconsistent. This project uses `ndim` (42 occurrences across 15 files). `n_dims` appears 0 times.
-
-**"What changed in the domain since last week?"**
-> 2 new concepts: `prompt`, `click_map`. 1 renamed: `mask` cluster absorbed `binary_mask`. Convention `nb_` prefix extended to `nb_prompts`.
-
 ## What it does that search can't
 
 Search tells you where a string appears. An LSP tells you where a symbol is defined and referenced. Neither answers: what are the domain concepts in this codebase? How do they relate? What naming conventions emerged? What changed in the domain vocabulary since last release?
