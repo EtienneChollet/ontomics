@@ -50,7 +50,7 @@ fn spawn_parent_watchdog() {
 }
 
 #[derive(ClapParser)]
-#[command(name = "ontomics", about = "Domain ontology extraction for Python/TypeScript/JavaScript/Rust codebases")]
+#[command(name = "ontomics", version, about = "Domain ontology extraction for Python/TypeScript/JavaScript/Rust codebases")]
 struct Cli {
     /// Path to the repository to analyze (defaults to current directory)
     #[arg(long, default_value = ".")]
