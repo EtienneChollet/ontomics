@@ -1,6 +1,9 @@
 # ontomics
 
-![languages](https://img.shields.io/badge/Python_·_Rust_·_TypeScript_·_JavaScript-blue)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
+![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)
 ![platform](https://img.shields.io/badge/macOS_·_Linux-grey)
 ![MCP](https://img.shields.io/badge/MCP_Server-green)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c)
