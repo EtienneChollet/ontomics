@@ -1,6 +1,6 @@
 # ontomics
 
-ontomics extracts the domain knowledge embedded in your codebase — concepts, naming conventions, vocabulary, and relationships — and makes it queryable. It serves this knowledge to AI coding assistants and developers through [MCP](https://modelcontextprotocol.io/).
+ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code and makes them queryable via [MCP](https://modelcontextprotocol.io/).
 
 ## Benchmark
 
