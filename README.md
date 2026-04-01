@@ -45,19 +45,22 @@ ontomics builds a semantic index of your project's domain — clustering related
 
 Install once, available in every project.
 
+**npm (macOS/Linux):**
+```bash
+npm install -g @ontomics/ontomics
+claude mcp add -s user ontomics -- ontomics
+```
+
 **macOS (Homebrew):**
 ```bash
 brew install EtienneChollet/tap/ontomics
+claude mcp add -s user ontomics -- ontomics
 ```
 
-**macOS/Linux:**
+**Shell installer (macOS/Linux):**
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/EtienneChollet/ontomics/releases/latest/download/ontomics-installer.sh | sh
-```
-
-**npm:**
-```bash
-npm install -g @ontomics/ontomics
+claude mcp add -s user ontomics -- ontomics
 ```
 
 **From source:**
@@ -65,10 +68,6 @@ npm install -g @ontomics/ontomics
 git clone https://github.com/EtienneChollet/ontomics.git
 cd ontomics
 cargo build --release
-```
-
-Then register with your MCP client:
-```bash
 claude mcp add -s user ontomics -- ontomics
 ```
 
