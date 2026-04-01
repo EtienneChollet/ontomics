@@ -609,6 +609,11 @@ impl ConceptGraph {
     }
 
     /// Suggest an identifier name given a natural language description.
+    ///
+    /// Primary path: embed the description, find semantically similar
+    /// concepts, then suggest their canonical forms (the vocabulary this
+    /// codebase uses).  Fallback (no embeddings yet): keyword matching
+    /// against concept canonicals and AbbreviationOf edges.
     pub fn suggest_name(
         &self,
         description: &str,
@@ -618,10 +623,365 @@ impl ConceptGraph {
             .map(|w| w.to_lowercase())
             .collect();
 
-        let mut suggestions = Vec::new();
+        // Phase 1: Find relevant concepts
+        let mut concept_scores: Vec<(u64, f32, String)> =
+            if let Some(query_vec) =
+                self.embeddings.embed_text(description)
+            {
+                self.embeddings
+                    .find_similar(&query_vec, 10)
+                    .into_iter()
+                    .filter(|(_, sim)| *sim >= 0.40)
+                    .map(|(cid, sim)| {
+                        (cid, sim, format!("similarity: {:.2}", sim))
+                    })
+                    .collect()
+            } else {
+                self.suggest_name_fallback(&words)
+            };
 
-        // Find matching conventions by semantic role
-        let role_keywords: &[(&str, &str)] = &[
+        // Phase 1b: Inject concepts that match query words by exact
+        // canonical or prefix (catches "convolution" → concept "conv").
+        let mut seen: HashSet<u64> =
+            concept_scores.iter().map(|(id, _, _)| *id).collect();
+        for word in &words {
+            // Skip stopwords and single-char words for prefix matching
+            if word.len() < 3 {
+                continue;
+            }
+            for concept in self.concepts.values() {
+                if seen.contains(&concept.id) {
+                    continue;
+                }
+                let canon = &concept.canonical;
+                // Both sides must be >= 3 chars for prefix matching
+                if canon.len() < 3 {
+                    continue;
+                }
+                if *canon == *word {
+                    seen.insert(concept.id);
+                    concept_scores.push((
+                        concept.id,
+                        0.85,
+                        format!("exact match '{}'", canon),
+                    ));
+                } else if word.starts_with(canon.as_str())
+                    || canon.starts_with(word.as_str())
+                {
+                    seen.insert(concept.id);
+                    concept_scores.push((
+                        concept.id,
+                        0.80,
+                        format!("'{}' ↔ '{}'", canon, word),
+                    ));
+                }
+            }
+        }
+
+        // Phase 2: Boost scores with structural signals
+        let matched_ids: HashSet<u64> =
+            concept_scores.iter().map(|(id, _, _)| *id).collect();
+        let mut adjusted: Vec<(u64, f32, String)> = concept_scores
+            .into_iter()
+            .filter_map(|(cid, raw, reason)| {
+                let concept = self.concepts.get(&cid)?;
+                let mut score = raw;
+
+                if words.contains(&concept.canonical) {
+                    score += 0.10;
+                }
+
+                let has_abbrev_link =
+                    self.relationships.iter().any(|r| {
+                        r.kind == RelationshipKind::AbbreviationOf
+                            && (r.source == cid || r.target == cid)
+                            && matched_ids.contains(
+                                if r.source == cid {
+                                    &r.target
+                                } else {
+                                    &r.source
+                                },
+                            )
+                    });
+                if has_abbrev_link {
+                    score += 0.05;
+                }
+
+                let occ_bonus = (concept.occurrences.len() as f32
+                    + 1.0)
+                    .ln()
+                    * 0.02;
+                score = (score + occ_bonus).min(0.99);
+
+                Some((cid, score, reason))
+            })
+            .collect();
+        adjusted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Phase 3: Convention matching
+        let matched_convention =
+            self.find_matching_convention(&words);
+
+        // Phase 4: Generate suggestions
+        let mut suggestions: Vec<NameSuggestion> = Vec::new();
+        let top: Vec<&(u64, f32, String)> =
+            adjusted.iter().take(5).collect();
+
+        // Convention-based suggestions (e.g. nb_ + concept)
+        if let Some(conv) = matched_convention {
+            for &(cid, adj_score, _) in &top {
+                let concept = match self.concepts.get(cid) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                match &conv.pattern {
+                    PatternKind::Prefix(prefix) => {
+                        let name = format!(
+                            "{}{}",
+                            prefix, concept.canonical
+                        );
+                        let exists = concept
+                            .occurrences
+                            .iter()
+                            .any(|o| o.identifier == name);
+                        let conf = if exists {
+                            (adj_score * 0.5 + 0.45).min(0.95)
+                        } else {
+                            (adj_score * 0.4 + 0.25).min(0.80)
+                        };
+                        suggestions.push(NameSuggestion {
+                            name,
+                            confidence: conf,
+                            based_on: vec![
+                                format!(
+                                    "'{}' prefix for {}",
+                                    prefix, conv.semantic_role
+                                ),
+                                format!(
+                                    "concept '{}' ({}x)",
+                                    concept.canonical,
+                                    concept.occurrences.len()
+                                ),
+                            ],
+                        });
+                    }
+                    PatternKind::Suffix(suffix) => {
+                        let name = format!(
+                            "{}{}",
+                            concept.canonical, suffix
+                        );
+                        let exists = concept
+                            .occurrences
+                            .iter()
+                            .any(|o| o.identifier == name);
+                        let conf = if exists {
+                            (adj_score * 0.5 + 0.45).min(0.95)
+                        } else {
+                            (adj_score * 0.4 + 0.25).min(0.80)
+                        };
+                        suggestions.push(NameSuggestion {
+                            name,
+                            confidence: conf,
+                            based_on: vec![
+                                format!(
+                                    "'{}' suffix for {}",
+                                    suffix, conv.semantic_role
+                                ),
+                                format!(
+                                    "concept '{}' ({}x)",
+                                    concept.canonical,
+                                    concept.occurrences.len()
+                                ),
+                            ],
+                        });
+                    }
+                    PatternKind::Conversion(sep) => {
+                        if top.len() >= 2 {
+                            let c0 =
+                                self.concepts.get(&top[0].0);
+                            let c1 =
+                                self.concepts.get(&top[1].0);
+                            if let (Some(c0), Some(c1)) = (c0, c1)
+                            {
+                                suggestions.push(NameSuggestion {
+                                    name: format!(
+                                        "{}{}{}",
+                                        c0.canonical,
+                                        sep,
+                                        c1.canonical
+                                    ),
+                                    confidence: (adj_score * 0.4
+                                        + 0.2)
+                                        .min(0.75),
+                                    based_on: vec![format!(
+                                        "'{}' conversion pattern",
+                                        sep
+                                    )],
+                                });
+                            }
+                        }
+                        break;
+                    }
+                    PatternKind::Compound(template) => {
+                        suggestions.push(NameSuggestion {
+                            name: template.replace(
+                                "[]",
+                                &concept.canonical,
+                            ),
+                            confidence: (adj_score * 0.4 + 0.25)
+                                .min(0.80),
+                            based_on: vec![format!(
+                                "compound pattern '{}'",
+                                template
+                            )],
+                        });
+                    }
+                }
+            }
+        }
+
+        // Concept canonical suggestions (the codebase vocabulary)
+        for &(cid, adj_score, ref reason) in &top {
+            let concept = match self.concepts.get(cid) {
+                Some(c) => c,
+                None => continue,
+            };
+            suggestions.push(NameSuggestion {
+                name: concept.canonical.clone(),
+                confidence: (adj_score * 0.85).min(0.92),
+                based_on: vec![
+                    format!(
+                        "'{}' ({}x in codebase)",
+                        concept.canonical,
+                        concept.occurrences.len()
+                    ),
+                    reason.clone(),
+                ],
+            });
+        }
+
+        // Deduplicate by name, keeping highest confidence
+        suggestions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        suggestions.dedup_by(|a, b| {
+            if a.name.to_lowercase() == b.name.to_lowercase() {
+                b.based_on.append(&mut a.based_on);
+                true
+            } else {
+                false
+            }
+        });
+        suggestions.truncate(5);
+        suggestions
+    }
+
+    /// Fallback concept matching when embeddings aren't loaded.
+    /// Uses exact canonical matches and AbbreviationOf edges.
+    fn suggest_name_fallback(
+        &self,
+        words: &[String],
+    ) -> Vec<(u64, f32, String)> {
+        let mut results: Vec<(u64, f32, String)> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+
+        // Exact canonical match
+        for concept in self.concepts.values() {
+            if words.contains(&concept.canonical)
+                && seen.insert(concept.id)
+            {
+                results.push((
+                    concept.id,
+                    0.80,
+                    format!("exact match '{}'", concept.canonical),
+                ));
+            }
+        }
+
+        // Follow AbbreviationOf edges (source=short, target=long)
+        let initial_ids: HashSet<u64> =
+            results.iter().map(|(id, _, _)| *id).collect();
+        for rel in &self.relationships {
+            if rel.kind != RelationshipKind::AbbreviationOf {
+                continue;
+            }
+            let linked = if initial_ids.contains(&rel.source) {
+                Some((rel.target, 0.75))
+            } else if initial_ids.contains(&rel.target) {
+                Some((rel.source, 0.70))
+            } else {
+                // Check if a word matches an endpoint not in initial
+                let src_match = self
+                    .concepts
+                    .get(&rel.source)
+                    .is_some_and(|c| {
+                        words.contains(&c.canonical)
+                    });
+                let tgt_match = self
+                    .concepts
+                    .get(&rel.target)
+                    .is_some_and(|c| {
+                        words.contains(&c.canonical)
+                    });
+                if src_match {
+                    Some((rel.target, 0.75))
+                } else if tgt_match {
+                    Some((rel.source, 0.70))
+                } else {
+                    None
+                }
+            };
+            if let Some((id, score)) = linked {
+                if seen.insert(id) {
+                    if let Some(c) = self.concepts.get(&id) {
+                        results.push((
+                            id,
+                            score,
+                            format!(
+                                "abbreviation of '{}'",
+                                c.canonical
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Identifier substring containment (weakest signal)
+        for concept in self.concepts.values() {
+            if seen.contains(&concept.id) {
+                continue;
+            }
+            if words.iter().any(|w| {
+                concept.occurrences.iter().any(|o| {
+                    o.identifier.to_lowercase().contains(w.as_str())
+                })
+            }) && seen.insert(concept.id)
+            {
+                results.push((
+                    concept.id,
+                    0.50,
+                    format!(
+                        "identifier contains '{}'",
+                        concept.canonical
+                    ),
+                ));
+            }
+        }
+
+        results
+    }
+
+    /// Find a convention whose semantic role matches a description word.
+    fn find_matching_convention(
+        &self,
+        words: &[String],
+    ) -> Option<&Convention> {
+        const ROLE_SYNONYMS: &[(&str, &str)] = &[
             ("count", "count"),
             ("number", "count"),
             ("boolean", "boolean predicate"),
@@ -630,169 +990,27 @@ impl ConceptGraph {
             ("conversion", "conversion"),
         ];
 
-        let mut matched_convention: Option<&Convention> = None;
-        for word in &words {
-            for &(keyword, role) in role_keywords {
-                if word == keyword {
-                    matched_convention = self.conventions.iter().find(
-                        |c| c.semantic_role == role,
-                    );
-                    break;
-                }
-            }
-            if matched_convention.is_some() {
-                break;
-            }
-        }
-
-        // Match concepts in priority tiers, tracking match quality.
-        // Each entry: (concept, score, reason).
-        let mut matched: Vec<(&Concept, f32, String)> = Vec::new();
-        let mut matched_ids: HashSet<u64> = HashSet::new();
-
-        // Tier 1: Exact canonical match
-        for concept in self.concepts.values() {
-            if words.contains(&concept.canonical) {
-                matched_ids.insert(concept.id);
-                matched.push((
-                    concept,
-                    0.9,
-                    format!("exact match '{}'", concept.canonical),
-                ));
-            }
-        }
-
-        // Tier 2: Abbreviation match (conv <-> convolution)
-        for concept in self.concepts.values() {
-            if matched_ids.contains(&concept.id) {
-                continue;
-            }
-            let canon = &concept.canonical;
-            let canon_slice = [canon.clone()];
-            for w in &words {
-                let w_slice = [w.clone()];
-                let is_abbrev =
-                    find_abbreviation(canon, &w_slice).is_some();
-                let is_expansion =
-                    find_abbreviation(w, &canon_slice).is_some();
-                if is_abbrev || is_expansion {
-                    matched_ids.insert(concept.id);
-                    let label = if is_abbrev {
-                        format!("'{}' abbreviates '{}'", canon, w)
-                    } else {
-                        format!("'{}' abbreviates '{}'", w, canon)
-                    };
-                    matched.push((concept, 0.85, label));
-                    break;
-                }
-            }
-        }
-
-        // Tier 3: Identifier substring match
-        for concept in self.concepts.values() {
-            if matched_ids.contains(&concept.id) {
-                continue;
-            }
-            if words.iter().any(|w| {
-                concept.occurrences.iter().any(|o| {
-                    o.identifier.to_lowercase().contains(w.as_str())
-                })
-            }) {
-                matched_ids.insert(concept.id);
-                matched.push((
-                    concept,
-                    0.55,
-                    format!(
-                        "identifier contains '{}'",
-                        concept.canonical,
-                    ),
-                ));
-            }
-        }
-
-        // Tier 4: Embedding similarity (threshold 0.65, use score directly)
-        if let Some(query_vec) = self.embeddings.embed_text(description) {
-            for (cid, score) in self.embeddings.find_similar(&query_vec, 5)
+        for word in words {
+            if let Some(conv) = self
+                .conventions
+                .iter()
+                .find(|c| c.semantic_role == word.as_str())
             {
-                if score < 0.65 {
-                    continue;
-                }
-                if matched_ids.contains(&cid) {
-                    continue;
-                }
-                if let Some(concept) = self.concepts.get(&cid) {
-                    matched_ids.insert(cid);
-                    matched.push((
-                        concept,
-                        score,
-                        format!("similar to '{}'", description),
-                    ));
-                }
+                return Some(conv);
             }
-        }
-
-        // Generate suggestions by combining convention prefix with concept
-        let matched_concepts: Vec<&Concept> =
-            matched.iter().map(|(c, _, _)| *c).collect();
-        if let Some(conv) = matched_convention {
-            if let PatternKind::Prefix(prefix) = &conv.pattern {
-                for concept in &matched_concepts {
-                    let name =
-                        format!("{}{}", prefix, concept.canonical);
-                    let exists = concept
-                        .occurrences
+            for &(synonym, role) in ROLE_SYNONYMS {
+                if word == synonym {
+                    if let Some(conv) = self
+                        .conventions
                         .iter()
-                        .any(|o| o.identifier == name);
-                    let confidence = if exists { 0.9 } else { 0.6 };
-
-                    suggestions.push(NameSuggestion {
-                        name,
-                        confidence,
-                        based_on: conv.examples.clone(),
-                    });
-                }
-            }
-            if let PatternKind::Conversion(sep) = &conv.pattern {
-                if matched_concepts.len() >= 2 {
-                    let name = format!(
-                        "{}{}{}",
-                        matched_concepts[0].canonical,
-                        sep,
-                        matched_concepts[1].canonical,
-                    );
-                    suggestions.push(NameSuggestion {
-                        name,
-                        confidence: 0.5,
-                        based_on: conv.examples.clone(),
-                    });
+                        .find(|c| c.semantic_role == role)
+                    {
+                        return Some(conv);
+                    }
                 }
             }
         }
-
-        // Fallback: suggest most common identifier, scored by match quality
-        if suggestions.is_empty() {
-            for (concept, score, reason) in &matched {
-                let mut id_counts: HashMap<&str, usize> = HashMap::new();
-                for occ in &concept.occurrences {
-                    *id_counts.entry(&occ.identifier).or_insert(0) += 1;
-                }
-                if let Some((&best, _)) =
-                    id_counts.iter().max_by_key(|(_, &c)| c)
-                {
-                    suggestions.push(NameSuggestion {
-                        name: best.to_string(),
-                        confidence: *score,
-                        based_on: vec![reason.clone()],
-                    });
-                }
-            }
-        }
-
-        // Sort by confidence descending, take top 5
-        suggestions
-            .sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-        suggestions.truncate(5);
-        suggestions
+        None
     }
 
     /// List all detected conventions.
