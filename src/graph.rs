@@ -645,44 +645,100 @@ impl ConceptGraph {
             }
         }
 
-        // Find matching concepts by word overlap
-        let mut matched_concepts: Vec<&Concept> = self
-            .concepts
-            .values()
-            .filter(|c| {
-                words.iter().any(|w| {
-                    c.canonical == *w
-                        || c.occurrences.iter().any(|o| {
-                            o.identifier.to_lowercase().contains(w.as_str())
-                        })
-                })
-            })
-            .collect();
+        // Match concepts in priority tiers, tracking match quality.
+        // Each entry: (concept, score, reason).
+        let mut matched: Vec<(&Concept, f32, String)> = Vec::new();
+        let mut matched_ids: HashSet<u64> = HashSet::new();
 
-        // Supplement with embedding-based search for semantic matches
-        // that word overlap misses (e.g., "volume dimensions" → ndim)
+        // Tier 1: Exact canonical match
+        for concept in self.concepts.values() {
+            if words.contains(&concept.canonical) {
+                matched_ids.insert(concept.id);
+                matched.push((
+                    concept,
+                    0.9,
+                    format!("exact match '{}'", concept.canonical),
+                ));
+            }
+        }
+
+        // Tier 2: Abbreviation match (conv <-> convolution)
+        for concept in self.concepts.values() {
+            if matched_ids.contains(&concept.id) {
+                continue;
+            }
+            let canon = &concept.canonical;
+            let canon_slice = [canon.clone()];
+            for w in &words {
+                let w_slice = [w.clone()];
+                let is_abbrev =
+                    find_abbreviation(canon, &w_slice).is_some();
+                let is_expansion =
+                    find_abbreviation(w, &canon_slice).is_some();
+                if is_abbrev || is_expansion {
+                    matched_ids.insert(concept.id);
+                    let label = if is_abbrev {
+                        format!("'{}' abbreviates '{}'", canon, w)
+                    } else {
+                        format!("'{}' abbreviates '{}'", w, canon)
+                    };
+                    matched.push((concept, 0.85, label));
+                    break;
+                }
+            }
+        }
+
+        // Tier 3: Identifier substring match
+        for concept in self.concepts.values() {
+            if matched_ids.contains(&concept.id) {
+                continue;
+            }
+            if words.iter().any(|w| {
+                concept.occurrences.iter().any(|o| {
+                    o.identifier.to_lowercase().contains(w.as_str())
+                })
+            }) {
+                matched_ids.insert(concept.id);
+                matched.push((
+                    concept,
+                    0.55,
+                    format!(
+                        "identifier contains '{}'",
+                        concept.canonical,
+                    ),
+                ));
+            }
+        }
+
+        // Tier 4: Embedding similarity (threshold 0.65, use score directly)
         if let Some(query_vec) = self.embeddings.embed_text(description) {
-            let matched_ids: HashSet<u64> =
-                matched_concepts.iter().map(|c| c.id).collect();
-            for (cid, score) in self.embeddings.find_similar(&query_vec, 5) {
-                if score < 0.5 {
+            for (cid, score) in self.embeddings.find_similar(&query_vec, 5)
+            {
+                if score < 0.65 {
                     continue;
                 }
                 if matched_ids.contains(&cid) {
                     continue;
                 }
                 if let Some(concept) = self.concepts.get(&cid) {
-                    matched_concepts.push(concept);
+                    matched_ids.insert(cid);
+                    matched.push((
+                        concept,
+                        score,
+                        format!("similar to '{}'", description),
+                    ));
                 }
             }
         }
 
         // Generate suggestions by combining convention prefix with concept
+        let matched_concepts: Vec<&Concept> =
+            matched.iter().map(|(c, _, _)| *c).collect();
         if let Some(conv) = matched_convention {
             if let PatternKind::Prefix(prefix) = &conv.pattern {
                 for concept in &matched_concepts {
-                    let name = format!("{}{}", prefix, concept.canonical);
-                    // Higher confidence if this exact name exists in corpus
+                    let name =
+                        format!("{}{}", prefix, concept.canonical);
                     let exists = concept
                         .occurrences
                         .iter()
@@ -697,7 +753,6 @@ impl ConceptGraph {
                 }
             }
             if let PatternKind::Conversion(sep) = &conv.pattern {
-                // For conversion, look for two concept words
                 if matched_concepts.len() >= 2 {
                     let name = format!(
                         "{}{}{}",
@@ -714,11 +769,9 @@ impl ConceptGraph {
             }
         }
 
-        // If no convention matched but we have concepts, suggest based on
-        // the most common identifier form for each concept
+        // Fallback: suggest most common identifier, scored by match quality
         if suggestions.is_empty() {
-            for concept in &matched_concepts {
-                // Find most common identifier for this concept
+            for (concept, score, reason) in &matched {
                 let mut id_counts: HashMap<&str, usize> = HashMap::new();
                 for occ in &concept.occurrences {
                     *id_counts.entry(&occ.identifier).or_insert(0) += 1;
@@ -728,11 +781,8 @@ impl ConceptGraph {
                 {
                     suggestions.push(NameSuggestion {
                         name: best.to_string(),
-                        confidence: 0.4,
-                        based_on: vec![format!(
-                            "concept '{}'",
-                            concept.canonical
-                        )],
+                        confidence: *score,
+                        based_on: vec![reason.clone()],
                     });
                 }
             }
