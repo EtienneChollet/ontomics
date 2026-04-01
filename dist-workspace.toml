@@ -16,7 +16,7 @@ install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
-install-updater = false
+install-updater = true
 # npm scope for the npm installer (change before first publish)
 npm-scope = "@ontomics"
 # Only run plan on PRs (save CI minutes)
