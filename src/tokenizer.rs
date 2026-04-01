@@ -128,7 +128,11 @@ pub fn find_abbreviation(short: &str, candidates: &[String]) -> Option<String> {
 
         if cand_lower.starts_with(&short_lower) {
             prefix_matches.push(candidate);
-        } else if is_subsequence(&short_lower, &cand_lower) {
+        } else if short_lower.len() >= 2
+            && short_lower.as_bytes()[0] == cand_lower.as_bytes()[0]
+            && short_lower.len() * 3 >= cand_lower.len()
+            && is_subsequence(&short_lower, &cand_lower)
+        {
             subseq_matches.push(candidate);
         }
     }
@@ -309,6 +313,24 @@ mod tests {
         assert!(result.is_some());
         // Both are prefix matches; prefer shorter
         assert_eq!(result.unwrap(), "transform");
+    }
+
+    #[test]
+    fn test_abbrev_rejects_wrong_first_letter() {
+        let candidates = vec!["convolution".to_string()];
+        assert_eq!(find_abbreviation("lut", &candidates), None);
+        assert_eq!(find_abbreviation("vol", &candidates), None);
+        assert_eq!(find_abbreviation("non", &candidates), None);
+        assert_eq!(find_abbreviation("out", &candidates), None);
+    }
+
+    #[test]
+    fn test_abbrev_rejects_single_char_subsequence() {
+        let candidates = vec!["convolution".to_string()];
+        // single char "c" is a prefix match so it still works
+        assert!(find_abbreviation("c", &candidates).is_some());
+        // single char "n" is NOT a prefix → should fail
+        assert_eq!(find_abbreviation("n", &candidates), None);
     }
 
     // --- is_subsequence tests ---
