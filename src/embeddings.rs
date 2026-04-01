@@ -1,13 +1,111 @@
 use crate::types::Concept;
 use anyhow::{anyhow, Result};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use hf_hub::api::sync::ApiBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+
+const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
+
+struct BgeModel {
+    model: BertModel,
+    tokenizer: Tokenizer,
+}
+
+impl BgeModel {
+    fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+        let device = Device::Cpu;
+
+        let mut builder = ApiBuilder::from_env();
+        if let Some(dir) = cache_dir {
+            builder = builder.with_cache_dir(dir.clone());
+        }
+        let api = builder.with_progress(true).build()?;
+        let repo = api.model(MODEL_ID.to_string());
+
+        let config_path = repo.get("config.json")?;
+        let tokenizer_path = repo.get("tokenizer.json")?;
+        let weights_path = repo.get("model.safetensors")?;
+
+        let config: BertConfig =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 512,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow!("failed to set truncation: {e}"))?;
+
+        let weights = std::fs::read(&weights_path)?;
+        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
+        let model = BertModel::load(vb, &config)?;
+
+        Ok(BgeModel { model, tokenizer })
+    }
+
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let device = &self.model.device;
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts, true)
+            .map_err(|e| anyhow!("tokenization failed: {e}"))?;
+
+        let batch_size = encodings.len();
+        let seq_len = encodings[0].get_ids().len();
+
+        let token_ids: Vec<u32> = encodings
+            .iter()
+            .flat_map(|e| e.get_ids().iter().copied())
+            .collect();
+        let type_ids: Vec<u32> = encodings
+            .iter()
+            .flat_map(|e| e.get_type_ids().iter().copied())
+            .collect();
+        let mask: Vec<u32> = encodings
+            .iter()
+            .flat_map(|e| e.get_attention_mask().iter().copied())
+            .collect();
+
+        let token_ids = Tensor::from_vec(token_ids, (batch_size, seq_len), device)?;
+        let type_ids = Tensor::from_vec(type_ids, (batch_size, seq_len), device)?;
+        let mask = Tensor::from_vec(mask, (batch_size, seq_len), device)?;
+
+        // Forward pass -> [batch, seq_len, hidden_size]
+        let output = self.model.forward(&token_ids, &type_ids, Some(&mask))?;
+
+        // CLS pooling: first token -> [batch, hidden_size]
+        let cls = output.narrow(1, 0, 1)?.squeeze(1)?;
+
+        // L2 normalize
+        let norms = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
+        let normalized = cls.broadcast_div(&norms)?;
+
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            results.push(normalized.get(i)?.to_vec1::<f32>()?);
+        }
+        Ok(results)
+    }
+}
 
 #[derive(Default)]
 pub struct EmbeddingIndex {
-    model: Option<TextEmbedding>,
+    model: Option<BgeModel>,
     vectors: HashMap<u64, Vec<f32>>,
     cache_dir: Option<PathBuf>,
 }
@@ -15,12 +113,7 @@ pub struct EmbeddingIndex {
 impl EmbeddingIndex {
     /// Initialize embedding index with the BGE-small model.
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        let mut opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
-            .with_show_download_progress(true);
-        if let Some(ref dir) = cache_dir {
-            opts = opts.with_cache_dir(dir.clone());
-        }
-        let model = TextEmbedding::try_new(opts)?;
+        let model = BgeModel::load(cache_dir.as_ref())?;
         Ok(Self {
             model: Some(model),
             vectors: HashMap::new(),
@@ -42,12 +135,7 @@ impl EmbeddingIndex {
         if self.model.is_some() {
             return Ok(());
         }
-        let mut opts = InitOptions::new(EmbeddingModel::BGESmallENV15)
-            .with_show_download_progress(true);
-        if let Some(ref dir) = self.cache_dir {
-            opts = opts.with_cache_dir(dir.clone());
-        }
-        let model = TextEmbedding::try_new(opts)?;
+        let model = BgeModel::load(self.cache_dir.as_ref())?;
         self.model = Some(model);
         Ok(())
     }
@@ -83,7 +171,7 @@ impl EmbeddingIndex {
             .ok_or_else(|| anyhow!("no embedding model loaded (index is empty)"))?;
 
         let text = Self::concept_text(concept);
-        let embeddings = model.embed(vec![text], None)?;
+        let embeddings = model.embed(vec![text])?;
         let vector = embeddings
             .into_iter()
             .next()
@@ -108,7 +196,7 @@ impl EmbeddingIndex {
             .iter()
             .map(Self::concept_text)
             .collect();
-        let all_embeddings = model.embed(texts, None)?;
+        let all_embeddings = model.embed(texts)?;
 
         for (concept, vector) in concepts.iter().zip(all_embeddings) {
             self.vectors.insert(concept.id, vector);
@@ -120,7 +208,7 @@ impl EmbeddingIndex {
     /// Returns a Vec parallel to the input: one embedding per text.
     pub fn embed_texts_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
         let model = self.model.as_ref()?;
-        model.embed(texts.to_vec(), None).ok()
+        model.embed(texts.to_vec()).ok()
     }
 
     /// Find top-k concepts most similar to the query by cosine similarity.
@@ -139,7 +227,7 @@ impl EmbeddingIndex {
     pub fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
         let model = self.model.as_ref()?;
         model
-            .embed(vec![text.to_string()], None)
+            .embed(vec![text.to_string()])
             .ok()
             .and_then(|vecs| vecs.into_iter().next())
     }
@@ -310,5 +398,74 @@ mod tests {
         );
         // Model should be None after deserialization
         assert!(deserialized.model.is_none());
+    }
+
+    #[test]
+    #[ignore] // requires model download
+    fn test_embed_text_produces_valid_vector() {
+        let index = EmbeddingIndex::new(None).unwrap();
+        let vector = index.embed_text("spatial transform").unwrap();
+        assert_eq!(vector.len(), 384); // BGE-Small dimension
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.01); // BGE-Small outputs are normalized
+    }
+
+    #[test]
+    #[ignore] // requires model download
+    fn test_similar_texts_have_higher_similarity() {
+        let index = EmbeddingIndex::new(None).unwrap();
+        let a = index.embed_text("spatial transform").unwrap();
+        let b = index.embed_text("affine transformation").unwrap();
+        let c = index.embed_text("database connection pool").unwrap();
+
+        let sim_ab = cosine_similarity(&a, &b);
+        let sim_ac = cosine_similarity(&a, &c);
+        assert!(sim_ab > sim_ac); // related terms closer than unrelated
+    }
+
+    #[test]
+    #[ignore] // requires model download
+    fn test_embed_concepts_batch_stores_vectors() {
+        use crate::types::{Concept, EntityType, Occurrence};
+        use std::collections::HashSet;
+
+        let mut index = EmbeddingIndex::new(None).unwrap();
+        let concepts = vec![
+            Concept {
+                id: 1,
+                canonical: "transform".to_string(),
+                subtokens: vec!["transform".to_string()],
+                occurrences: vec![Occurrence {
+                    file: PathBuf::from("test.py"),
+                    line: 1,
+                    identifier: "spatial_transform".to_string(),
+                    entity_type: EntityType::Function,
+                }],
+                entity_types: HashSet::from([EntityType::Function]),
+                embedding: None,
+                cluster_id: None,
+                subconcepts: Vec::new(),
+            },
+            Concept {
+                id: 2,
+                canonical: "connection".to_string(),
+                subtokens: vec!["connection".to_string()],
+                occurrences: vec![Occurrence {
+                    file: PathBuf::from("test.py"),
+                    line: 10,
+                    identifier: "db_connection".to_string(),
+                    entity_type: EntityType::Variable,
+                }],
+                entity_types: HashSet::from([EntityType::Variable]),
+                embedding: None,
+                cluster_id: None,
+                subconcepts: Vec::new(),
+            },
+        ];
+
+        index.embed_concepts_batch(&concepts).unwrap();
+        assert_eq!(index.nb_vectors(), 2);
+        assert_eq!(index.get_vector(1).unwrap().len(), 384);
+        assert_eq!(index.get_vector(2).unwrap().len(), 384);
     }
 }

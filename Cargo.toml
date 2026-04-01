@@ -20,7 +20,11 @@ tree-sitter-javascript = "0.23"
 tree-sitter-rust = "0.23"
 
 # Embeddings
-fastembed = "4"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = "0.5"
+tokenizers = "0.22"
 
 # MCP server
 rmcp = { version = "0.1", features = ["server", "transport-io"] }
