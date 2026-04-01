@@ -6,7 +6,7 @@ ontomics extracts the domain knowledge embedded in your codebase — concepts, n
 
 Tested with Claude Sonnet — same question, with and without ontomics.
 
-"What does 'transform' mean in this codebase?" on [voxelmorph](https://github.com/voxelmorph/voxelmorph):
+"What does 'transform' mean in this codebase?" on [voxelmorph](https://github.com/voxelmorph/voxelmorph) ([full transcript](doc/benchmarks/transform-voxelmorph.md)):
 
 |                | With ontomics | Without    |
 |----------------|---------------|------------|
@@ -15,7 +15,7 @@ Tested with Claude Sonnet — same question, with and without ontomics.
 | Time           | 5s            | 1m 15s     |
 | Answer quality | Complete      | Complete   |
 
-"What are the main domain concepts in this codebase?" on [ScribblePrompt](https://github.com/halleewong/ScribblePrompt):
+"What are the main domain concepts in this codebase?" on [ScribblePrompt](https://github.com/halleewong/ScribblePrompt) ([full transcript](doc/benchmarks/concepts-scribbleprompt.md)):
 
 |                | With ontomics | Without    |
 |----------------|---------------|------------|
