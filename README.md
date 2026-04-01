@@ -2,6 +2,30 @@
 
 ontomics extracts the domain knowledge embedded in your codebase — concepts, naming conventions, vocabulary, and relationships — and makes it queryable. It serves this knowledge to AI coding assistants and developers through [MCP](https://modelcontextprotocol.io/).
 
+## Benchmark
+
+Tested with Claude Sonnet — same question, with and without ontomics.
+
+"What does 'transform' mean in this codebase?" on [voxelmorph](https://github.com/voxelmorph/voxelmorph):
+
+|                | With ontomics | Without    |
+|----------------|---------------|------------|
+| Tool calls     | 1             | 19         |
+| Tokens         | ~3.7k         | ~76k       |
+| Time           | 5s            | 1m 15s     |
+| Answer quality | Complete      | Complete   |
+
+"What are the main domain concepts in this codebase?" on [ScribblePrompt](https://github.com/halleewong/ScribblePrompt):
+
+|                | With ontomics | Without    |
+|----------------|---------------|------------|
+| Tool calls     | 1             | 26         |
+| Tokens         | ~3.7k         | ~61.6k     |
+| Time           | ~5s           | 56s        |
+| Answer quality | Complete      | Complete   |
+
+Both conditions produced complete, correct answers. ontomics got there in one call.
+
 ## Examples
 
 **"What are the main concepts in this codebase?"**
@@ -18,19 +42,6 @@ ontomics extracts the domain knowledge embedded in your codebase — concepts, n
 
 **"What changed in the domain since last week?"**
 > 2 new concepts: `prompt`, `click_map`. 1 renamed: `mask` cluster absorbed `binary_mask`. Convention `nb_` prefix extended to `nb_prompts`.
-
-## Benchmark
-
-"What does 'transform' mean in this codebase?" — tested on [voxelmorph](https://github.com/voxelmorph/voxelmorph) with Claude Sonnet:
-
-|                | With ontomics | Without    |
-|----------------|---------------|------------|
-| Tool calls     | 1             | 19         |
-| Tokens         | ~3.7k         | ~76k       |
-| Time           | 5s            | 1m 15s     |
-| Answer quality | Complete      | Complete   |
-
-Both answers correctly identified the `trf` abbreviation, displacement vs coordinate representations, and key entry points. ontomics got there in one call.
 
 ## What it does that search can't
 
