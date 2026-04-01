@@ -19,6 +19,19 @@ ontomics extracts the domain knowledge embedded in your codebase — concepts, n
 **"What changed in the domain since last week?"**
 > 2 new concepts: `prompt`, `click_map`. 1 renamed: `mask` cluster absorbed `binary_mask`. Convention `nb_` prefix extended to `nb_prompts`.
 
+## Benchmark
+
+"What does 'transform' mean in this codebase?" — tested on [voxelmorph](https://github.com/voxelmorph/voxelmorph) with Claude Sonnet:
+
+|                | With ontomics | Without    |
+|----------------|---------------|------------|
+| Tool calls     | 1             | 19         |
+| Tokens         | ~3.7k         | ~76k       |
+| Time           | 5s            | 1m 15s     |
+| Answer quality | Complete      | Complete   |
+
+Both answers correctly identified the `trf` abbreviation, displacement vs coordinate representations, and key entry points. ontomics got there in one call.
+
 ## What it does that search can't
 
 Search tells you where a string appears. An LSP tells you where a symbol is defined and referenced. Neither answers: what are the domain concepts in this codebase? How do they relate? What naming conventions emerged? What changed in the domain vocabulary since last release?
