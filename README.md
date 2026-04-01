@@ -1,5 +1,11 @@
 # ontomics
 
+![languages](https://img.shields.io/badge/Python_·_Rust_·_TypeScript_·_JavaScript-blue)
+![platform](https://img.shields.io/badge/macOS_·_Linux-grey)
+![MCP](https://img.shields.io/badge/MCP_Server-green)
+![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c)
+![Codex](https://img.shields.io/badge/Codex-black)
+
 ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code and makes them queryable via [MCP](https://modelcontextprotocol.io/).
 
 ## Benchmark
