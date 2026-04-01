@@ -115,6 +115,8 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Update ontomics to the latest version
+    Update,
     /// List entities (classes, functions) with optional filtering
     Entities {
         /// Filter by concept
@@ -682,6 +684,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Command::Update) = &cli.command {
+        return cmd_update();
+    }
+
     let mut config = config::Config::load(&cli.repo)?;
 
     let mut startup_warnings: Vec<String> = Vec::new();
@@ -746,7 +753,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut startup_warnings,
             )?;
             match cmd {
-                Command::Serve => unreachable!(),
+                Command::Serve | Command::Update => unreachable!(),
                 Command::Query { term } => cmd_query(&result.graph, &term),
                 Command::Check { identifier } => {
                     cmd_check(&result.graph, &identifier)
@@ -917,6 +924,23 @@ fn cmd_entities(
     let results = graph.list_entities(concept, role, None, top_k);
     print_json(&results);
     Ok(())
+}
+
+fn cmd_update() -> anyhow::Result<()> {
+    eprintln!("ontomics {}", env!("CARGO_PKG_VERSION"));
+    let status = std::process::Command::new("ontomics-update").status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        _ => {
+            eprintln!("ontomics-update not found. Reinstall to get it:");
+            eprintln!();
+            eprintln!("  curl --proto '=https' --tlsv1.2 -LsSf \\");
+            eprintln!(
+                "    https://github.com/EtienneChollet/ontomics/releases/latest/download/ontomics-installer.sh | sh"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Load domain packs from paths in config, resolving relative to repo root.
