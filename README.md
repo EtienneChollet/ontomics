@@ -6,8 +6,8 @@
 ![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)
 ![platform](https://img.shields.io/badge/macOS_·_Linux-grey)
 ![MCP](https://img.shields.io/badge/MCP_Server-green)
-![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c)
-![Codex](https://img.shields.io/badge/Codex-black)
+![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c?logo=anthropic&logoColor=white)
+![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
 
 ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code and makes them queryable via [MCP](https://modelcontextprotocol.io/).
 
