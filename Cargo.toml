@@ -1,10 +1,11 @@
 [package]
 name = "ontomics"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "MCP server that extracts domain ontologies from Python codebases"
 license = "MIT"
 repository = "https://github.com/EtienneChollet/ontomics"
+homepage = "https://github.com/EtienneChollet/ontomics"
 readme = "README.md"
 
 [features]
