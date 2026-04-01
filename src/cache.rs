@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::UNIX_EPOCH;
 
 /// Auto-generated hash of indexing source files. Changes whenever
 /// entity.rs, analyzer.rs, parser.rs, cache.rs, tokenizer.rs, or types.rs
@@ -139,6 +140,59 @@ impl IndexCache {
         let _ = fs::remove_file(self.embedding_lock_path());
     }
 
+    /// Repo root derived from db_path (<repo>/.ontomics/index.db).
+    fn repo_root(&self) -> &Path {
+        self.db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("db_path must be <repo>/.ontomics/index.db")
+    }
+
+    /// Collect all unique source files referenced by the graph.
+    fn referenced_files(graph: &ConceptGraph) -> HashSet<PathBuf> {
+        let mut files = HashSet::new();
+        for concept in graph.concepts.values() {
+            for occ in &concept.occurrences {
+                files.insert(occ.file.clone());
+            }
+        }
+        for sig in &graph.signatures {
+            files.insert(sig.file.clone());
+        }
+        for cls in &graph.classes {
+            files.insert(cls.file.clone());
+        }
+        for cs in &graph.call_sites {
+            files.insert(cs.file.clone());
+        }
+        files
+    }
+
+    /// Build manifest: relative path → mtime as unix seconds.
+    fn build_manifest(
+        repo_root: &Path,
+        files: &HashSet<PathBuf>,
+    ) -> HashMap<PathBuf, u64> {
+        let mut manifest = HashMap::new();
+        for file in files {
+            let abs = if file.is_relative() {
+                repo_root.join(file)
+            } else {
+                file.clone()
+            };
+            if let Ok(meta) = fs::metadata(&abs) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                manifest.insert(file.clone(), mtime);
+            }
+        }
+        manifest
+    }
+
     /// Save full graph to cache, tagged with the active language.
     pub fn save(&self, graph: &ConceptGraph, language: &str) -> Result<()> {
         self.acquire_lock()
@@ -180,6 +234,16 @@ impl IndexCache {
             "INSERT OR REPLACE INTO cache (key, value, updated_at)
              VALUES (?1, ?2, datetime('now'))",
             rusqlite::params!["language", language.as_bytes()],
+        )?;
+
+        // Store file manifest for staleness detection
+        let files = Self::referenced_files(graph);
+        let manifest = Self::build_manifest(self.repo_root(), &files);
+        let manifest_json = serde_json::to_vec(&manifest)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params!["file_manifest", &manifest_json],
         )?;
 
         Ok(())
@@ -256,6 +320,51 @@ impl IndexCache {
                 language,
             );
             return Ok(None);
+        }
+
+        // Check file manifest — deleted or modified files trigger re-index
+        let manifest_blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM cache WHERE key = ?1",
+                rusqlite::params!["file_manifest"],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(blob) = manifest_blob {
+            if let Ok(manifest) =
+                serde_json::from_slice::<HashMap<PathBuf, u64>>(&blob)
+            {
+                let repo_root = self.repo_root();
+                for (file, cached_mtime) in &manifest {
+                    let abs = if file.is_relative() {
+                        repo_root.join(file)
+                    } else {
+                        file.clone()
+                    };
+                    let current_mtime = fs::metadata(&abs)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs());
+                    match current_mtime {
+                        None => {
+                            eprintln!(
+                                "Cached file deleted: {} — re-indexing",
+                                file.display(),
+                            );
+                            return Ok(None);
+                        }
+                        Some(mtime) if mtime != *cached_mtime => {
+                            eprintln!(
+                                "Cached file modified: {} — re-indexing",
+                                file.display(),
+                            );
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         let result: rusqlite::Result<Vec<u8>> = conn.query_row(
@@ -860,5 +969,118 @@ mod tests {
         cache.release_embedding_lock();
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Helper: build a graph whose occurrences reference real files on disk.
+    fn make_graph_with_files(files: &[PathBuf]) -> ConceptGraph {
+        use crate::types::Occurrence;
+        let mut concepts = HashMap::new();
+        let occs: Vec<Occurrence> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| Occurrence {
+                identifier: format!("id_{i}"),
+                entity_type: crate::types::EntityType::Function,
+                file: f.clone(),
+                line: 1,
+            })
+            .collect();
+        concepts.insert(
+            1,
+            Concept {
+                id: 1,
+                canonical: "test".to_string(),
+                subtokens: vec!["test".to_string()],
+                occurrences: occs,
+                entity_types: HashSet::new(),
+                embedding: None,
+                cluster_id: None,
+                subconcepts: Vec::new(),
+            },
+        );
+        ConceptGraph {
+            concepts,
+            relationships: Vec::new(),
+            conventions: Vec::new(),
+            embeddings: EmbeddingIndex::empty(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+            entities: HashMap::new(),
+            cluster_centroids: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_manifest_invalidates_on_deleted_file() {
+        let dir = Path::new("/tmp/ontomics_test_manifest_delete");
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+
+        // Create a source file the graph references
+        let src = dir.join("example.py");
+        fs::write(&src, "def foo(): pass").unwrap();
+
+        let graph = make_graph_with_files(&[src.clone()]);
+        let cache = IndexCache::open(dir).unwrap();
+        cache.save(&graph, "python").unwrap();
+
+        // Cache loads fine while file exists
+        assert!(cache.load("python").unwrap().is_some());
+
+        // Delete the file — cache should invalidate
+        fs::remove_file(&src).unwrap();
+        assert!(cache.load("python").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_manifest_invalidates_on_modified_file() {
+        let dir = Path::new("/tmp/ontomics_test_manifest_modify");
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+
+        let src = dir.join("example.py");
+        fs::write(&src, "def foo(): pass").unwrap();
+
+        let graph = make_graph_with_files(&[src.clone()]);
+        let cache = IndexCache::open(dir).unwrap();
+        cache.save(&graph, "python").unwrap();
+
+        assert!(cache.load("python").unwrap().is_some());
+
+        // Modify the file (bump mtime by writing new content after a delay)
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(&src, "def foo(): return 42").unwrap();
+        assert!(cache.load("python").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_manifest_missing_is_graceful() {
+        // Old caches without a manifest should still load (no regression)
+        let dir = Path::new("/tmp/ontomics_test_manifest_missing");
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+
+        let graph = make_test_graph();
+        let cache = IndexCache::open(dir).unwrap();
+        cache.save(&graph, "python").unwrap();
+
+        // Manually delete the manifest row to simulate an old cache
+        let db_path = dir.join(".ontomics").join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "DELETE FROM cache WHERE key = ?1",
+            rusqlite::params!["file_manifest"],
+        )
+        .unwrap();
+
+        // Should still load — no manifest means skip check
+        assert!(cache.load("python").unwrap().is_some());
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
