@@ -6,3 +6,10 @@ SPEC2.md
 .semex/
 CLAUDE.md
 .claude/
+.fastembed_cache/
+doc/
+package/
+research/
+todo/
+BENCHMARK_SPEC_A.md
+*.tgz
