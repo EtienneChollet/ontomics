@@ -26,7 +26,7 @@ publish-jobs = ["npm", "homebrew"]
 # Homebrew tap repo for `brew install EtienneChollet/tap/ontomics`
 tap = "EtienneChollet/homebrew-tap"
 # Run setup script inside containers before building
-github-build-setup = "build-setup.yml"
+github-build-setup = "../build-setup.yml"
 
 # Build Linux binaries in older-glibc container for broad compatibility
 [dist.github-custom-runners.x86_64-unknown-linux-gnu]
