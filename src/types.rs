@@ -164,8 +164,6 @@ pub struct ConceptQueryResult {
     pub classes: Vec<ClassInfo>,
     pub call_graph: Vec<(String, String)>,
     #[serde(default)]
-    pub subconcepts: Vec<Subconcept>,
-    #[serde(default)]
     pub entities: Vec<EntitySummary>,
 }
 

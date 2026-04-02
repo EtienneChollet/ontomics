@@ -9,10 +9,55 @@ use rmcp::model::{
     ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
+use ontomics::types::ConceptQueryResult;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// Budget in bytes for MCP tool output (~10K tokens).
+const OUTPUT_BUDGET_BYTES: usize = 40_000;
+
+/// Strip internal-only data and progressively compact a query result
+/// so that the serialized output stays within `OUTPUT_BUDGET_BYTES`.
+fn compact_query_result(r: &mut ConceptQueryResult) {
+    // Always strip data that is useless to MCP consumers:
+    // - concept.occurrences is redundant with top_occurrences
+    // - embedding vectors are internal implementation details
+    r.concept.occurrences.clear();
+    r.concept.embedding = None;
+    for sc in &mut r.concept.subconcepts {
+        sc.embedding = None;
+    }
+
+    if estimated_json_len(r) <= OUTPUT_BUDGET_BYTES {
+        return;
+    }
+
+    // Level 1: trim unbounded / low-priority fields
+    r.call_graph.truncate(10);
+    r.classes.truncate(3);
+    r.variants.truncate(10);
+    for sc in &mut r.concept.subconcepts {
+        sc.occurrences.truncate(3);
+    }
+
+    if estimated_json_len(r) <= OUTPUT_BUDGET_BYTES {
+        return;
+    }
+
+    // Level 2: aggressive — keep only the essentials
+    r.call_graph.clear();
+    r.classes.truncate(1);
+    r.signatures.truncate(2);
+    r.variants.truncate(5);
+    r.concept.subconcepts.clear();
+}
+
+/// Cheap size estimate: serialize to JSON and measure byte length.
+fn estimated_json_len(r: &ConceptQueryResult) -> usize {
+    serde_json::to_string(r).map(|s| s.len()).unwrap_or(0)
+}
 
 #[derive(Clone)]
 pub struct OntomicsServer {
@@ -101,8 +146,11 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         match graph.query_concept(term, &params) {
-            Some(result) => serde_json::to_value(result)
-                .map_err(|e| format!("serialization error: {e}")),
+            Some(mut result) => {
+                compact_query_result(&mut result);
+                serde_json::to_value(result)
+                    .map_err(|e| format!("serialization error: {e}"))
+            }
             None => Ok(json!({
                 "error": "not_found",
                 "message": format!("no concept matching '{term}'"),
@@ -665,9 +713,17 @@ impl ServerHandler for OntomicsServer {
         };
 
         std::future::ready(Ok(match result {
-            Ok(value) => CallToolResult::success(vec![
-                Content::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
-            ]),
+            Ok(value) => {
+                let pretty = serde_json::to_string_pretty(&value)
+                    .unwrap_or_default();
+                let text = if pretty.len() > OUTPUT_BUDGET_BYTES {
+                    // Fall back to compact JSON to save ~30% on large output
+                    serde_json::to_string(&value).unwrap_or(pretty)
+                } else {
+                    pretty
+                };
+                CallToolResult::success(vec![Content::text(text)])
+            }
             Err(msg) => CallToolResult::error(vec![Content::text(msg)]),
         }))
     }
@@ -818,7 +874,6 @@ mod tests {
             graph,
             PathBuf::from("/tmp"),
             Arc::new(ontomics::parser::python_parser()),
-            "python".to_string(),
             Vec::new(),
         )
     }
@@ -897,7 +952,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]

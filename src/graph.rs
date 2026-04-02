@@ -359,7 +359,6 @@ impl ConceptGraph {
             signatures: matching_signatures,
             classes: matching_classes,
             call_graph,
-            subconcepts: concept.subconcepts.clone(),
             entities,
         })
     }
