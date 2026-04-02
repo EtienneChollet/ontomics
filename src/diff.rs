@@ -30,7 +30,11 @@ pub fn ontology_diff(
     let base_tree = base_commit.tree()?;
 
     let base_parse_results = parse_git_tree(&repo, &base_tree, repo_root, lang)?;
-    let base_analysis = analyzer::analyze(&base_parse_results, &analyzer::AnalysisParams::default(), language_name)?;
+    let base_analysis = analyzer::analyze(
+        &base_parse_results,
+        &analyzer::AnalysisParams::default(),
+        language_name,
+    )?;
     let base_concepts: HashMap<u64, Concept> = base_analysis
         .concepts
         .into_iter()

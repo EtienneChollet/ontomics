@@ -1,0 +1,95 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## ABSOLUTE RULE — Tests are sacred
+
+**NEVER modify, delete, weaken, skip, or rewrite any test without explicit permission from the user.** This is the single most important rule in this project. No exceptions.
+
+- If a test fails, the implementation is wrong — fix the implementation.
+- Do not change assertions, expected values, or test structure to make a failing test pass.
+- Do not add `#[ignore]`, comment out, or remove failing tests.
+- Do not refactor tests "for clarity" or "consistency" unless explicitly asked.
+- The only time a test may be modified is when the user explicitly says to modify that specific test.
+- Do not widen assertion windows (e.g., top_n thresholds) to absorb implementation regressions.
+- Do not remove expected entities, concepts, or conventions from test expectations.
+- Do not replace specific assertions with weaker structural checks.
+- Do not "update expectations to match reality" — reality must match expectations.
+- Do not relax naming checks, convention checks, or entity lists because the tool produces wrong output.
+- Do not move must-contain items to should-contain or drop them entirely.
+- Failing testbed tests are bugs in `src/`, not bugs in `tests/`.
+- The testbed expectations are the definition of done — they define what ontomics MUST produce.
+- Any change to analysis logic (TF-IDF, stop words, convention detection) that breaks testbed expectations must be fixed in the analysis code until the tests pass, not by weakening the tests.
+- When in doubt: the test is right, the implementation is wrong.
+
+## What this is
+
+ontomics is a Rust MCP server that extracts domain ontologies from codebases (Python, TypeScript, JavaScript, Rust). It parses source files with tree-sitter, clusters related identifiers by embedding similarity, detects naming conventions, and exposes the results as MCP tools. Runs locally with no API keys.
+
+## Build and test
+
+```bash
+cargo build --release          # production binary
+cargo build                    # debug build
+cargo test                     # all tests (~200, inline in each module)
+cargo test --lib config        # tests in a single module
+cargo clippy                   # lint (must pass with zero warnings)
+```
+
+Optional feature flag: `cargo build --features lsp` enables pyright-based LSP enrichment for inheritance chains.
+
+Releases use `cargo-dist` (see `dist-workspace.toml`). CI builds on tag push via `.github/workflows/release.yml`. Targets: macOS (aarch64, x86_64), Linux (x86_64, glibc 2.28+). Distributed via Homebrew, npm (`@ontomics/ontomics`), and shell installer.
+
+## Architecture
+
+The pipeline runs in this order. Each module is a single file under `src/`.
+
+1. **`parser.rs`** — `LanguageParser` trait with implementations for Python, TypeScript, JavaScript, Rust. Uses tree-sitter to walk ASTs and extract `RawIdentifier`, `Signature`, `ClassInfo`, `CallSite`. Parallel file parsing via rayon.
+
+2. **`tokenizer.rs`** — Splits identifiers into subtokens (`spatial_transform` → `["spatial", "transform"]`), handles snake_case, camelCase, ALLCAPS boundaries. Also detects abbreviations.
+
+3. **`analyzer.rs`** — TF-IDF scoring on subtokens to find domain-specific concepts. Builds `Concept` nodes, `Convention` patterns, and `Relationship` edges (co-occurrence, abbreviation). Takes `AnalysisParams` (min_frequency, tfidf_threshold, convention_threshold).
+
+4. **`embeddings.rs`** — `EmbeddingIndex` wrapping fastembed (`BAAI/bge-small-en-v1.5`, local ONNX). Stores concept ID → vector mapping. Used for similarity queries and clustering.
+
+5. **`cluster.rs`** — Agglomerative clustering with average linkage (priority queue, O(N² log N)). Groups concepts by embedding similarity. Assigns `cluster_id` on each `Concept`.
+
+6. **`entity.rs`** — Promotes functions/classes into `Entity` nodes with concept tags and semantic roles. Builds entity-level relationships (Instantiates, InheritsFrom, Uses).
+
+7. **`graph.rs`** — `ConceptGraph` is the central data structure. Holds concepts, relationships, conventions, embeddings, entities, signatures, classes, call_sites. All query methods (query_concept, check_naming, suggest_name, locate_concept, describe_symbol, etc.) live here.
+
+8. **`tools.rs`** — `OntomicsServer` implements `rmcp::ServerHandler`. Maps MCP tool calls to `ConceptGraph` query methods. Supports deferred startup (graph populated in background).
+
+9. **`cache.rs`** — SQLite persistence at `<repo>/.ontomics/index.db`. Auto-invalidation via `ONTOMICS_CACHE_VERSION` (hash of indexing source files, computed in `build.rs`). File watcher (notify) for incremental re-indexing.
+
+10. **`diff.rs`** — `ontology_diff`: parses a base git ref's source tree via git2, re-runs analysis, and diffs concept sets against HEAD.
+
+11. **`domain_pack.rs`** — Export/import of portable YAML domain knowledge (abbreviations, conventions, terms, associations).
+
+12. **`enrichment.rs`** — Background embedding completion. Computes embedding plan (which concepts still need vectors), merges vectors into graph, checks generation staleness.
+
+13. **`config.rs`** — `Config` loaded from `.ontomics/config.toml`. Sections: language, index, analysis, embeddings, cache, resources, conventions, domain_packs.
+
+14. **`types.rs`** — All shared types: `Concept`, `Entity`, `Relationship`, `Convention`, `Occurrence`, `Signature`, `ClassInfo`, `CallSite`, `DomainPack`, query param/result structs.
+
+15. **`lsp.rs`** — Behind `lsp` feature flag. Shells out to pyright for cross-file inheritance resolution.
+
+16. **`main.rs`** — CLI (clap) with subcommands (serve, query, check, suggest, diff, concepts, conventions, describe, locate, briefing, export, entities). Default is `serve` (MCP stdio). Orchestrates the full pipeline: config → parse → analyze → embed → cluster → entity build → graph. Supports deferred embedding (background thread) for fast MCP startup. Parent process watchdog for clean exit.
+
+## Key design decisions
+
+- **`build.rs`** hashes `INDEX_FILES` (entity, analyzer, parser, cache, tokenizer, types) into `ONTOMICS_CACHE_VERSION`. Any change to these files auto-invalidates all caches.
+- **Deferred startup**: In serve mode, graph is built without embeddings first, MCP is available immediately, embeddings complete in background thread.
+- **No `unwrap()` outside tests, no `panic!` in library code.** Error handling uses `anyhow::Result` throughout.
+- **Modules map 1:1 to files** — no `mod.rs` nesting.
+- **Entity IDs use a distinct hash namespace** from concept IDs to prevent collisions.
+- **`serde(default)`** on cached types ensures old caches deserialize gracefully when new fields are added.
+
+## Configuration
+
+Optional `.ontomics/config.toml` in repo root. All fields have sensible defaults. Key knobs:
+- `language`: auto (default), python, typescript, javascript, rust
+- `index.min_frequency`: minimum subtoken frequency (default: 2)
+- `analysis.domain_specificity_threshold`: TF-IDF cutoff (default: 0.3)
+- `embeddings.similarity_threshold`: clustering merge threshold (default: 0.75)
+- `resources.max_threads`: rayon thread cap (default: half CPUs)
