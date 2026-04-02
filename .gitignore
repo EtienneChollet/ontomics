@@ -13,3 +13,9 @@ research/
 todo/
 BENCHMARK_SPEC_A.md
 *.tgz
+rust_out
+testbed_timings.txt
+CONTRIBUTING.md
+DEFINITION_OF_DONE_GUIDE.md
+SPEC_ONTOLOGY_DIFF_TEST.md
+SPEC_TESTBED_QUALITY.md
