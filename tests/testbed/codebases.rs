@@ -35,6 +35,9 @@ macro_rules! testbed_tests {
 
             #[test]
             fn ontology_diff() { universal::run_ontology_diff(&$expectations_fn()); }
+
+            #[test]
+            fn vocabulary_health() { universal::run_vocabulary_health(&$expectations_fn()); }
         }
     };
     ($mod_name:ident, $expectations_fn:ident, #[ignore]) => {
@@ -70,6 +73,9 @@ macro_rules! testbed_tests {
 
             #[test] #[ignore]
             fn ontology_diff() { universal::run_ontology_diff(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn vocabulary_health() { universal::run_vocabulary_health(&$expectations_fn()); }
         }
     };
 }

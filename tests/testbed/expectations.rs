@@ -13,6 +13,13 @@ pub struct NamingCheck {
     pub expected_verdict: &'static str,
     /// If Inconsistent, the suggestion must contain this substring.
     pub suggestion_contains: Option<&'static str>,
+    /// If set, assert confidence >= this value.
+    pub min_confidence: Option<f32>,
+}
+
+/// Vocabulary health expectations.
+pub struct VocabularyHealthCheck {
+    pub min_overall: f32,
 }
 
 /// A single suggest_name check.
@@ -83,6 +90,12 @@ pub struct TestbedExpectations {
 
     // export_domain_pack
     pub min_domain_terms: usize,
+
+    // vocabulary_health
+    pub vocabulary_health_check: Option<VocabularyHealthCheck>,
+
+    // performance ceiling (seconds, release-mode builds)
+    pub max_build_seconds: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,8 +132,12 @@ pub fn voxelmorph_expectations() -> TestbedExpectations {
             },
         ],
         naming_checks: vec![
-            // NOTE: check_naming frequency logic flags many real identifiers
-            // as Inconsistent. Structural checks only for now.
+            NamingCheck {
+                identifier: "n_dims",
+                expected_verdict: "Inconsistent",
+                suggestion_contains: Some("nb_"),
+                min_confidence: Some(0.5),
+            },
         ],
         suggest_name_checks: vec![
             SuggestNameCheck { description: "spatial transformation", must_contain: "transform" },
@@ -161,6 +178,10 @@ pub fn voxelmorph_expectations() -> TestbedExpectations {
             // jacobian_determinant not promoted to entity (low concept tag count)
         ],
         min_domain_terms: 5,
+        vocabulary_health_check: Some(VocabularyHealthCheck {
+            min_overall: 0.3,
+        }),
+        max_build_seconds: 15,
     }
 }
 
@@ -226,6 +247,10 @@ pub fn neurite_expectations() -> TestbedExpectations {
             EntityCheck { name: "upsampling_conv_blocks" },
         ],
         min_domain_terms: 5,
+        vocabulary_health_check: Some(VocabularyHealthCheck {
+            min_overall: 0.3,
+        }),
+        max_build_seconds: 15,
     }
 }
 
@@ -281,6 +306,8 @@ pub fn interseg3d_expectations() -> TestbedExpectations {
             EntityCheck { name: "sample_confusion_coords" },
         ],
         min_domain_terms: 8,
+        vocabulary_health_check: None,
+        max_build_seconds: 30,
     }
 }
 
@@ -329,6 +356,8 @@ pub fn scribbleprompt_expectations() -> TestbedExpectations {
             EntityCheck { name: "click_onehot" },
         ],
         min_domain_terms: 5,
+        vocabulary_health_check: None,
+        max_build_seconds: 30,
     }
 }
 
@@ -377,6 +406,8 @@ pub fn freebrowse_expectations() -> TestbedExpectations {
             // as TS-dominant, so Python files may not be parsed
         ],
         min_domain_terms: 3,
+        vocabulary_health_check: None,
+        max_build_seconds: 30,
     }
 }
 
@@ -423,6 +454,8 @@ pub fn pylot_expectations() -> TestbedExpectations {
             EntityCheck { name: "flatten" },
         ],
         min_domain_terms: 8,
+        vocabulary_health_check: None,
+        max_build_seconds: 30,
     }
 }
 
@@ -496,6 +529,8 @@ pub fn pytorch_expectations() -> TestbedExpectations {
             EntityCheck { name: "MaxPool2d" },
         ],
         min_domain_terms: 20,
+        vocabulary_health_check: None,
+        max_build_seconds: 300,
     }
 }
 
@@ -553,5 +588,7 @@ pub fn pandas_expectations() -> TestbedExpectations {
             EntityCheck { name: "BlockManager" },
         ],
         min_domain_terms: 20,
+        vocabulary_health_check: None,
+        max_build_seconds: 300,
     }
 }

@@ -190,6 +190,23 @@ pub fn run_check_naming(exp: &TestbedExpectations) {
                 );
             }
         }
+
+        // Confidence is always bounded
+        assert!(
+            result.confidence >= 0.0 && result.confidence <= 1.0,
+            "{}: check_naming('{}') confidence {} out of range",
+            exp.name, check.identifier, result.confidence
+        );
+
+        // If min_confidence specified, assert it
+        if let Some(min_conf) = check.min_confidence {
+            assert!(
+                result.confidence >= min_conf,
+                "{}: check_naming('{}') confidence {} below minimum {}",
+                exp.name, check.identifier,
+                result.confidence, min_conf
+            );
+        }
     }
 }
 
@@ -532,4 +549,39 @@ pub fn run_ontology_diff(exp: &TestbedExpectations) {
         "{}: ontology_diff response exceeds {} token limit (~{} tokens)",
         exp.name, MCP_TOKEN_LIMIT, token_estimate
     );
+}
+
+// ── vocabulary_health ─────────────────────────────────────────────────────
+
+pub fn run_vocabulary_health(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    if let Some(ref check) = exp.vocabulary_health_check {
+        let config = ontomics::config::HealthConfig::default();
+        let health = bg.graph.vocabulary_health(&config);
+
+        // All sub-scores bounded
+        assert!(
+            health.convention_coverage >= 0.0
+                && health.convention_coverage <= 1.0
+        );
+        assert!(
+            health.consistency_ratio >= 0.0
+                && health.consistency_ratio <= 1.0
+        );
+        assert!(
+            health.cluster_cohesion >= 0.0
+                && health.cluster_cohesion <= 1.0
+        );
+        assert!(
+            health.overall >= 0.0 && health.overall <= 1.0
+        );
+
+        // Overall meets minimum
+        assert!(
+            health.overall >= check.min_overall,
+            "{}: vocabulary_health overall {} below minimum {}",
+            exp.name, health.overall, check.min_overall
+        );
+    }
 }

@@ -12,8 +12,55 @@ mod testbed {
     use ontomics::parser::{self, ParseOptions};
     use ontomics::types;
     use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::io::Write as _;
     use std::path::Path;
     use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
+
+    /// Recorded timing for one codebase build.
+    struct BuildTiming {
+        name: String,
+        seconds: f64,
+        files: usize,
+        concepts: usize,
+        entities: usize,
+        skipped: bool,
+        skip_path: String,
+    }
+
+    /// Thread-safe cache of build timings, keyed by codebase name.
+    fn timings_cache() -> &'static Mutex<Vec<BuildTiming>> {
+        static CACHE: OnceLock<Mutex<Vec<BuildTiming>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Write all recorded timings to `testbed_timings.txt` in the project root.
+    fn write_timings_file() {
+        let timings = timings_cache().lock().unwrap();
+        if timings.is_empty() {
+            return;
+        }
+
+        let mut buf = String::new();
+        for t in timings.iter() {
+            if t.skipped {
+                let _ = writeln!(buf, "{:<20} SKIP    (not found at {})", t.name, t.skip_path);
+            } else {
+                let _ = writeln!(
+                    buf,
+                    "{:<20} {:>5.1}s {:>5} files {:>5} concepts {:>5} entities",
+                    t.name, t.seconds, t.files, t.concepts, t.entities,
+                );
+            }
+        }
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = Path::new(manifest_dir).join("testbed_timings.txt");
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let _ = f.write_all(buf.as_bytes());
+        }
+    }
 
     /// A built graph plus the parser and language name that produced it.
     #[derive(Clone)]
@@ -35,6 +82,22 @@ mod testbed {
         let repo = Path::new(exp.repo_path);
         if !repo.exists() {
             eprintln!("SKIP: {} not found at {}", exp.name, exp.repo_path);
+            // Record skip in timings (only once per codebase)
+            {
+                let mut timings = timings_cache().lock().unwrap();
+                if !timings.iter().any(|t| t.name == exp.name) {
+                    timings.push(BuildTiming {
+                        name: exp.name.to_string(),
+                        seconds: 0.0,
+                        files: 0,
+                        concepts: 0,
+                        entities: 0,
+                        skipped: true,
+                        skip_path: exp.repo_path.to_string(),
+                    });
+                }
+            }
+            write_timings_file();
             return None;
         }
 
@@ -44,6 +107,7 @@ mod testbed {
         }
 
         eprintln!("Building graph for {} at {}...", exp.name, exp.repo_path);
+        let build_start = Instant::now();
 
         let config = Config::load(repo).unwrap_or_default();
         let (language, _file_count) = Language::detect(repo);
@@ -156,12 +220,41 @@ mod testbed {
             graph.entities.insert(ent.id, ent);
         }
 
+        let build_elapsed = build_start.elapsed();
+        let build_secs = build_elapsed.as_secs_f64();
+
         eprintln!(
-            "  Graph ready: {} concepts, {} entities, {} conventions",
+            "  Graph ready: {} concepts, {} entities, {} conventions ({:.1}s)",
             graph.concepts.len(),
             graph.entities.len(),
-            graph.conventions.len()
+            graph.conventions.len(),
+            build_secs,
         );
+
+        // Record timing
+        {
+            let mut timings = timings_cache().lock().unwrap();
+            timings.push(BuildTiming {
+                name: exp.name.to_string(),
+                seconds: build_secs,
+                files: parse_results.len(),
+                concepts: graph.concepts.len(),
+                entities: graph.entities.len(),
+                skipped: false,
+                skip_path: String::new(),
+            });
+        }
+        write_timings_file();
+
+        // Performance ceiling: only assert when ONTOMICS_ASSERT_PERF is set,
+        // since debug builds are much slower than release.
+        if std::env::var("ONTOMICS_ASSERT_PERF").is_ok() {
+            assert!(
+                build_secs <= exp.max_build_seconds as f64,
+                "{}: build took {:.1}s, exceeds ceiling of {}s",
+                exp.name, build_secs, exp.max_build_seconds,
+            );
+        }
 
         let bg = BuiltGraph {
             graph: Arc::new(graph),

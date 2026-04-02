@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ABSOLUTE RULE — Embeddings must stay enabled
+
+**NEVER disable embeddings** (`embeddings.enabled = false`) in any `.ontomics/config.toml` for any codebase without explicit permission from the user. Embeddings are a core part of the pipeline — disabling them silently degrades concept discovery, clustering, and suggest_name quality.
+
 ## ABSOLUTE RULE — Tests are sacred
 
 **NEVER modify, delete, weaken, skip, or rewrite any test without explicit permission from the user.** This is the single most important rule in this project. No exceptions.
