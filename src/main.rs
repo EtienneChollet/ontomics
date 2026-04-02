@@ -1147,6 +1147,19 @@ async fn run_server(
         // Load domain packs for watcher re-indexing
         let watcher_packs = load_domain_packs(&repo_root, &watcher_config);
 
+        // Wait for the initial build to finish before processing
+        // file events — otherwise the build's own I/O triggers
+        // spurious re-indexes.
+        while !watcher_indexing_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Drain events that arrived during the build.
+            let _ = rx.try_recv();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Drain any remaining events queued during the build.
+        while rx.try_recv().is_ok() {}
+
         eprintln!("File watcher started");
         loop {
             match rx.recv_timeout(Duration::from_secs(2)) {
@@ -1282,6 +1295,10 @@ async fn run_server(
                             continue;
                         }
                     }
+
+                    // Drain events that fired during re-indexing
+                    // (e.g. cache writes) to avoid self-triggered loops.
+                    while rx.try_recv().is_ok() {}
 
                     // Re-embed in the background
                     if watcher_config.embeddings.enabled {
