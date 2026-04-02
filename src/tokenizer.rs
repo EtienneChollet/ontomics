@@ -97,6 +97,50 @@ fn split_camel(s: &str) -> Vec<String> {
     tokens
 }
 
+/// Known language keywords and builtin type names that should not become domain
+/// concepts. Indexed by language name as returned by `Language::name()`.
+pub fn language_stop_words(language: &str) -> &'static [&'static str] {
+    match language {
+        "python" => &[
+            // keywords
+            "and", "as", "assert", "async", "await", "break", "class",
+            "continue", "def", "del", "elif", "else", "except", "finally",
+            "for", "from", "global", "if", "import", "in", "is", "lambda",
+            "nonlocal", "not", "or", "pass", "raise", "return", "try",
+            "while", "with", "yield",
+            // builtin types / constants
+            "int", "float", "str", "bool", "list", "dict", "set", "tuple",
+            "none", "true", "false", "bytes", "complex", "object", "type",
+            // common framework tokens that leak into identifiers
+            "self", "cls", "super",
+        ],
+        "typescript" | "javascript" => &[
+            "const", "let", "var", "function", "class", "if", "else",
+            "for", "while", "do", "switch", "case", "break", "continue",
+            "return", "try", "catch", "finally", "throw", "new", "this",
+            "typeof", "instanceof", "void", "delete", "in", "of",
+            "import", "export", "default", "from", "as", "async", "await",
+            // builtin types
+            "string", "number", "boolean", "null", "undefined", "object",
+            "any", "never", "unknown", "symbol", "bigint",
+            "array", "promise", "map", "set",
+        ],
+        "rust" => &[
+            "fn", "let", "mut", "const", "static", "struct", "enum",
+            "impl", "trait", "type", "pub", "crate", "mod", "use",
+            "self", "super", "where", "for", "in", "if", "else",
+            "match", "loop", "while", "break", "continue", "return",
+            "async", "await", "move", "ref", "unsafe",
+            // builtin types
+            "bool", "char", "str", "string", "i8", "i16", "i32", "i64",
+            "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+            "f32", "f64", "vec", "box", "option", "result", "some",
+            "none", "ok", "err",
+        ],
+        _ => &[],
+    }
+}
+
 /// Find whether `short` is likely an abbreviation of one of the `candidates`.
 ///
 /// Matching strategy (in priority order):

@@ -490,9 +490,12 @@ impl ConceptGraph {
                 .collect()
         };
 
-        // If a related identifier has strictly higher frequency, suggest it
+        // If a related identifier has strictly higher frequency, suggest it.
+        // Only flag Inconsistent when the input was observed in the corpus.
+        // Zero-occurrence identifiers are Unknown (not seen), not Inconsistent
+        // (seen but less common than an alternative).
         if let Some((best_name, best_freq)) = related_ids.first() {
-            if *best_freq > input_freq {
+            if input_freq > 0 && *best_freq > input_freq {
                 return NamingCheckResult {
                     input: identifier.to_string(),
                     subtokens,

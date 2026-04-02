@@ -19,6 +19,7 @@ pub struct OntomicsServer {
     graph: Arc<RwLock<ConceptGraph>>,
     repo_root: PathBuf,
     parser: Arc<dyn LanguageParser>,
+    language_name: String,
     warnings: Arc<Mutex<Vec<String>>>,
     indexing_ready: Arc<AtomicBool>,
 }
@@ -28,12 +29,14 @@ impl OntomicsServer {
         graph: ConceptGraph,
         repo_root: PathBuf,
         parser: Arc<dyn LanguageParser>,
+        language_name: String,
         warnings: Vec<String>,
     ) -> Self {
         Self {
             graph: Arc::new(RwLock::new(graph)),
             repo_root,
             parser,
+            language_name,
             warnings: Arc::new(Mutex::new(warnings)),
             indexing_ready: Arc::new(AtomicBool::new(true)),
         }
@@ -45,6 +48,7 @@ impl OntomicsServer {
         graph: Arc<RwLock<ConceptGraph>>,
         repo_root: PathBuf,
         parser: Arc<dyn LanguageParser>,
+        language_name: String,
         warnings: Arc<Mutex<Vec<String>>>,
         indexing_ready: Arc<AtomicBool>,
     ) -> Self {
@@ -52,6 +56,7 @@ impl OntomicsServer {
             graph,
             repo_root,
             parser,
+            language_name,
             warnings,
             indexing_ready,
         }
@@ -146,6 +151,7 @@ impl OntomicsServer {
             since,
             &graph.concepts,
             &*self.parser,
+            &self.language_name,
         )
         .map_err(|e| format!("ontology_diff failed: {e}"))?;
 
@@ -731,6 +737,7 @@ mod tests {
             graph,
             PathBuf::from("/tmp"),
             Arc::new(ontomics::parser::python_parser()),
+            "python".to_string(),
             Vec::new(),
         )
     }

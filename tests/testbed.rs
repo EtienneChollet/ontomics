@@ -72,9 +72,13 @@ mod testbed {
             min_frequency: config.index.min_frequency,
             tfidf_threshold: config.analysis.domain_specificity_threshold,
             convention_threshold: config.analysis.convention_threshold,
+            domain_specificity_threshold: config
+                .analysis
+                .domain_specificity_threshold,
         };
-        let analysis = analyzer::analyze(&parse_results, &analysis_params)
-            .expect("analysis failed");
+        let analysis =
+            analyzer::analyze(&parse_results, &analysis_params, language.name())
+                .expect("analysis failed");
         eprintln!(
             "  Found {} concepts, {} conventions",
             analysis.concepts.len(),

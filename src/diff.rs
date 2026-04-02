@@ -16,6 +16,7 @@ pub fn ontology_diff(
     base_ref: &str,
     current_concepts: &HashMap<u64, Concept>,
     lang: &dyn LanguageParser,
+    language_name: &str,
 ) -> Result<OntologyDiff> {
     let repo = git2::Repository::open(repo_root)
         .context("failed to open git repository")?;
@@ -29,7 +30,7 @@ pub fn ontology_diff(
     let base_tree = base_commit.tree()?;
 
     let base_parse_results = parse_git_tree(&repo, &base_tree, repo_root, lang)?;
-    let base_analysis = analyzer::analyze(&base_parse_results, &analyzer::AnalysisParams::default())?;
+    let base_analysis = analyzer::analyze(&base_parse_results, &analyzer::AnalysisParams::default(), language_name)?;
     let base_concepts: HashMap<u64, Concept> = base_analysis
         .concepts
         .into_iter()
@@ -275,14 +276,14 @@ def spatial_transform(vol, trf):
             &dir.join("module.py"),
         )
         .unwrap();
-        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
+        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default(), "python").unwrap();
         let current: HashMap<u64, Concept> = analysis
             .concepts
             .into_iter()
             .map(|c| (c.id, c))
             .collect();
 
-        let diff = ontology_diff(&dir, "HEAD", &current, &parser::PythonParser).unwrap();
+        let diff = ontology_diff(&dir, "HEAD", &current, &parser::PythonParser, "python").unwrap();
         assert!(diff.added_concepts.is_empty());
         assert!(diff.removed_concepts.is_empty());
         assert!(diff.changed_concepts.is_empty());
@@ -322,14 +323,14 @@ def compute_displacement(source, target):
             &dir.join("module.py"),
         )
         .unwrap();
-        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
+        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default(), "python").unwrap();
         let current: HashMap<u64, Concept> = analysis
             .concepts
             .into_iter()
             .map(|c| (c.id, c))
             .collect();
 
-        let diff = ontology_diff(&dir, "HEAD~1", &current, &parser::PythonParser).unwrap();
+        let diff = ontology_diff(&dir, "HEAD~1", &current, &parser::PythonParser, "python").unwrap();
 
         // "displacement" should be added (appears in HEAD but not in base)
         let added_names: Vec<&str> = diff
@@ -381,14 +382,14 @@ def spatial_transform(vol, trf):
             &dir.join("module.py"),
         )
         .unwrap();
-        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default()).unwrap();
+        let analysis = analyzer::analyze(&[parse_results], &analyzer::AnalysisParams::default(), "python").unwrap();
         let current: HashMap<u64, Concept> = analysis
             .concepts
             .into_iter()
             .map(|c| (c.id, c))
             .collect();
 
-        let diff = ontology_diff(&dir, "HEAD~1", &current, &parser::PythonParser).unwrap();
+        let diff = ontology_diff(&dir, "HEAD~1", &current, &parser::PythonParser, "python").unwrap();
 
         let removed_names: Vec<&str> = diff
             .removed_concepts
@@ -409,7 +410,7 @@ def spatial_transform(vol, trf):
         let (dir, _repo) =
             make_test_repo("invalid_ref", &[("module.py", base_py)]);
 
-        let result = ontology_diff(&dir, "nonexistent_ref", &HashMap::new(), &parser::PythonParser);
+        let result = ontology_diff(&dir, "nonexistent_ref", &HashMap::new(), &parser::PythonParser, "python");
         assert!(result.is_err());
 
         fs::remove_dir_all(&dir).unwrap();

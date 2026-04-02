@@ -244,9 +244,10 @@ fn build_graph(
         min_frequency: config.index.min_frequency,
         tfidf_threshold: config.analysis.domain_specificity_threshold,
         convention_threshold: config.analysis.convention_threshold,
+        domain_specificity_threshold: config.analysis.domain_specificity_threshold,
     };
     let mut analysis =
-        analyzer::analyze(&parse_results, &analysis_params)?;
+        analyzer::analyze(&parse_results, &analysis_params, language_name)?;
 
     // Merge bootstrap conventions from config (if any)
     for conv_cfg in &config.conventions {
@@ -761,7 +762,7 @@ async fn main() -> anyhow::Result<()> {
                     cmd_suggest(&result.graph, &description)
                 }
                 Command::Diff { since } => {
-                    cmd_diff(&cli.repo, &result.graph, &since, &*active_parser)
+                    cmd_diff(&cli.repo, &result.graph, &since, &*active_parser, &lang_name)
                 }
                 Command::Concepts { top_k } => {
                     cmd_concepts(&result.graph, top_k)
@@ -826,8 +827,9 @@ fn cmd_diff(
     graph: &graph::ConceptGraph,
     since: &str,
     lang: &dyn parser::LanguageParser,
+    language_name: &str,
 ) -> anyhow::Result<()> {
-    let result = diff::ontology_diff(repo, since, &graph.concepts, lang)?;
+    let result = diff::ontology_diff(repo, since, &graph.concepts, lang, language_name)?;
     print_json(&result);
     Ok(())
 }
@@ -1018,6 +1020,7 @@ async fn run_server(
         Arc::clone(&graph_handle),
         repo.to_path_buf(),
         Arc::clone(&active_parser),
+        language_name.clone(),
         Arc::clone(&warnings),
         Arc::clone(&indexing_ready),
     );
@@ -1155,10 +1158,14 @@ async fn run_server(
                         convention_threshold: watcher_config
                             .analysis
                             .convention_threshold,
+                        domain_specificity_threshold: watcher_config
+                            .analysis
+                            .domain_specificity_threshold,
                     };
                     let mut analysis = match analyzer::analyze(
                         &parse_results,
                         &analysis_params,
+                        &watcher_language_name,
                     ) {
                         Ok(a) => a,
                         Err(e) => {
