@@ -82,15 +82,23 @@ Python, TypeScript, JavaScript, Rust. Auto-detected from file extensions.
 | Tool | What it does |
 |------|--------------|
 | `query_concept` | Find all variants, related concepts, and occurrences of a term |
-| `check_naming` | Check an identifier against project conventions; suggests the canonical form |
-| `suggest_name` | Generate an identifier name that fits the project's vocabulary |
-| `list_concepts` | List the top domain concepts by frequency |
-| `list_conventions` | List all detected naming patterns (prefixes, suffixes, conversions) |
 | `locate_concept` | Find the key signatures, classes, and files for a concept |
 | `describe_symbol` | Get the signature, docstring, and relationships for a function or class |
-| `list_entities` | List code entities (classes, functions) of a given kind |
+| `trace_concept` | Trace how a concept flows through the codebase via call chains |
+| `list_concepts` | List the top domain concepts by frequency |
+| `list_conventions` | List all detected naming patterns (prefixes, suffixes, conversions) |
+| `list_entities` | List code entities (classes, functions) filtered by concept, role, or kind |
+| `check_naming` | Check an identifier against project conventions; suggests the canonical form |
+| `suggest_name` | Generate an identifier name that fits the project's vocabulary |
+| `vocabulary_health` | Measure convention coverage, naming consistency, and cluster cohesion |
 | `ontology_diff` | Show new, changed, or removed domain concepts since a git ref |
 | `export_domain_pack` | Export domain knowledge as portable YAML for use in other repos |
+
+### Resources
+
+| Resource | What it does |
+|----------|--------------|
+| `ontomics://briefing` | Session briefing: top conventions, abbreviations, key concepts, contrastive pairs, and vocabulary warnings. Also available via `ontomics briefing` CLI. |
 
 ## How it works
 
