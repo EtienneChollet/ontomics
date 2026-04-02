@@ -292,6 +292,36 @@ impl OntomicsServer {
         serde_json::to_value(results)
             .map_err(|e| format!("serialization error: {e}"))
     }
+
+    fn handle_trace_concept(
+        &self,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let concept = args
+            .get("concept")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required argument 'concept'")?;
+        let max_depth = args
+            .get("max_depth")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(5);
+
+        let graph = self
+            .graph
+            .read()
+            .map_err(|e| format!("lock error: {e}"))?;
+        match graph.trace_concept(concept, max_depth) {
+            Some(result) => serde_json::to_value(result)
+                .map_err(|e| format!("serialization error: {e}")),
+            None => Ok(json!({
+                "error": "not_found",
+                "message": format!(
+                    "no concept matching '{concept}'"
+                ),
+            })),
+        }
+    }
 }
 
 fn tool_schema(
@@ -512,6 +542,32 @@ fn tool_definitions() -> Vec<Tool> {
              uncovered identifiers.",
             tool_schema(json!({}), &[]),
         ),
+        Tool::new(
+            "trace_concept",
+            "Trace how a domain concept flows through the codebase \
+             via function call chains — shows which functions produce \
+             the concept, which consume it, and the call path between \
+             them including bridge functions on the path. Returns an \
+             ordered call chain with file locations and producer/ \
+             consumer roles. Use when asked 'how does concept X \
+             propagate', 'what calls what for X', or 'trace X through \
+             the code'.",
+            tool_schema(
+                json!({
+                    "concept": {
+                        "type": "string",
+                        "description": "The concept to trace \
+                            (e.g. 'transform')",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum call chain depth \
+                            (default: 5)",
+                    }
+                }),
+                &["concept"],
+            ),
+        ),
     ]
 }
 
@@ -544,6 +600,7 @@ impl ServerHandler for OntomicsServer {
                  - \"what naming conventions\" / \"what style\" → list_conventions\n\
                  - \"is this name right\" → check_naming\n\
                  - \"what should I call this\" → suggest_name\n\
+                 - \"how does X flow\" / \"trace X\" / \"call chain for X\" → trace_concept\n\
                  \n\
                  Fall back to file reading ONLY when ontomics returns insufficient detail."
                     .to_string(),
@@ -603,6 +660,7 @@ impl ServerHandler for OntomicsServer {
             "list_entities" => self.handle_list_entities(&args),
             "export_domain_pack" => self.handle_export_domain_pack(&args),
             "vocabulary_health" => self.handle_vocabulary_health(&args),
+            "trace_concept" => self.handle_trace_concept(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 

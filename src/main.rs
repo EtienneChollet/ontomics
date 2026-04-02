@@ -106,6 +106,14 @@ enum Command {
         /// Concept to locate (e.g. "transform")
         term: String,
     },
+    /// Trace how a concept flows through the codebase call graph
+    Trace {
+        /// Concept to trace (e.g. "transform")
+        concept: String,
+        /// Maximum call chain depth
+        #[arg(long, default_value = "5")]
+        max_depth: usize,
+    },
     /// Print session briefing (conventions, abbreviations, warnings)
     Briefing,
     /// Export domain knowledge as a portable YAML pack
@@ -771,6 +779,9 @@ async fn main() -> anyhow::Result<()> {
                     cmd_describe(&result.graph, &name)
                 }
                 Command::Locate { term } => cmd_locate(&result.graph, &term),
+                Command::Trace { concept, max_depth } => {
+                    cmd_trace(&result.graph, &concept, max_depth)
+                }
                 Command::Briefing => cmd_briefing(&result.graph),
                 Command::Export { output } => {
                     cmd_export(&result.graph, output.as_deref())
@@ -882,6 +893,21 @@ fn cmd_locate(
         Some(result) => print_json(&result),
         None => {
             eprintln!("No concept matching '{term}'");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_trace(
+    graph: &graph::ConceptGraph,
+    concept: &str,
+    max_depth: usize,
+) -> anyhow::Result<()> {
+    match graph.trace_concept(concept, max_depth) {
+        Some(result) => print_json(&result),
+        None => {
+            eprintln!("No concept matching '{concept}'");
             std::process::exit(1);
         }
     }
