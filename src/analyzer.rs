@@ -1,4 +1,4 @@
-use crate::tokenizer::{language_stop_words, split_identifier};
+use crate::tokenizer::split_identifier;
 use crate::types::*;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -25,10 +25,7 @@ struct Corpus {
     nb_files: usize,
 }
 
-fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
-    let stop_words: HashSet<&str> =
-        language_stop_words(language).iter().copied().collect();
-
+fn build_corpus(parse_results: &[ParseResult]) -> Corpus {
     let mut subtoken_file_counts: HashMap<String, HashMap<PathBuf, usize>> =
         HashMap::new();
     let mut subtoken_total_counts: HashMap<String, usize> = HashMap::new();
@@ -44,10 +41,6 @@ fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
             let subtokens = split_identifier(&ident.name);
 
             for st in &subtokens {
-                if stop_words.contains(st.as_str()) {
-                    continue;
-                }
-
                 *subtoken_file_counts
                     .entry(st.clone())
                     .or_default()
@@ -126,10 +119,7 @@ fn build_concepts(
     tfidf_scores: &HashMap<String, f64>,
     min_frequency: usize,
     tfidf_threshold: f64,
-    domain_specificity_threshold: f64,
 ) -> Vec<Concept> {
-    let max_score = tfidf_scores.values().copied().fold(0.0_f64, f64::max);
-
     let mut concepts = Vec::new();
 
     for (subtoken, total_count) in &corpus.subtoken_total_counts {
@@ -140,13 +130,6 @@ fn build_concepts(
         let score = tfidf_scores.get(subtoken).copied().unwrap_or(0.0);
         if score < tfidf_threshold {
             continue;
-        }
-
-        if domain_specificity_threshold > 0.0 && max_score > 0.0 {
-            let normalized = score / max_score;
-            if normalized < domain_specificity_threshold {
-                continue;
-            }
         }
 
         let canonical = subtoken.to_lowercase();
@@ -202,9 +185,11 @@ fn detect_conventions(
         &all_identifiers,
         convention_threshold,
     ));
+    // Higher threshold for camelCase conventions to avoid false positives
+    // in Python codebases that happen to have a few camelCase names
     conventions.extend(detect_camelcase_prefix_conventions(
         &all_identifiers,
-        convention_threshold,
+        convention_threshold.max(5),
     ));
     conventions.extend(detect_special_suffix_conventions(
         &all_identifiers,
@@ -599,7 +584,6 @@ pub struct AnalysisParams {
     pub min_frequency: usize,
     pub tfidf_threshold: f64,
     pub convention_threshold: usize,
-    pub domain_specificity_threshold: f64,
 }
 
 impl Default for AnalysisParams {
@@ -608,31 +592,28 @@ impl Default for AnalysisParams {
             min_frequency: 2,
             tfidf_threshold: 0.1,
             convention_threshold: 3,
-            domain_specificity_threshold: 0.0,
         }
     }
 }
 
 /// Run full analysis pipeline on parsed identifiers.
 ///
-/// 1. Aggregate subtokens across all files (stop words for `language` filtered)
+/// 1. Aggregate subtokens across all files
 /// 2. TF-IDF to distinguish domain terms from generic terms
-/// 3. Build concepts from high-TF-IDF subtokens above domain specificity threshold
+/// 3. Build concepts from high-TF-IDF subtokens
 /// 4. Detect prefix/suffix/conversion naming conventions
 /// 5. Build co-occurrence weights from shared identifiers
 pub fn analyze(
     parse_results: &[ParseResult],
     params: &AnalysisParams,
-    language: &str,
 ) -> Result<AnalysisResult> {
-    let corpus = build_corpus(parse_results, language);
+    let corpus = build_corpus(parse_results);
     let tfidf_scores = compute_tfidf(&corpus);
     let concepts = build_concepts(
         &corpus,
         &tfidf_scores,
         params.min_frequency,
         params.tfidf_threshold,
-        params.domain_specificity_threshold,
     );
     let conventions =
         detect_conventions(parse_results, params.convention_threshold);
@@ -701,7 +682,7 @@ mod tests {
             ("apply_transform", EntityType::Function),
             ("transform_layer", EntityType::Class),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(
             result.concepts.iter().any(|c| c.canonical == "transform")
         );
@@ -715,7 +696,7 @@ mod tests {
             ("nb_steps", EntityType::Parameter),
             ("nb_dims", EntityType::Parameter),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(result.conventions.iter().any(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "nb_")
         }));
@@ -728,7 +709,7 @@ mod tests {
             ("params_to_affine", EntityType::Function),
             ("seg_to_mask", EntityType::Function),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(result.conventions.iter().any(|c| {
             matches!(&c.pattern, PatternKind::Conversion(p) if p == "_to_")
         }));
@@ -740,7 +721,7 @@ mod tests {
             ("nb_features", EntityType::Parameter),
             ("nb_bins", EntityType::Parameter),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(!result.conventions.iter().any(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "nb_")
         }));
@@ -754,7 +735,7 @@ mod tests {
             ("spatial_transform", EntityType::Function),
             ("apply_transform", EntityType::Function),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         assert!(
             !result.concepts.iter().any(|c| c.canonical == "unique")
         );
@@ -771,7 +752,7 @@ mod tests {
             ("spatial_transform", EntityType::Function),
             ("apply_transform", EntityType::Function),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
 
         let spatial = result
             .concepts
@@ -804,7 +785,7 @@ mod tests {
             ("vx_data", EntityType::Variable),
             ("vx_size", EntityType::Variable),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "vx_")
         });
@@ -819,7 +800,7 @@ mod tests {
             ("output_vol", EntityType::Variable),
             ("target_vol", EntityType::Variable),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Suffix(s) if s == "_vol")
         });
@@ -834,7 +815,7 @@ mod tests {
             ("roi_mask", EntityType::Variable),
             ("seg_mask", EntityType::Variable),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Suffix(s) if s == "_mask")
         });
@@ -844,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let result = analyze(&[], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[], &AnalysisParams::default()).unwrap();
         assert!(result.concepts.is_empty());
         assert!(result.conventions.is_empty());
         assert!(result.co_occurrence_matrix.is_empty());
@@ -869,7 +850,7 @@ mod tests {
             ("useEffect", EntityType::Function),
             ("useMemo", EntityType::Function),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "use")
         });
@@ -886,7 +867,7 @@ mod tests {
             ("handleInput", EntityType::Function),
             ("handleBlur", EntityType::Function),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "handle")
         });
@@ -906,7 +887,7 @@ mod tests {
             ("onBlur", EntityType::Variable),
             ("onFocus", EntityType::Variable),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "on")
         });
@@ -921,7 +902,7 @@ mod tests {
             ("useRouter", EntityType::Function),
             // Only 2 — below default threshold of 3
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "use")
         });
@@ -935,7 +916,7 @@ mod tests {
             ("data$", EntityType::Variable),
             ("click$", EntityType::Variable),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Suffix(s) if s == "$")
         });
@@ -950,7 +931,7 @@ mod tests {
             ("IConfig", EntityType::Class),
             ("IService", EntityType::Class),
         ]);
-        let result = analyze(&[pr], &AnalysisParams::default(), "").unwrap();
+        let result = analyze(&[pr], &AnalysisParams::default()).unwrap();
         let conv = result.conventions.iter().find(|c| {
             matches!(&c.pattern, PatternKind::Prefix(p) if p == "I")
         });

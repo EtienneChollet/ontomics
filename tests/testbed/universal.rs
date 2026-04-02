@@ -445,7 +445,6 @@ pub fn run_ontology_diff(exp: &TestbedExpectations) {
         base_ref,
         &bg.graph.concepts,
         &*bg.parser,
-        bg.language_name,
     );
 
     // Handle gracefully: some repos may not have 3 commits
