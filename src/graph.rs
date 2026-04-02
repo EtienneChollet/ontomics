@@ -3958,4 +3958,348 @@ mod tests {
             "nonexistent concept should return None"
         );
     }
+
+    #[test]
+    fn test_trace_concept_no_call_sites__orphan_seeds__appear_in_chain_with_empty_edges() {
+        /// Entities tagged with the concept but present in zero call_sites must
+        /// surface as orphan seeds in `call_chain` while `edges` stays empty.
+        ///
+        /// Parameters
+        /// ----------
+        /// None — self-contained fixture.
+        ///
+        /// Expected
+        /// --------
+        /// `call_chain` contains both entities; `edges` is empty; `producers`
+        /// and `consumers` are non-empty (each entity falls into `Both` because
+        /// neither has a signature that matches the concept subtokens exactly).
+        let concept = make_concept(1, "loss", &["dice_loss", "ncc_loss"]);
+        let entities = vec![
+            Entity {
+                id: 20,
+                name: "dice_loss".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "loss".to_string(),
+                file: PathBuf::from("losses.py"),
+                line: 1,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 21,
+                name: "ncc_loss".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "loss".to_string(),
+                file: PathBuf::from("losses.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+        let analysis = AnalysisResult {
+            concepts: vec![concept],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(), // zero call sites
+        };
+        let graph = ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let trace = graph
+            .trace_concept("loss", 5)
+            .expect("concept exists — must return Some");
+
+        let chain_names: Vec<&str> = trace
+            .call_chain
+            .iter()
+            .map(|n| n.entity_name.as_str())
+            .collect();
+        assert!(
+            chain_names.contains(&"dice_loss"),
+            "dice_loss must appear as orphan seed in call_chain"
+        );
+        assert!(
+            chain_names.contains(&"ncc_loss"),
+            "ncc_loss must appear as orphan seed in call_chain"
+        );
+        assert!(
+            trace.edges.is_empty(),
+            "no call_sites means edges must be empty"
+        );
+        // Both entities have no signature, so they fall to TraceRole::Both —
+        // they count as both producers AND consumers.
+        assert!(
+            !trace.producers.is_empty(),
+            "producers must be non-empty even without call_sites"
+        );
+        assert!(
+            !trace.consumers.is_empty(),
+            "consumers must be non-empty even without call_sites"
+        );
+    }
+
+    #[test]
+    fn test_trace_concept_cyclic_calls__toposort_fallback__all_nodes_in_chain() {
+        /// A→B→C→A forms a cycle that breaks toposort. The BFS fallback must
+        /// include all three concept-tagged entities in `call_chain`.
+        ///
+        /// Parameters
+        /// ----------
+        /// None — self-contained fixture.
+        ///
+        /// Expected
+        /// --------
+        /// `call_chain` contains all three entity names; no panic from the
+        /// toposort failure path.
+        let concept = make_concept(
+            1,
+            "segment",
+            &["seg_a", "seg_b", "seg_c"],
+        );
+        let entities = vec![
+            Entity {
+                id: 30,
+                name: "seg_a".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "segment".to_string(),
+                file: PathBuf::from("seg.py"),
+                line: 1,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 31,
+                name: "seg_b".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "segment".to_string(),
+                file: PathBuf::from("seg.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 32,
+                name: "seg_c".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "segment".to_string(),
+                file: PathBuf::from("seg.py"),
+                line: 20,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+        // A→B→C→A cycle
+        let call_sites = vec![
+            CallSite {
+                caller_scope: Some("seg_a".to_string()),
+                callee: "seg_b".to_string(),
+                file: PathBuf::from("seg.py"),
+                line: 5,
+            },
+            CallSite {
+                caller_scope: Some("seg_b".to_string()),
+                callee: "seg_c".to_string(),
+                file: PathBuf::from("seg.py"),
+                line: 15,
+            },
+            CallSite {
+                caller_scope: Some("seg_c".to_string()),
+                callee: "seg_a".to_string(),
+                file: PathBuf::from("seg.py"),
+                line: 25,
+            },
+        ];
+        let analysis = AnalysisResult {
+            concepts: vec![concept],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites,
+        };
+        let graph = ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let trace = graph
+            .trace_concept("segment", 5)
+            .expect("concept exists — must return Some");
+
+        let chain_names: Vec<&str> = trace
+            .call_chain
+            .iter()
+            .map(|n| n.entity_name.as_str())
+            .collect();
+        assert!(
+            chain_names.contains(&"seg_a"),
+            "seg_a must be in call_chain after cycle fallback"
+        );
+        assert!(
+            chain_names.contains(&"seg_b"),
+            "seg_b must be in call_chain after cycle fallback"
+        );
+        assert!(
+            chain_names.contains(&"seg_c"),
+            "seg_c must be in call_chain after cycle fallback"
+        );
+    }
+
+    #[test]
+    fn test_trace_concept_producer_consumer_classification__roles_match_signature() {
+        /// Verifies that TraceRole assignment follows signature shape:
+        /// - return_type contains concept subtoken → Producer
+        /// - param name/type contains concept subtoken → Consumer
+        /// - both match → Both
+        ///
+        /// Parameters
+        /// ----------
+        /// None — self-contained fixture.
+        ///
+        /// Expected
+        /// --------
+        /// `make_vol` has role Producer; `apply_vol` has role Consumer;
+        /// `process_vol` has role Both.
+        let concept = make_concept(1, "vol", &["make_vol", "apply_vol", "process_vol"]);
+        // Signatures placed at indices 0, 1, 2 in the analysis vector.
+        let sigs = vec![
+            Signature {
+                // sig index 0: returns "Vol" → Producer
+                name: "make_vol".to_string(),
+                params: Vec::new(),
+                return_type: Some("Vol".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("vol.py"),
+                line: 1,
+                scope: None,
+            },
+            Signature {
+                // sig index 1: param type "Vol" → Consumer
+                name: "apply_vol".to_string(),
+                params: vec![Param {
+                    name: "src".to_string(),
+                    type_annotation: Some("Vol".to_string()),
+                    default: None,
+                }],
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("vol.py"),
+                line: 10,
+                scope: None,
+            },
+            Signature {
+                // sig index 2: returns "Vol" AND param named "vol" → Both
+                name: "process_vol".to_string(),
+                params: vec![Param {
+                    name: "vol".to_string(),
+                    type_annotation: None,
+                    default: None,
+                }],
+                return_type: Some("Vol".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("vol.py"),
+                line: 20,
+                scope: None,
+            },
+        ];
+        let entities = vec![
+            Entity {
+                id: 40,
+                name: "make_vol".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "vol".to_string(),
+                file: PathBuf::from("vol.py"),
+                line: 1,
+                signature_idx: Some(0),
+                class_info_idx: None,
+            },
+            Entity {
+                id: 41,
+                name: "apply_vol".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "vol".to_string(),
+                file: PathBuf::from("vol.py"),
+                line: 10,
+                signature_idx: Some(1),
+                class_info_idx: None,
+            },
+            Entity {
+                id: 42,
+                name: "process_vol".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "vol".to_string(),
+                file: PathBuf::from("vol.py"),
+                line: 20,
+                signature_idx: Some(2),
+                class_info_idx: None,
+            },
+        ];
+        let analysis = AnalysisResult {
+            concepts: vec![concept],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: sigs,
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let graph = ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let trace = graph
+            .trace_concept("vol", 5)
+            .expect("concept exists — must return Some");
+
+        let role_of = |name: &str| -> TraceRole {
+            trace
+                .call_chain
+                .iter()
+                .find(|n| n.entity_name == name)
+                .unwrap_or_else(|| panic!("{name} must be in call_chain"))
+                .role
+                .clone()
+        };
+
+        assert_eq!(
+            role_of("make_vol"),
+            TraceRole::Producer,
+            "make_vol returns Vol → Producer"
+        );
+        assert_eq!(
+            role_of("apply_vol"),
+            TraceRole::Consumer,
+            "apply_vol takes Vol param → Consumer"
+        );
+        assert_eq!(
+            role_of("process_vol"),
+            TraceRole::Both,
+            "process_vol returns Vol AND takes vol param → Both"
+        );
+    }
+
 }
