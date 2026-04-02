@@ -3,14 +3,16 @@ use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::config::HealthConfig;
 use crate::types::{
     AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
-    Convention, DescribeSymbolResult, Entity, InconsistencyPair,
-    LocateConceptResult, NameSuggestion, NamingCheckResult, PatternKind,
-    QueryConceptParams, RelatedConcept, Relationship, RelationshipKind,
-    SessionBriefing, Signature, Subconcept, SymbolKind, Verdict,
-    VocabularyHealth,
+    ConceptTrace, Convention, DescribeSymbolResult, Entity,
+    InconsistencyPair, LocateConceptResult, NameSuggestion,
+    NamingCheckResult, PatternKind, QueryConceptParams,
+    RelatedConcept, Relationship, RelationshipKind,
+    SessionBriefing, Signature, Subconcept, SymbolKind,
+    TraceEdge, TraceNode, TraceRole, Verdict, VocabularyHealth,
 };
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -2366,6 +2368,423 @@ impl ConceptGraph {
         uncovered.truncate(limit);
         uncovered.into_iter().map(|(id, _)| id).collect()
     }
+
+    /// Trace a concept through the call graph, showing which
+    /// entities produce it, consume it, and bridge between them.
+    pub fn trace_concept(
+        &self,
+        concept_name: &str,
+        max_depth: usize,
+    ) -> Option<ConceptTrace> {
+        use petgraph::graph::{DiGraph, NodeIndex};
+        use std::collections::VecDeque;
+
+        let term_lower = concept_name.to_lowercase();
+        let subtokens = split_identifier(concept_name);
+
+        // 1. Resolve concept (same matching as query_concept)
+        let concept = self
+            .concepts
+            .values()
+            .find(|c| c.canonical == term_lower)
+            .or_else(|| {
+                subtokens.iter().find_map(|st| {
+                    self.concepts
+                        .values()
+                        .find(|c| c.canonical == *st)
+                })
+            })
+            .or_else(|| {
+                self.concepts.values().find(|c| {
+                    c.occurrences.iter().any(|o| {
+                        o.identifier
+                            .to_lowercase()
+                            .contains(&term_lower)
+                    })
+                })
+            })?;
+
+        // 2. Find seed entities tagged with this concept
+        let seed_ids: HashSet<u64> = self
+            .entities
+            .values()
+            .filter(|e| e.concept_tags.contains(&concept.id))
+            .map(|e| e.id)
+            .collect();
+
+        if seed_ids.is_empty() {
+            return Some(ConceptTrace {
+                concept: concept.canonical.clone(),
+                producers: Vec::new(),
+                consumers: Vec::new(),
+                call_chain: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+
+        // 3. Classify seeds as producer/consumer/both
+        let classify =
+            |entity: &Entity| -> TraceRole {
+                let sig = entity
+                    .signature_idx
+                    .and_then(|i| self.signatures.get(i));
+                let Some(sig) = sig else {
+                    return TraceRole::Both;
+                };
+                let subs = &concept.subtokens;
+                let is_producer = sig
+                    .return_type
+                    .as_ref()
+                    .map(|rt| {
+                        let rt_lower = rt.to_lowercase();
+                        subs.iter().any(|s| {
+                            rt_lower.contains(&s.to_lowercase())
+                        })
+                    })
+                    .unwrap_or(false);
+                let is_consumer = sig.params.iter().any(|p| {
+                    let name_lower = p.name.to_lowercase();
+                    let type_lower = p
+                        .type_annotation
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    subs.iter().any(|s| {
+                        let s_lower = s.to_lowercase();
+                        name_lower.contains(&s_lower)
+                            || type_lower.contains(&s_lower)
+                    })
+                });
+                match (is_producer, is_consumer) {
+                    (true, true) => TraceRole::Both,
+                    (true, false) => TraceRole::Producer,
+                    (false, true) => TraceRole::Consumer,
+                    (false, false) => TraceRole::Both,
+                }
+            };
+
+        let mut seed_roles: HashMap<u64, TraceRole> = HashMap::new();
+        for &sid in &seed_ids {
+            if let Some(e) = self.entities.get(&sid) {
+                seed_roles.insert(sid, classify(e));
+            }
+        }
+
+        // 4. Build petgraph DiGraph from call sites
+        let mut call_graph: DiGraph<String, ()> = DiGraph::new();
+        let mut node_map: HashMap<String, NodeIndex> =
+            HashMap::new();
+
+        let ensure_node =
+            |g: &mut DiGraph<String, ()>,
+             m: &mut HashMap<String, NodeIndex>,
+             name: &str|
+             -> NodeIndex {
+                if let Some(&idx) = m.get(name) {
+                    idx
+                } else {
+                    let idx = g.add_node(name.to_string());
+                    m.insert(name.to_string(), idx);
+                    idx
+                }
+            };
+
+        for cs in &self.call_sites {
+            let Some(ref caller) = cs.caller_scope else {
+                continue;
+            };
+            let caller_idx = ensure_node(
+                &mut call_graph,
+                &mut node_map,
+                caller,
+            );
+            let callee_idx = ensure_node(
+                &mut call_graph,
+                &mut node_map,
+                &cs.callee,
+            );
+            call_graph.add_edge(caller_idx, callee_idx, ());
+        }
+
+        // Map seed entity names to node indices
+        let seed_node_indices: HashMap<String, NodeIndex> = self
+            .entities
+            .values()
+            .filter(|e| seed_ids.contains(&e.id))
+            .filter_map(|e| {
+                node_map.get(&e.name).map(|&idx| {
+                    (e.name.clone(), idx)
+                })
+            })
+            .collect();
+
+        // 5. Find bridges via BFS forward/backward from seeds
+        let bfs_reachable = |starts: &[NodeIndex],
+                             forward: bool|
+         -> HashSet<NodeIndex> {
+            let mut visited = HashSet::new();
+            let mut queue = VecDeque::new();
+            for &s in starts {
+                visited.insert(s);
+                queue.push_back((s, 0usize));
+            }
+            while let Some((node, depth)) = queue.pop_front()
+            {
+                if depth >= max_depth {
+                    continue;
+                }
+                let neighbors: Vec<NodeIndex> = if forward {
+                    call_graph
+                        .neighbors_directed(
+                            node,
+                            petgraph::Direction::Outgoing,
+                        )
+                        .collect()
+                } else {
+                    call_graph
+                        .neighbors_directed(
+                            node,
+                            petgraph::Direction::Incoming,
+                        )
+                        .collect()
+                };
+                for nb in neighbors {
+                    if visited.insert(nb) {
+                        queue.push_back((nb, depth + 1));
+                    }
+                }
+            }
+            visited
+        };
+
+        let seed_indices: Vec<NodeIndex> =
+            seed_node_indices.values().copied().collect();
+        let forward_set = bfs_reachable(&seed_indices, true);
+        let backward_set = bfs_reachable(&seed_indices, false);
+
+        let seed_idx_set: HashSet<NodeIndex> =
+            seed_indices.iter().copied().collect();
+
+        let bridge_indices: HashSet<NodeIndex> = forward_set
+            .intersection(&backward_set)
+            .copied()
+            .filter(|n| !seed_idx_set.contains(n))
+            .collect();
+
+        // 6. Build subgraph with seeds + bridges
+        let subgraph_nodes: HashSet<NodeIndex> = seed_idx_set
+            .iter()
+            .chain(bridge_indices.iter())
+            .copied()
+            .collect();
+
+        let mut sub: DiGraph<String, ()> = DiGraph::new();
+        let mut sub_map: HashMap<NodeIndex, NodeIndex> =
+            HashMap::new();
+        for &orig in &subgraph_nodes {
+            let new = sub
+                .add_node(call_graph[orig].clone());
+            sub_map.insert(orig, new);
+        }
+        for &orig in &subgraph_nodes {
+            for neighbor in call_graph.neighbors_directed(
+                orig,
+                petgraph::Direction::Outgoing,
+            ) {
+                if let (Some(&from), Some(&to)) = (
+                    sub_map.get(&orig),
+                    sub_map.get(&neighbor),
+                ) {
+                    sub.add_edge(from, to, ());
+                }
+            }
+        }
+
+        // Topological sort; fall back to BFS from roots
+        let ordered: Vec<NodeIndex> =
+            match petgraph::algo::toposort(&sub, None) {
+                Ok(sorted) => sorted,
+                Err(_) => {
+                    // Cycle: BFS from nodes with no incoming
+                    let roots: Vec<NodeIndex> = sub
+                        .node_indices()
+                        .filter(|n| {
+                            sub.neighbors_directed(
+                                *n,
+                                petgraph::Direction::Incoming,
+                            )
+                            .next()
+                            .is_none()
+                        })
+                        .collect();
+                    let mut visited = HashSet::new();
+                    let mut queue = VecDeque::new();
+                    let mut result = Vec::new();
+                    for r in roots {
+                        if visited.insert(r) {
+                            queue.push_back(r);
+                        }
+                    }
+                    // If no roots (pure cycle), start
+                    // from first node
+                    if queue.is_empty() {
+                        if let Some(n) =
+                            sub.node_indices().next()
+                        {
+                            visited.insert(n);
+                            queue.push_back(n);
+                        }
+                    }
+                    while let Some(n) = queue.pop_front() {
+                        result.push(n);
+                        for nb in sub.neighbors_directed(
+                            n,
+                            petgraph::Direction::Outgoing,
+                        ) {
+                            if visited.insert(nb) {
+                                queue.push_back(nb);
+                            }
+                        }
+                    }
+                    result
+                }
+            };
+
+        // 7. Assemble result
+        // Reverse map: node name -> entity (for looking up
+        // metadata)
+        let entity_by_name: HashMap<&str, &Entity> = self
+            .entities
+            .values()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
+
+        let concept_name_for_id = |cid: &u64| -> String {
+            self.concepts
+                .get(cid)
+                .map(|c| c.canonical.clone())
+                .unwrap_or_default()
+        };
+
+        let make_trace_node =
+            |name: &str, role: TraceRole| -> TraceNode {
+                if let Some(entity) = entity_by_name.get(name)
+                {
+                    TraceNode {
+                        entity_name: entity.name.clone(),
+                        kind: entity.kind.clone(),
+                        file: entity.file.clone(),
+                        line: entity.line,
+                        role,
+                        concept_tags: entity
+                            .concept_tags
+                            .iter()
+                            .map(concept_name_for_id)
+                            .collect(),
+                    }
+                } else {
+                    TraceNode {
+                        entity_name: name.to_string(),
+                        kind: crate::types::EntityKind::Function,
+                        file: PathBuf::new(),
+                        line: 0,
+                        role,
+                        concept_tags: Vec::new(),
+                    }
+                }
+            };
+
+        let mut call_chain = Vec::new();
+        for &sub_idx in &ordered {
+            let name = &sub[sub_idx];
+            // Find original node index for role lookup
+            let orig_idx = sub_map.iter().find_map(
+                |(&orig, &mapped)| {
+                    if mapped == sub_idx {
+                        Some(orig)
+                    } else {
+                        None
+                    }
+                },
+            );
+            let role = if let Some(oi) = orig_idx {
+                if bridge_indices.contains(&oi) {
+                    TraceRole::Bridge
+                } else if let Some(entity) =
+                    entity_by_name.get(name.as_str())
+                {
+                    seed_roles
+                        .get(&entity.id)
+                        .cloned()
+                        .unwrap_or(TraceRole::Both)
+                } else {
+                    TraceRole::Both
+                }
+            } else {
+                TraceRole::Both
+            };
+            call_chain.push(make_trace_node(name, role));
+        }
+
+        // Build edges from call sites within subgraph
+        let subgraph_names: HashSet<&str> = subgraph_nodes
+            .iter()
+            .map(|&n| call_graph[n].as_str())
+            .collect();
+
+        let edges: Vec<TraceEdge> = self
+            .call_sites
+            .iter()
+            .filter(|cs| {
+                cs.caller_scope.as_deref().is_some_and(
+                    |caller| {
+                        subgraph_names.contains(caller)
+                            && subgraph_names
+                                .contains(cs.callee.as_str())
+                    },
+                )
+            })
+            .map(|cs| TraceEdge {
+                caller: cs
+                    .caller_scope
+                    .clone()
+                    .unwrap_or_default(),
+                callee: cs.callee.clone(),
+                file: cs.file.clone(),
+                line: cs.line,
+            })
+            .collect();
+
+        let producers: Vec<TraceNode> = call_chain
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.role,
+                    TraceRole::Producer | TraceRole::Both
+                ) && n.role != TraceRole::Bridge
+            })
+            .cloned()
+            .collect();
+
+        let consumers: Vec<TraceNode> = call_chain
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.role,
+                    TraceRole::Consumer | TraceRole::Both
+                ) && n.role != TraceRole::Bridge
+            })
+            .cloned()
+            .collect();
+
+        Some(ConceptTrace {
+            concept: concept.canonical.clone(),
+            producers,
+            consumers,
+            call_chain,
+            edges,
+        })
+    }
 }
 
 /// Find identifiers in the corpus similar to the given one.
@@ -3197,6 +3616,148 @@ mod tests {
     }
 
     #[test]
+    fn test_trace_concept_basic() {
+        let concept = make_concept(
+            1,
+            "transform",
+            &["apply_transform", "transform"],
+        );
+        let sigs = vec![
+            Signature {
+                name: "load_data".to_string(),
+                params: Vec::new(),
+                return_type: Some("Data".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 1,
+                scope: None,
+            },
+            Signature {
+                name: "apply_transform".to_string(),
+                params: vec![Param {
+                    name: "data".to_string(),
+                    type_annotation: Some(
+                        "Data".to_string(),
+                    ),
+                    default: None,
+                }],
+                return_type: Some(
+                    "Transform".to_string(),
+                ),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 10,
+                scope: None,
+            },
+            Signature {
+                name: "save_result".to_string(),
+                params: vec![Param {
+                    name: "trf".to_string(),
+                    type_annotation: Some(
+                        "Transform".to_string(),
+                    ),
+                    default: None,
+                }],
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 20,
+                scope: None,
+            },
+        ];
+        let entities = vec![
+            Entity {
+                id: 10,
+                name: "apply_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 10,
+                signature_idx: Some(1),
+                class_info_idx: None,
+            },
+            Entity {
+                id: 11,
+                name: "save_result".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "io".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 20,
+                signature_idx: Some(2),
+                class_info_idx: None,
+            },
+        ];
+        let call_sites = vec![
+            CallSite {
+                caller_scope: Some(
+                    "load_data".to_string(),
+                ),
+                callee: "apply_transform".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 5,
+            },
+            CallSite {
+                caller_scope: Some(
+                    "apply_transform".to_string(),
+                ),
+                callee: "save_result".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 15,
+            },
+        ];
+        let analysis = AnalysisResult {
+            concepts: vec![concept],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: sigs,
+            classes: Vec::new(),
+            call_sites,
+        };
+        let graph = ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let result = graph.trace_concept("transform", 5);
+        assert!(result.is_some(), "should find trace");
+        let trace = result.unwrap();
+        assert_eq!(trace.concept, "transform");
+        assert!(
+            !trace.call_chain.is_empty(),
+            "call_chain must not be empty"
+        );
+        let chain_names: Vec<&str> = trace
+            .call_chain
+            .iter()
+            .map(|n| n.entity_name.as_str())
+            .collect();
+        assert!(
+            chain_names.contains(&"apply_transform"),
+            "apply_transform must be in call_chain"
+        );
+        assert!(
+            chain_names.contains(&"save_result"),
+            "save_result must be in call_chain"
+        );
+        assert!(
+            !trace.producers.is_empty(),
+            "producers must not be empty"
+        );
+        assert!(
+            !trace.consumers.is_empty(),
+            "consumers must not be empty"
+        );
+    }
+
+    #[test]
     fn test_vocabulary_health_uncovered() {
         use crate::config::HealthConfig;
 
@@ -3223,5 +3784,108 @@ mod tests {
 
         assert_eq!(health.uncovered_identifiers.len(), 2);
         assert_eq!(health.convention_coverage, 0.0);
+    }
+
+    #[test]
+    fn test_trace_concept_bridge_entities() {
+        let concept = make_concept(
+            1,
+            "transform",
+            &["produce_transform", "consume_transform"],
+        );
+        let entities = vec![
+            Entity {
+                id: 10,
+                name: "produce_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 1,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 11,
+                name: "helper".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: Vec::new(),
+                semantic_role: "util".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 12,
+                name: "consume_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 20,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+        let call_sites = vec![
+            CallSite {
+                caller_scope: Some(
+                    "produce_transform".to_string(),
+                ),
+                callee: "helper".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 5,
+            },
+            CallSite {
+                caller_scope: Some(
+                    "helper".to_string(),
+                ),
+                callee: "consume_transform".to_string(),
+                file: PathBuf::from("test.py"),
+                line: 15,
+            },
+        ];
+        let analysis = AnalysisResult {
+            concepts: vec![concept],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites,
+        };
+        let graph = ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let result = graph.trace_concept("transform", 5);
+        assert!(result.is_some(), "should find trace");
+        let trace = result.unwrap();
+        let bridge = trace.call_chain.iter().find(|n| {
+            n.entity_name == "helper"
+        });
+        assert!(
+            bridge.is_some(),
+            "helper must appear in call_chain"
+        );
+        assert_eq!(
+            bridge.unwrap().role,
+            TraceRole::Bridge,
+            "helper must have Bridge role"
+        );
+    }
+
+    #[test]
+    fn test_trace_concept_not_found() {
+        let graph = make_test_graph();
+        let result = graph.trace_concept("nonexistent", 5);
+        assert!(
+            result.is_none(),
+            "nonexistent concept should return None"
+        );
     }
 }

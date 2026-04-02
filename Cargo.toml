@@ -58,6 +58,9 @@ clap = { version = "4", features = ["derive"] }
 # Parallelism
 rayon = "1"
 
+# Graph algorithms
+petgraph = "0.6"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

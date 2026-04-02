@@ -339,6 +339,43 @@ impl Entity {
     }
 }
 
+// --- Concept trace types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TraceRole {
+    Producer,
+    Consumer,
+    Both,
+    Bridge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceNode {
+    pub entity_name: String,
+    pub kind: EntityKind,
+    pub file: PathBuf,
+    pub line: usize,
+    pub role: TraceRole,
+    pub concept_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEdge {
+    pub caller: String,
+    pub callee: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptTrace {
+    pub concept: String,
+    pub producers: Vec<TraceNode>,
+    pub consumers: Vec<TraceNode>,
+    pub call_chain: Vec<TraceNode>,
+    pub edges: Vec<TraceEdge>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeSymbolResult {
     pub name: String,
