@@ -1,11 +1,13 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::tokenizer::{find_abbreviation, split_identifier};
+use crate::config::HealthConfig;
 use crate::types::{
     AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
-    Convention, DescribeSymbolResult, Entity, LocateConceptResult,
-    NameSuggestion, NamingCheckResult, PatternKind, QueryConceptParams,
-    RelatedConcept, Relationship, RelationshipKind, SessionBriefing,
-    Signature, Subconcept, SymbolKind, Verdict,
+    Convention, DescribeSymbolResult, Entity, InconsistencyPair,
+    LocateConceptResult, NameSuggestion, NamingCheckResult, PatternKind,
+    QueryConceptParams, RelatedConcept, Relationship, RelationshipKind,
+    SessionBriefing, Signature, Subconcept, SymbolKind, Verdict,
+    VocabularyHealth,
 };
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -496,28 +498,52 @@ impl ConceptGraph {
         // (seen but less common than an alternative).
         if let Some((best_name, best_freq)) = related_ids.first() {
             if input_freq > 0 && *best_freq > input_freq {
+                let total =
+                    (input_freq + *best_freq) as f32;
+                let ratio = 1.0
+                    - (input_freq as f32
+                        / (*best_freq).max(1) as f32);
+                let sample_scale =
+                    (total.max(1.0).log2() / 4.0).min(1.0);
+                let confidence =
+                    (ratio * sample_scale).clamp(0.0, 1.0);
                 return NamingCheckResult {
                     input: identifier.to_string(),
                     subtokens,
                     verdict: Verdict::Inconsistent,
                     reason: format!(
-                        "'{}' appears {} times vs '{}' appears {} times",
-                        best_name, best_freq, id_lower, input_freq,
+                        "'{}' appears {} times vs '{}' \
+                         appears {} times",
+                        best_name,
+                        best_freq,
+                        id_lower,
+                        input_freq,
                     ),
                     suggestion: Some(best_name.clone()),
                     matching_convention: None,
                     similar_identifiers: similar_from_related(
                         Some(best_name.as_str()),
                     ),
+                    confidence,
                 };
             }
         }
 
-        // 2. Check prefix conventions — if the identifier uses a prefix
-        // that conflicts with a convention for the same semantic role
+        // 2. Check prefix conventions — if the identifier uses a
+        // count prefix that conflicts with the project's count prefix.
+        // Pick the highest-frequency count convention as canonical.
         let known_count_prefixes = ["n_", "nb_", "num_"];
-        for conv in &self.conventions {
-            if let PatternKind::Prefix(conv_prefix) = &conv.pattern {
+        let best_count_conv = self
+            .conventions
+            .iter()
+            .filter(|c| {
+                matches!(&c.pattern, PatternKind::Prefix(p)
+                    if known_count_prefixes.contains(&p.as_str()))
+            })
+            .max_by_key(|c| c.frequency);
+        if let Some(conv) = best_count_conv {
+            if let PatternKind::Prefix(conv_prefix) = &conv.pattern
+            {
                 for &alt_prefix in &known_count_prefixes {
                     if alt_prefix == conv_prefix.as_str() {
                         continue;
@@ -536,14 +562,19 @@ impl ConceptGraph {
                         reason: format!(
                             "project uses '{}' prefix for {} \
                              (not '{}')",
-                            conv_prefix, conv.semantic_role, alt_prefix
+                            conv_prefix,
+                            conv.semantic_role,
+                            alt_prefix
                         ),
                         suggestion: Some(suggested),
-                        matching_convention: Some(conv.clone()),
-                        similar_identifiers: find_similar_identifiers(
-                            identifier,
-                            &id_freq,
+                        matching_convention: Some(
+                            conv.clone(),
                         ),
+                        similar_identifiers:
+                            find_similar_identifiers(
+                                identifier, &id_freq,
+                            ),
+                        confidence: 0.8,
                     };
                 }
             }
@@ -575,6 +606,7 @@ impl ConceptGraph {
                     suggestion: None,
                     matching_convention: Some(conv.clone()),
                     similar_identifiers: similar_from_related(None),
+                    confidence: 0.8,
                 };
             }
         }
@@ -595,6 +627,7 @@ impl ConceptGraph {
                     identifier,
                     &id_freq,
                 ),
+                confidence: 0.6,
             };
         }
 
@@ -603,11 +636,13 @@ impl ConceptGraph {
             input: identifier.to_string(),
             subtokens,
             verdict: Verdict::Unknown,
-            reason: "identifier not found in corpus and matches no convention"
+            reason: "identifier not found in corpus and \
+                     matches no convention"
                 .to_string(),
             suggestion: None,
             matching_convention: None,
             similar_identifiers: similar_from_related(None),
+            confidence: 0.0,
         }
     }
 
@@ -2120,6 +2155,217 @@ impl ConceptGraph {
             entity_clusters,
         }
     }
+
+    /// Measure vocabulary health across three dimensions:
+    /// convention coverage, spelling consistency, and cluster
+    /// cohesion. Returns an overall weighted score plus
+    /// actionable lists of inconsistencies and uncovered names.
+    pub fn vocabulary_health(
+        &self,
+        config: &HealthConfig,
+    ) -> VocabularyHealth {
+        let convention_coverage = self.compute_convention_coverage();
+        let consistency_ratio = self.compute_consistency_ratio();
+        let cluster_cohesion = self.compute_cluster_cohesion();
+
+        let w1 = config.convention_coverage_weight;
+        let w2 = config.consistency_ratio_weight;
+        let w3 = config.cluster_cohesion_weight;
+        let w_sum = w1 + w2 + w3;
+        let overall = if w_sum > 0.0 {
+            (convention_coverage * w1
+                + consistency_ratio * w2
+                + cluster_cohesion * w3)
+                / w_sum
+        } else {
+            0.0
+        };
+
+        let top_inconsistencies =
+            self.find_top_inconsistencies(10);
+        let uncovered_identifiers =
+            self.find_uncovered_identifiers(10);
+
+        VocabularyHealth {
+            convention_coverage,
+            consistency_ratio,
+            cluster_cohesion,
+            overall,
+            top_inconsistencies,
+            uncovered_identifiers,
+        }
+    }
+
+    /// Fraction of concepts whose occurrences match at least one
+    /// convention pattern.
+    fn compute_convention_coverage(&self) -> f32 {
+        if self.concepts.is_empty() {
+            return 0.0;
+        }
+        let matching = self
+            .concepts
+            .values()
+            .filter(|c| {
+                c.occurrences.iter().any(|occ| {
+                    self.identifier_matches_any_convention(
+                        &occ.identifier,
+                    )
+                })
+            })
+            .count();
+        matching as f32 / self.concepts.len() as f32
+    }
+
+    /// Average per-concept spelling consistency. A concept where
+    /// every occurrence uses the same identifier scores 1.0; one
+    /// with many distinct spellings scores lower.
+    fn compute_consistency_ratio(&self) -> f32 {
+        let scores: Vec<f32> = self
+            .concepts
+            .values()
+            .filter(|c| !c.occurrences.is_empty())
+            .map(|c| {
+                let mut unique = HashSet::new();
+                for occ in &c.occurrences {
+                    unique.insert(occ.identifier.to_lowercase());
+                }
+                let nb_unique = unique.len();
+                let nb_occ = c.occurrences.len().max(1);
+                1.0 - ((nb_unique - 1) as f32 / nb_occ as f32)
+            })
+            .collect();
+        if scores.is_empty() {
+            return 1.0;
+        }
+        scores.iter().sum::<f32>() / scores.len() as f32
+    }
+
+    /// Average cosine similarity of cluster members to their
+    /// centroid, averaged across all clusters.
+    fn compute_cluster_cohesion(&self) -> f32 {
+        if self.cluster_centroids.is_empty() {
+            return 1.0;
+        }
+        let mut cluster_sims: Vec<f32> = Vec::new();
+        for (&cluster_id, centroid) in &self.cluster_centroids {
+            let members: Vec<&Concept> = self
+                .concepts
+                .values()
+                .filter(|c| c.cluster_id == Some(cluster_id))
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let mut sims: Vec<f32> = Vec::new();
+            for member in &members {
+                if let Some(vec) =
+                    self.embeddings.get_vector(member.id)
+                {
+                    sims.push(cosine_similarity(vec, centroid));
+                }
+            }
+            if !sims.is_empty() {
+                let avg =
+                    sims.iter().sum::<f32>() / sims.len() as f32;
+                cluster_sims.push(avg);
+            }
+        }
+        if cluster_sims.is_empty() {
+            return 1.0;
+        }
+        cluster_sims.iter().sum::<f32>()
+            / cluster_sims.len() as f32
+    }
+
+    /// Check whether an identifier matches any convention pattern.
+    fn identifier_matches_any_convention(
+        &self,
+        identifier: &str,
+    ) -> bool {
+        let id_lower = identifier.to_lowercase();
+        self.conventions.iter().any(|conv| match &conv.pattern {
+            PatternKind::Prefix(p) => {
+                id_lower.starts_with(p.as_str())
+            }
+            PatternKind::Suffix(s) => {
+                id_lower.ends_with(s.as_str())
+            }
+            PatternKind::Conversion(c) => {
+                id_lower.contains(c.as_str())
+            }
+            PatternKind::Compound(c) => {
+                id_lower.contains(c.as_str())
+            }
+        })
+    }
+
+    /// Find concepts with multiple identifier spellings. For each,
+    /// pair the dominant spelling against each minority spelling.
+    fn find_top_inconsistencies(
+        &self,
+        limit: usize,
+    ) -> Vec<InconsistencyPair> {
+        let mut pairs: Vec<InconsistencyPair> = Vec::new();
+        for concept in self.concepts.values() {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for occ in &concept.occurrences {
+                *counts
+                    .entry(occ.identifier.to_lowercase())
+                    .or_insert(0) += 1;
+            }
+            if counts.len() < 2 {
+                continue;
+            }
+            let mut sorted: Vec<(String, usize)> =
+                counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let (dominant, dominant_count) = &sorted[0];
+            for &(ref minority, minority_count) in &sorted[1..] {
+                pairs.push(InconsistencyPair {
+                    dominant: dominant.clone(),
+                    minority: minority.clone(),
+                    dominant_count: *dominant_count,
+                    minority_count,
+                });
+            }
+        }
+        pairs.sort_by(|a, b| {
+            let diff_a = a.dominant_count.saturating_sub(
+                a.minority_count,
+            );
+            let diff_b = b.dominant_count.saturating_sub(
+                b.minority_count,
+            );
+            diff_b.cmp(&diff_a)
+        });
+        pairs.truncate(limit);
+        pairs
+    }
+
+    /// Collect identifiers that match no convention pattern,
+    /// sorted by frequency descending.
+    fn find_uncovered_identifiers(
+        &self,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut id_freq: HashMap<String, usize> = HashMap::new();
+        for concept in self.concepts.values() {
+            for occ in &concept.occurrences {
+                let id = occ.identifier.to_lowercase();
+                *id_freq.entry(id).or_insert(0) += 1;
+            }
+        }
+        let mut uncovered: Vec<(String, usize)> = id_freq
+            .into_iter()
+            .filter(|(id, _)| {
+                !self.identifier_matches_any_convention(id)
+            })
+            .collect();
+        uncovered.sort_by(|a, b| b.1.cmp(&a.1));
+        uncovered.truncate(limit);
+        uncovered.into_iter().map(|(id, _)| id).collect()
+    }
 }
 
 /// Find identifiers in the corpus similar to the given one.
@@ -2722,4 +2968,260 @@ mod tests {
         assert!(similar_after.contains(&(3, 4)), "SimilarTo(alpha, beta) must survive after contrastive");
     }
 
+    #[test]
+    fn test_confidence_bounded_zero_to_one() {
+        let graph = make_test_graph();
+        // Test all verdict paths produce bounded confidence
+        let cases = [
+            "nb_features", // Consistent (convention match)
+            "ndim",        // Consistent (corpus presence)
+            "n_dims",      // Inconsistent (prefix mismatch)
+            "xyzzy_foo",   // Unknown
+        ];
+        for name in &cases {
+            let result = graph.check_naming(name);
+            assert!(
+                (0.0..=1.0).contains(&result.confidence),
+                "{}: confidence {} out of [0, 1]",
+                name,
+                result.confidence,
+            );
+        }
+    }
+
+    #[test]
+    fn test_confidence_convention_match() {
+        let graph = make_test_graph();
+        let result = graph.check_naming("nb_features");
+        assert_eq!(result.verdict, Verdict::Consistent);
+        assert!(
+            result.matching_convention.is_some(),
+            "convention match path expected"
+        );
+        assert_eq!(result.confidence, 0.8);
+    }
+
+    #[test]
+    fn test_confidence_corpus_presence() {
+        // "ndim" is in corpus (3 occurrences) but matches no
+        // convention, so it hits the corpus-presence path.
+        let analysis = AnalysisResult {
+            concepts: vec![make_concept(
+                1,
+                "ndim",
+                &["ndim", "ndim", "ndim"],
+            )],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty())
+                .unwrap();
+        let result = graph.check_naming("ndim");
+        assert_eq!(result.verdict, Verdict::Consistent);
+        assert!(
+            result.matching_convention.is_none(),
+            "should NOT match a convention"
+        );
+        assert_eq!(result.confidence, 0.6);
+    }
+
+    #[test]
+    fn test_confidence_prefix_mismatch() {
+        let graph = make_test_graph();
+        let result = graph.check_naming("n_dims");
+        assert_eq!(result.verdict, Verdict::Inconsistent);
+        assert_eq!(result.confidence, 0.8);
+    }
+
+    #[test]
+    fn test_confidence_unknown() {
+        let graph = make_test_graph();
+        let result = graph.check_naming("xyzzy_foo");
+        assert_eq!(result.verdict, Verdict::Unknown);
+        assert_eq!(result.confidence, 0.0);
+    }
+
+    #[test]
+    fn test_confidence_frequency_ratio() {
+        // "spatial_trf" appears once while "spatial_transform"
+        // appears 8 times. Both share the "spatial" concept
+        // subtoken, so the frequency-comparison path fires and
+        // produces a dynamic confidence in (0, 1).
+        let analysis = AnalysisResult {
+            concepts: vec![make_concept(
+                1,
+                "spatial",
+                &[
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_transform",
+                    "spatial_trf",
+                ],
+            )],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty())
+                .unwrap();
+        let result = graph.check_naming("spatial_trf");
+        assert_eq!(result.verdict, Verdict::Inconsistent);
+        assert!(
+            result.confidence > 0.0 && result.confidence < 1.0,
+            "frequency confidence should be in (0, 1), \
+             got {}",
+            result.confidence,
+        );
+    }
+
+    // --- vocabulary_health tests ---
+
+    #[test]
+    fn test_vocabulary_health_empty_graph() {
+        use crate::config::HealthConfig;
+
+        let graph = ConceptGraph::empty();
+        let health =
+            graph.vocabulary_health(&HealthConfig::default());
+
+        // No concepts → coverage 0, consistency 1, cohesion 1
+        assert_eq!(health.convention_coverage, 0.0);
+        assert_eq!(health.consistency_ratio, 1.0);
+        assert_eq!(health.cluster_cohesion, 1.0);
+        assert!(health.overall > 0.0);
+        assert!(health.top_inconsistencies.is_empty());
+        assert!(health.uncovered_identifiers.is_empty());
+    }
+
+    #[test]
+    fn test_vocabulary_health_with_conventions() {
+        use crate::config::HealthConfig;
+
+        let graph = make_test_graph();
+        let health =
+            graph.vocabulary_health(&HealthConfig::default());
+
+        // The test graph has 5 concepts and one convention
+        // (nb_ prefix). Concept "nb" has all identifiers
+        // starting with "nb_", so it matches. That should
+        // give non-zero convention_coverage.
+        assert!(
+            health.convention_coverage > 0.0,
+            "at least one concept should be covered, got {}",
+            health.convention_coverage,
+        );
+        assert!(
+            health.convention_coverage <= 1.0,
+            "coverage must be <= 1.0, got {}",
+            health.convention_coverage,
+        );
+
+        // Consistency: concepts with uniform spellings should
+        // score high, but some concepts in the test graph
+        // (e.g. "features" with "nb_features" and "features")
+        // have multiple spellings, pulling the ratio down.
+        assert!(
+            health.consistency_ratio > 0.0
+                && health.consistency_ratio <= 1.0,
+            "consistency_ratio should be in (0, 1], got {}",
+            health.consistency_ratio,
+        );
+
+        // No embeddings → cohesion defaults to 1.0
+        assert_eq!(health.cluster_cohesion, 1.0);
+
+        // Overall should be between 0 and 1
+        assert!(
+            health.overall > 0.0 && health.overall <= 1.0,
+            "overall should be in (0, 1], got {}",
+            health.overall,
+        );
+    }
+
+    #[test]
+    fn test_vocabulary_health_inconsistencies() {
+        use crate::config::HealthConfig;
+
+        // Create a concept with mixed spellings
+        let analysis = AnalysisResult {
+            concepts: vec![make_concept(
+                1,
+                "transform",
+                &[
+                    "transform",
+                    "transform",
+                    "transform",
+                    "trf",
+                ],
+            )],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let graph = ConceptGraph::build(
+            analysis,
+            EmbeddingIndex::empty(),
+        )
+        .unwrap();
+        let health =
+            graph.vocabulary_health(&HealthConfig::default());
+
+        assert_eq!(health.top_inconsistencies.len(), 1);
+        assert_eq!(
+            health.top_inconsistencies[0].dominant,
+            "transform"
+        );
+        assert_eq!(
+            health.top_inconsistencies[0].minority, "trf"
+        );
+        assert_eq!(
+            health.top_inconsistencies[0].dominant_count, 3
+        );
+        assert_eq!(
+            health.top_inconsistencies[0].minority_count, 1
+        );
+    }
+
+    #[test]
+    fn test_vocabulary_health_uncovered() {
+        use crate::config::HealthConfig;
+
+        // No conventions → all identifiers are uncovered
+        let analysis = AnalysisResult {
+            concepts: vec![make_concept(
+                1,
+                "foo",
+                &["foo_bar", "foo_baz"],
+            )],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+        };
+        let graph = ConceptGraph::build(
+            analysis,
+            EmbeddingIndex::empty(),
+        )
+        .unwrap();
+        let health =
+            graph.vocabulary_health(&HealthConfig::default());
+
+        assert_eq!(health.uncovered_identifiers.len(), 2);
+        assert_eq!(health.convention_coverage, 0.0);
+    }
 }

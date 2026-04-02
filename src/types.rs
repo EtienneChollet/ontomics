@@ -178,6 +178,8 @@ pub struct NamingCheckResult {
     pub suggestion: Option<String>,
     pub matching_convention: Option<Convention>,
     pub similar_identifiers: Vec<(String, usize)>,
+    #[serde(default)]
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,6 +207,24 @@ pub struct LocateConceptResult {
     pub contrastive_concepts: Vec<String>,
     #[serde(default)]
     pub key_entities: Vec<EntitySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VocabularyHealth {
+    pub convention_coverage: f32,
+    pub consistency_ratio: f32,
+    pub cluster_cohesion: f32,
+    pub overall: f32,
+    pub top_inconsistencies: Vec<InconsistencyPair>,
+    pub uncovered_identifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InconsistencyPair {
+    pub dominant: String,
+    pub minority: String,
+    pub dominant_count: usize,
+    pub minority_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

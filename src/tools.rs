@@ -259,6 +259,22 @@ impl OntomicsServer {
         }))
     }
 
+    fn handle_vocabulary_health(
+        &self,
+        _args: &Value,
+    ) -> Result<Value, String> {
+        use ontomics::config::HealthConfig;
+
+        let graph = self
+            .graph
+            .read()
+            .map_err(|e| format!("lock error: {e}"))?;
+        let config = HealthConfig::default();
+        let result = graph.vocabulary_health(&config);
+        serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))
+    }
+
     fn handle_list_entities(&self, args: &Value) -> Result<Value, String> {
         use ontomics::types::EntityKind;
 
@@ -490,6 +506,18 @@ fn tool_definitions() -> Vec<Tool> {
                 &[],
             ),
         ),
+        Tool::new(
+            "vocabulary_health",
+            "Measure the vocabulary health of this codebase \
+             — returns convention coverage (how many identifiers \
+             follow conventions), consistency ratio (how uniformly \
+             concepts are spelled), and cluster cohesion (how well \
+             semantic clusters hold together). Use when asked about \
+             code quality, naming consistency, or vocabulary health. \
+             Returns an overall score plus top inconsistencies and \
+             uncovered identifiers.",
+            tool_schema(json!({}), &[]),
+        ),
     ]
 }
 
@@ -580,6 +608,7 @@ impl ServerHandler for OntomicsServer {
             "locate_concept" => self.handle_locate_concept(&args),
             "list_entities" => self.handle_list_entities(&args),
             "export_domain_pack" => self.handle_export_domain_pack(&args),
+            "vocabulary_health" => self.handle_vocabulary_health(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -816,7 +845,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
