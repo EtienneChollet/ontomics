@@ -2557,13 +2557,54 @@ impl ConceptGraph {
             visited
         };
 
-        let seed_indices: Vec<NodeIndex> =
-            seed_node_indices.values().copied().collect();
-        let forward_set = bfs_reachable(&seed_indices, true);
-        let backward_set = bfs_reachable(&seed_indices, false);
+        // Build seed name→entity lookup for role classification
+        let seed_entity_by_name: HashMap<&str, &Entity> = self
+            .entities
+            .values()
+            .filter(|e| seed_ids.contains(&e.id))
+            .map(|e| (e.name.as_str(), e))
+            .collect();
+
+        // Split seeds by role for directional BFS
+        let producer_indices: Vec<NodeIndex> = seed_node_indices
+            .iter()
+            .filter(|(name, _)| {
+                seed_entity_by_name
+                    .get(name.as_str())
+                    .and_then(|e| seed_roles.get(&e.id))
+                    .map(|r| {
+                        matches!(
+                            r,
+                            TraceRole::Producer | TraceRole::Both
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(_, &idx)| idx)
+            .collect();
+        let consumer_indices: Vec<NodeIndex> = seed_node_indices
+            .iter()
+            .filter(|(name, _)| {
+                seed_entity_by_name
+                    .get(name.as_str())
+                    .and_then(|e| seed_roles.get(&e.id))
+                    .map(|r| {
+                        matches!(
+                            r,
+                            TraceRole::Consumer | TraceRole::Both
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(_, &idx)| idx)
+            .collect();
+        let forward_set =
+            bfs_reachable(&producer_indices, true);
+        let backward_set =
+            bfs_reachable(&consumer_indices, false);
 
         let seed_idx_set: HashSet<NodeIndex> =
-            seed_indices.iter().copied().collect();
+            seed_node_indices.values().copied().collect();
 
         let bridge_indices: HashSet<NodeIndex> = forward_set
             .intersection(&backward_set)
@@ -2605,7 +2646,8 @@ impl ConceptGraph {
             match petgraph::algo::toposort(&sub, None) {
                 Ok(sorted) => sorted,
                 Err(_) => {
-                    // Cycle: BFS from nodes with no incoming
+                    // Cycle: BFS from roots, then sweep
+                    // disconnected components
                     let roots: Vec<NodeIndex> = sub
                         .node_indices()
                         .filter(|n| {
@@ -2625,8 +2667,6 @@ impl ConceptGraph {
                             queue.push_back(r);
                         }
                     }
-                    // If no roots (pure cycle), start
-                    // from first node
                     if queue.is_empty() {
                         if let Some(n) =
                             sub.node_indices().next()
@@ -2643,6 +2683,15 @@ impl ConceptGraph {
                         ) {
                             if visited.insert(nb) {
                                 queue.push_back(nb);
+                            }
+                        }
+                        // Sweep disconnected components
+                        if queue.is_empty() {
+                            for c in sub.node_indices() {
+                                if visited.insert(c) {
+                                    queue.push_back(c);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2725,6 +2774,27 @@ impl ConceptGraph {
             };
             call_chain.push(make_trace_node(name, role));
         }
+
+        // Include orphan seeds (entities not in any call site)
+        let chain_names: HashSet<&str> = call_chain
+            .iter()
+            .map(|n| n.entity_name.as_str())
+            .collect();
+        let orphans: Vec<TraceNode> = seed_roles
+            .iter()
+            .filter_map(|(&sid, role)| {
+                let entity = self.entities.get(&sid)?;
+                if chain_names.contains(entity.name.as_str())
+                {
+                    return None;
+                }
+                Some(make_trace_node(
+                    &entity.name,
+                    role.clone(),
+                ))
+            })
+            .collect();
+        call_chain.extend(orphans);
 
         // Build edges from call sites within subgraph
         let subgraph_names: HashSet<&str> = subgraph_nodes
