@@ -15,15 +15,23 @@ mod testbed {
     use std::path::Path;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    /// Thread-safe cache of built ConceptGraphs, keyed by repo path.
-    fn graph_cache() -> &'static Mutex<HashMap<String, Arc<ConceptGraph>>> {
-        static CACHE: OnceLock<Mutex<HashMap<String, Arc<ConceptGraph>>>> = OnceLock::new();
+    /// A built graph plus the parser and language name that produced it.
+    #[derive(Clone)]
+    pub struct BuiltGraph {
+        pub graph: Arc<ConceptGraph>,
+        pub parser: Arc<dyn parser::LanguageParser>,
+        pub language_name: &'static str,
+    }
+
+    /// Thread-safe cache of built graphs, keyed by repo path.
+    fn graph_cache() -> &'static Mutex<HashMap<String, BuiltGraph>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, BuiltGraph>>> = OnceLock::new();
         CACHE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Build or retrieve a cached ConceptGraph for the given repo.
+    /// Build or retrieve a cached BuiltGraph for the given repo.
     /// Returns None if the repo path doesn't exist (test should skip).
-    pub fn get_or_build_graph(exp: &TestbedExpectations) -> Option<Arc<ConceptGraph>> {
+    pub fn get_or_build_graph(exp: &TestbedExpectations) -> Option<BuiltGraph> {
         let repo = Path::new(exp.repo_path);
         if !repo.exists() {
             eprintln!("SKIP: {} not found at {}", exp.name, exp.repo_path);
@@ -31,8 +39,8 @@ mod testbed {
         }
 
         let mut cache = graph_cache().lock().unwrap();
-        if let Some(graph) = cache.get(exp.repo_path) {
-            return Some(Arc::clone(graph));
+        if let Some(bg) = cache.get(exp.repo_path) {
+            return Some(bg.clone());
         }
 
         eprintln!("Building graph for {} at {}...", exp.name, exp.repo_path);
@@ -40,21 +48,23 @@ mod testbed {
         let config = Config::load(repo).unwrap_or_default();
         let (language, _file_count) = Language::detect(repo);
 
-        let lang: Box<dyn parser::LanguageParser> = match &language {
-            Language::Python => Box::new(parser::python_parser()),
-            Language::TypeScript => Box::new(parser::typescript_parser()),
-            Language::JavaScript => Box::new(parser::javascript_parser()),
-            Language::Rust => Box::new(parser::rust_parser()),
+        let lang: Arc<dyn parser::LanguageParser> = match &language {
+            Language::Python => Arc::new(parser::python_parser()),
+            Language::TypeScript => Arc::new(parser::typescript_parser()),
+            Language::JavaScript => Arc::new(parser::javascript_parser()),
+            Language::Rust => Arc::new(parser::rust_parser()),
             Language::Auto => {
                 let (detected, _) = Language::detect(repo);
                 match detected {
-                    Language::TypeScript => Box::new(parser::typescript_parser()),
-                    Language::JavaScript => Box::new(parser::javascript_parser()),
-                    Language::Rust => Box::new(parser::rust_parser()),
-                    _ => Box::new(parser::python_parser()),
+                    Language::TypeScript => Arc::new(parser::typescript_parser()),
+                    Language::JavaScript => Arc::new(parser::javascript_parser()),
+                    Language::Rust => Arc::new(parser::rust_parser()),
+                    _ => Arc::new(parser::python_parser()),
                 }
             }
         };
+
+        let language_name = language.name();
 
         let mut index_config = config.index.clone();
         index_config.resolve_for_language(&language);
@@ -77,7 +87,7 @@ mod testbed {
                 .domain_specificity_threshold,
         };
         let analysis =
-            analyzer::analyze(&parse_results, &analysis_params, language.name())
+            analyzer::analyze(&parse_results, &analysis_params, language_name)
                 .expect("analysis failed");
         eprintln!(
             "  Found {} concepts, {} conventions",
@@ -156,16 +166,20 @@ mod testbed {
             graph.conventions.len()
         );
 
-        let arc = Arc::new(graph);
-        cache.insert(exp.repo_path.to_string(), Arc::clone(&arc));
-        Some(arc)
+        let bg = BuiltGraph {
+            graph: Arc::new(graph),
+            parser: Arc::clone(&lang),
+            language_name,
+        };
+        cache.insert(exp.repo_path.to_string(), bg.clone());
+        Some(bg)
     }
 
     /// Macro to skip test gracefully if codebase not found.
     macro_rules! skip_if_missing {
         ($exp:expr) => {
             match $crate::testbed::get_or_build_graph($exp) {
-                Some(g) => g,
+                Some(bg) => bg,
                 None => {
                     eprintln!("SKIP: {} not available", $exp.name);
                     return;

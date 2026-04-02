@@ -14,8 +14,8 @@ const MCP_TOKEN_LIMIT: usize = 10_000;
 // ── list_concepts ──────────────────────────────────────────────────────────
 
 pub fn run_list_concepts(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
-    let concepts = graph.list_concepts();
+    let bg = skip_if_missing!(exp);
+    let concepts = bg.graph.list_concepts();
 
     // Structural
     assert!(
@@ -79,10 +79,10 @@ pub fn run_list_concepts(exp: &TestbedExpectations) {
 // ── query_concept ──────────────────────────────────────────────────────────
 
 pub fn run_query_concept(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
     // Structural: top-5 concepts must be queryable
-    let top5: Vec<String> = graph
+    let top5: Vec<String> = bg.graph
         .list_concepts()
         .iter()
         .take(5)
@@ -90,7 +90,7 @@ pub fn run_query_concept(exp: &TestbedExpectations) {
         .collect();
     for canonical in &top5 {
         let params = QueryConceptParams::default();
-        let result = graph.query_concept(canonical, &params);
+        let result = bg.graph.query_concept(canonical, &params);
         assert!(
             result.is_some(),
             "{}: query_concept('{}') returned None for top-5 concept",
@@ -114,7 +114,7 @@ pub fn run_query_concept(exp: &TestbedExpectations) {
     // Per-codebase checks
     for check in &exp.query_concept_checks {
         let params = QueryConceptParams::default();
-        let result = graph.query_concept(check.term, &params);
+        let result = bg.graph.query_concept(check.term, &params);
         assert!(
             result.is_some(),
             "{}: query_concept('{}') returned None",
@@ -151,10 +151,10 @@ pub fn run_query_concept(exp: &TestbedExpectations) {
 // ── check_naming ───────────────────────────────────────────────────────────
 
 pub fn run_check_naming(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
     for check in &exp.naming_checks {
-        let result = graph.check_naming(check.identifier);
+        let result = bg.graph.check_naming(check.identifier);
 
         // Input echoes back exactly
         assert_eq!(result.input, check.identifier, "{}: input mismatch", exp.name);
@@ -196,10 +196,10 @@ pub fn run_check_naming(exp: &TestbedExpectations) {
 // ── suggest_name ───────────────────────────────────────────────────────────
 
 pub fn run_suggest_name(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
     for check in &exp.suggest_name_checks {
-        let suggestions = graph.suggest_name(check.description);
+        let suggestions = bg.graph.suggest_name(check.description);
 
         assert!(
             !suggestions.is_empty(),
@@ -248,8 +248,8 @@ pub fn run_suggest_name(exp: &TestbedExpectations) {
 // ── list_conventions ───────────────────────────────────────────────────────
 
 pub fn run_list_conventions(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
-    let conventions = graph.list_conventions();
+    let bg = skip_if_missing!(exp);
+    let conventions = bg.graph.list_conventions();
 
     // Structural
     for conv in conventions {
@@ -281,10 +281,10 @@ pub fn run_list_conventions(exp: &TestbedExpectations) {
 // ── describe_symbol ────────────────────────────────────────────────────────
 
 pub fn run_describe_symbol(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
     for check in &exp.describe_symbol_checks {
-        let result = graph.describe_symbol(check.name);
+        let result = bg.graph.describe_symbol(check.name);
         assert!(
             result.is_some(),
             "{}: describe_symbol('{}') returned None",
@@ -312,17 +312,17 @@ pub fn run_describe_symbol(exp: &TestbedExpectations) {
 // ── locate_concept ─────────────────────────────────────────────────────────
 
 pub fn run_locate_concept(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
     // Structural: top-5 concepts must be locatable
-    let top5: Vec<String> = graph
+    let top5: Vec<String> = bg.graph
         .list_concepts()
         .iter()
         .take(5)
         .map(|c| c.canonical.clone())
         .collect();
     for canonical in &top5 {
-        let result = graph.locate_concept(canonical);
+        let result = bg.graph.locate_concept(canonical);
         assert!(
             result.is_some(),
             "{}: locate_concept('{}') returned None for top-5 concept",
@@ -334,7 +334,7 @@ pub fn run_locate_concept(exp: &TestbedExpectations) {
 
     // Per-codebase checks
     for check in &exp.locate_concept_checks {
-        let result = graph.locate_concept(check.term);
+        let result = bg.graph.locate_concept(check.term);
         assert!(
             result.is_some(),
             "{}: locate_concept('{}') returned None",
@@ -355,9 +355,9 @@ pub fn run_locate_concept(exp: &TestbedExpectations) {
 // ── list_entities ──────────────────────────────────────────────────────────
 
 pub fn run_list_entities(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
-    let entities = graph.list_entities(None, None, None, 1000);
+    let entities = bg.graph.list_entities(None, None, None, 1000);
 
     // Structural
     assert!(
@@ -388,15 +388,15 @@ pub fn run_list_entities(exp: &TestbedExpectations) {
     }
 
     // Respects top_k
-    let limited = graph.list_entities(None, None, None, 5);
+    let limited = bg.graph.list_entities(None, None, None, 5);
     assert!(limited.len() <= 5, "{}: top_k=5 returned {} entities", exp.name, limited.len());
 }
 
 // ── export_domain_pack ─────────────────────────────────────────────────────
 
 pub fn run_export_domain_pack(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
-    let pack = domain_pack::export_domain_pack(&graph);
+    let bg = skip_if_missing!(exp);
+    let pack = domain_pack::export_domain_pack(&bg.graph);
 
     // Valid YAML
     let yaml = serde_yaml::to_string(&pack).expect("domain pack should serialize to YAML");
@@ -424,12 +424,11 @@ pub fn run_export_domain_pack(exp: &TestbedExpectations) {
     );
 }
 
-// ── ontology_diff (structural only) ────────────────────────────────────────
+// ── ontology_diff ──────────────────────────────────────────────────────────
 
 pub fn run_ontology_diff(exp: &TestbedExpectations) {
-    let graph = skip_if_missing!(exp);
+    let bg = skip_if_missing!(exp);
 
-    // ontology_diff requires a git repo — just verify the repo is a git repo
     let repo_path = std::path::Path::new(exp.repo_path);
     let git_dir = repo_path.join(".git");
     if !git_dir.exists() {
@@ -437,12 +436,101 @@ pub fn run_ontology_diff(exp: &TestbedExpectations) {
         return;
     }
 
-    // We can't easily call diff::ontology_diff from here without a language
-    // parser, so just verify the structural requirement: git repo exists
-    // and the concepts are non-empty (diff would operate on these).
+    // Use HEAD~3 as default base ref — enough history for meaningful diff
+    // but not so far back that it's slow on large repos.
+    let base_ref = "HEAD~3";
+
+    let result = ontomics::diff::ontology_diff(
+        repo_path,
+        base_ref,
+        &bg.graph.concepts,
+        &*bg.parser,
+        bg.language_name,
+    );
+
+    // Handle gracefully: some repos may not have 3 commits
+    let diff = match result {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("revparse") || msg.contains("not found") {
+                eprintln!(
+                    "{}: not enough git history for HEAD~3, skipping",
+                    exp.name
+                );
+                return;
+            }
+            panic!("{}: ontology_diff failed: {e}", exp.name);
+        }
+    };
+
+    // Structural assertions
     assert!(
-        !graph.concepts.is_empty(),
-        "{}: graph has no concepts for diff",
+        !diff.base_ref.is_empty(),
+        "{}: base_ref is empty",
         exp.name
+    );
+    assert!(
+        !diff.head_ref.is_empty(),
+        "{}: head_ref is empty",
+        exp.name
+    );
+
+    // Validate added concepts
+    for concept in &diff.added_concepts {
+        assert!(
+            !concept.canonical.is_empty(),
+            "{}: added concept has empty canonical",
+            exp.name
+        );
+        assert_eq!(
+            concept.canonical,
+            concept.canonical.to_lowercase(),
+            "{}: added concept '{}' not lowercase",
+            exp.name, concept.canonical
+        );
+    }
+
+    // Validate removed concepts
+    for concept in &diff.removed_concepts {
+        assert!(
+            !concept.canonical.is_empty(),
+            "{}: removed concept has empty canonical",
+            exp.name
+        );
+    }
+
+    // Validate changed concepts
+    for delta in &diff.changed_concepts {
+        assert!(
+            !delta.concept.canonical.is_empty(),
+            "{}: changed concept has empty canonical",
+            exp.name
+        );
+        // new_variants and removed_variants should be disjoint
+        for v in &delta.new_variants {
+            assert!(
+                !delta.removed_variants.contains(v),
+                "{}: variant '{}' in both new and removed for '{}'",
+                exp.name, v, delta.concept.canonical
+            );
+        }
+    }
+
+    eprintln!(
+        "{}: ontology_diff(HEAD~3): {} added, {} removed, {} changed",
+        exp.name,
+        diff.added_concepts.len(),
+        diff.removed_concepts.len(),
+        diff.changed_concepts.len()
+    );
+
+    // MCP token limit
+    let json = serde_json::to_string(&diff).unwrap_or_default();
+    let token_estimate = json.len() / 4;
+    assert!(
+        token_estimate < MCP_TOKEN_LIMIT,
+        "{}: ontology_diff response exceeds {} token limit (~{} tokens)",
+        exp.name, MCP_TOKEN_LIMIT, token_estimate
     );
 }
