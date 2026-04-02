@@ -124,6 +124,8 @@ enum Command {
     },
     /// Update ontomics to the latest version
     Update,
+    /// Measure vocabulary health (convention coverage, consistency, cohesion)
+    Health,
     /// List entities (classes, functions) with optional filtering
     Entities {
         /// Filter by concept
@@ -782,6 +784,9 @@ async fn main() -> anyhow::Result<()> {
                 Command::Trace { concept, max_depth } => {
                     cmd_trace(&result.graph, &concept, max_depth)
                 }
+                Command::Health => {
+                    cmd_health(&result.graph, &config)
+                }
                 Command::Briefing => cmd_briefing(&result.graph),
                 Command::Export { output } => {
                     cmd_export(&result.graph, output.as_deref())
@@ -948,6 +953,15 @@ fn cmd_entities(
 ) -> anyhow::Result<()> {
     let results = graph.list_entities(concept, role, None, top_k);
     print_json(&results);
+    Ok(())
+}
+
+fn cmd_health(
+    graph: &graph::ConceptGraph,
+    config: &config::Config,
+) -> anyhow::Result<()> {
+    let result = graph.vocabulary_health(&config.health);
+    print_json(&result);
     Ok(())
 }
 

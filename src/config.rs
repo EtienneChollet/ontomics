@@ -184,6 +184,9 @@ pub struct Config {
     /// Paths to domain pack YAML files, resolved relative to repo root.
     #[serde(default)]
     pub domain_packs: Vec<String>,
+    /// Weights for vocabulary health sub-scores.
+    #[serde(default)]
+    pub health: HealthConfig,
     #[cfg(feature = "lsp")]
     #[serde(default)]
     pub lsp: LspConfig,
@@ -345,6 +348,24 @@ impl Default for ResourcesConfig {
         Self {
             max_threads: (cpus / 2).max(1),
             embedding_batch_size: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HealthConfig {
+    pub convention_coverage_weight: f32,
+    pub consistency_ratio_weight: f32,
+    pub cluster_cohesion_weight: f32,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            convention_coverage_weight: 0.33,
+            consistency_ratio_weight: 0.33,
+            cluster_cohesion_weight: 0.33,
         }
     }
 }
