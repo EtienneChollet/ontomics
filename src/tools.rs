@@ -1,6 +1,6 @@
-use crate::diff;
-use crate::graph::ConceptGraph;
-use crate::parser::LanguageParser;
+use ontomics::diff;
+use ontomics::graph::ConceptGraph;
+use ontomics::parser::LanguageParser;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, Implementation, InitializeResult,
@@ -63,7 +63,7 @@ impl OntomicsServer {
 
 
     fn handle_query_concept(&self, args: &Value) -> Result<Value, String> {
-        use crate::types::QueryConceptParams;
+        use ontomics::types::QueryConceptParams;
 
         let term = args
             .get("term")
@@ -238,7 +238,7 @@ impl OntomicsServer {
 
     fn handle_export_domain_pack(&self, _args: &Value) -> Result<Value, String> {
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
-        let pack = crate::domain_pack::export_domain_pack(&graph);
+        let pack = ontomics::domain_pack::export_domain_pack(&graph);
         let yaml = serde_yaml::to_string(&pack)
             .map_err(|e| format!("YAML serialization error: {e}"))?;
         let stats = json!({
@@ -254,7 +254,7 @@ impl OntomicsServer {
     }
 
     fn handle_list_entities(&self, args: &Value) -> Result<Value, String> {
-        use crate::types::EntityKind;
+        use ontomics::types::EntityKind;
 
         let concept = args.get("concept").and_then(|v| v.as_str());
         let role = args.get("role").and_then(|v| v.as_str());
@@ -668,9 +668,9 @@ impl ServerHandler for OntomicsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::EmbeddingIndex;
-    use crate::graph::ConceptGraph;
-    use crate::types::*;
+    use ontomics::embeddings::EmbeddingIndex;
+    use ontomics::graph::ConceptGraph;
+    use ontomics::types::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -730,7 +730,7 @@ mod tests {
         OntomicsServer::new(
             graph,
             PathBuf::from("/tmp"),
-            Arc::new(crate::parser::python_parser()),
+            Arc::new(ontomics::parser::python_parser()),
             Vec::new(),
         )
     }

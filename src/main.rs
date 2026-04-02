@@ -1,19 +1,18 @@
-mod analyzer;
-mod cache;
-mod cluster;
-mod config;
-mod diff;
-mod domain_pack;
-mod embeddings;
-mod enrichment;
-mod entity;
-mod graph;
-#[cfg(feature = "lsp")]
-mod lsp;
-mod parser;
-mod tokenizer;
 mod tools;
-mod types;
+
+use ontomics::analyzer;
+use ontomics::cache;
+use ontomics::config;
+use ontomics::diff;
+use ontomics::domain_pack;
+use ontomics::embeddings;
+use ontomics::enrichment;
+use ontomics::entity;
+use ontomics::graph;
+#[cfg(feature = "lsp")]
+use ontomics::lsp;
+use ontomics::parser;
+use ontomics::types;
 
 use clap::{Parser as ClapParser, Subcommand};
 use rmcp::ServiceExt;
