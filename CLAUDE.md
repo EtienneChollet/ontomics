@@ -8,12 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## ABSOLUTE RULE — Worktree workflow
 
-**ALL source code and test changes MUST go through a worktree branch and PR.** Never commit implementation work directly to main.
+**ALL source code and test changes MUST go through a worktree branch and PR.** Never commit implementation work directly to main. **NEVER edit a single file before the worktree exists.**
+
+**The worktree MUST be created BEFORE any files are edited. This is the very first action for any implementation task. No exceptions. Do not edit on main and stash/move retroactively.**
+
+Worktree location: `./worktrees/per-<issue-number>-<issue-name>` (e.g., `worktrees/per-42-testbed-thread-cap`). **NEVER place worktrees outside the project root (e.g., `../`).**
 
 Workflow:
 1. Create a feature branch: `epc28/<description>` (associate with a Linear issue when one exists)
-2. Use `git worktree` or the Agent tool's `isolation: "worktree"` to work in an isolated copy
-3. Implement, test, commit on the feature branch
+2. Create the worktree: `git worktree add -b epc28/<name> worktrees/per-<issue>-<name> main`
+3. Work ONLY inside that worktree — all edits, tests, and commits happen there
 4. Create a PR from the feature branch to main
 5. Merge to main only after review/validation
 
