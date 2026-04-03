@@ -353,24 +353,16 @@ jobs:
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
-      - name: Inject mcpName into npm packages
+      - name: Inject mcpName and publish npm packages
         run: |
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
             pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
             mkdir -p /tmp/npm-patch
             tar xzf "./npm/${pkg}" -C /tmp/npm-patch
-            cd /tmp/npm-patch
-            jq '.mcpName = "io.github.etiennechollet/ontomics"' package/package.json > package/package.json.tmp
-            mv package/package.json.tmp package/package.json
-            tar czf "$GITHUB_WORKSPACE/npm/${pkg}" .
-            cd "$GITHUB_WORKSPACE"
+            jq '.mcpName = "io.github.etiennechollet/ontomics"' /tmp/npm-patch/package/package.json > /tmp/npm-patch/package/package.json.tmp
+            mv /tmp/npm-patch/package/package.json.tmp /tmp/npm-patch/package/package.json
+            npm publish --access public /tmp/npm-patch/package
             rm -rf /tmp/npm-patch
-          done
-      - name: Publish npm packages
-        run: |
-          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
-            pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
-            npm publish --access public "./npm/${pkg}"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
