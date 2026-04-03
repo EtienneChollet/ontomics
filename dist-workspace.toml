@@ -21,6 +21,8 @@ install-updater = true
 npm-scope = "@ontomics"
 # Only run plan on PRs (save CI minutes)
 pr-run-mode = "plan"
+# Allow hand-edited CI (mcpName injection step in publish-npm)
+allow-dirty = ["ci"]
 # Publish npm package to registry (requires NPM_TOKEN secret in GitHub)
 publish-jobs = ["npm", "homebrew"]
 # Homebrew tap repo for `brew install EtienneChollet/tap/ontomics`
