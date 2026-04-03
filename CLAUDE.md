@@ -63,7 +63,24 @@ cargo clippy                   # lint (must pass with zero warnings)
 
 Optional feature flag: `cargo build --features lsp` enables pyright-based LSP enrichment for inheritance chains.
 
-Releases use `cargo-dist` (see `dist-workspace.toml`). CI builds on tag push via `.github/workflows/release.yml`. Targets: macOS (aarch64, x86_64), Linux (x86_64, glibc 2.28+). Distributed via Homebrew, npm (`@ontomics/ontomics`), and shell installer.
+## Releases
+
+**All four version sources MUST be bumped in lockstep on every release:**
+
+1. `Cargo.toml` — `version` field
+2. `Cargo.lock` — auto-updated via `cargo update -p ontomics`
+3. `server.json` — both top-level `version` and `packages[0].version`
+
+**Release procedure:**
+1. Bump versions in `Cargo.toml` and `server.json` (all three locations)
+2. Run `cargo update -p ontomics` to sync `Cargo.lock`
+3. Commit: `chore: Release ontomics version X.Y.Z`
+4. Tag: `git tag vX.Y.Z`
+5. Push commit and tag: `git push && git push origin vX.Y.Z`
+
+CI (`release.yml`) handles everything from there: builds binaries, publishes to GitHub Releases, npm, Homebrew, and MCP Registry. All four channels must show the same version after a release.
+
+Distribution targets: macOS (aarch64, x86_64), Linux (x86_64, glibc 2.28+). See `dist-workspace.toml` for config.
 
 ## Architecture
 

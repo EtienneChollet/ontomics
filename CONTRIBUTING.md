@@ -110,4 +110,50 @@ cargo run -- diff /path/to/codebase HEAD~5
 
 ## Releases
 
-Releases use `cargo-dist`. CI builds on tag push via `.github/workflows/release.yml`. To cut a release, see the `cargo-release` workflow.
+Releases use `cargo-dist`. CI builds on tag push via `.github/workflows/release.yml`.
+
+### Version sources (must stay in sync)
+
+Every release touches exactly these files:
+
+| File | Field(s) |
+|------|----------|
+| `Cargo.toml` | `version` |
+| `Cargo.lock` | `ontomics` package version (auto via `cargo update -p ontomics`) |
+| `server.json` | `version` and `packages[0].version` |
+
+### Cutting a release
+
+```bash
+# 1. Bump Cargo.toml version and server.json (both version fields)
+# 2. Sync lockfile
+cargo update -p ontomics
+
+# 3. Commit and tag
+git add Cargo.toml Cargo.lock server.json
+git commit -m "chore: Release ontomics version X.Y.Z"
+git tag vX.Y.Z
+
+# 4. Push
+git push && git push origin vX.Y.Z
+```
+
+CI publishes to all four channels automatically:
+
+| Channel | Job | Auth |
+|---------|-----|------|
+| GitHub Releases | `host` | `GITHUB_TOKEN` |
+| npm (`@ontomics/ontomics`) | `publish-npm` | `NPM_TOKEN` secret |
+| Homebrew (`EtienneChollet/tap`) | `publish-homebrew-formula` | `HOMEBREW_TAP_TOKEN` secret |
+| MCP Registry | `publish-mcp-registry` | GitHub OIDC (no secret needed) |
+
+### Verifying a release
+
+After CI completes, confirm all channels show the same version:
+
+```bash
+gh release view vX.Y.Z --json tagName        # GitHub
+npm view @ontomics/ontomics version           # npm
+# Homebrew: check EtienneChollet/homebrew-tap Formula/ontomics.rb
+# MCP Registry: https://registry.modelcontextprotocol.io
+```
