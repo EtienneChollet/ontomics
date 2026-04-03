@@ -164,6 +164,7 @@ mod testbed {
             min_frequency: config.index.min_frequency,
             tfidf_threshold: config.analysis.domain_specificity_threshold,
             convention_threshold: config.analysis.convention_threshold,
+            language: language_name.to_string(),
         };
         let analysis =
             analyzer::analyze(&parse_results, &analysis_params)

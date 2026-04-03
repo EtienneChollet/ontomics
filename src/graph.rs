@@ -350,7 +350,7 @@ impl ConceptGraph {
             .map(|e| e.summary())
             .collect();
 
-        Some(ConceptQueryResult {
+        let mut result = ConceptQueryResult {
             concept: concept.clone(),
             variants,
             related,
@@ -360,7 +360,49 @@ impl ConceptGraph {
             classes: matching_classes,
             call_graph,
             entities,
-        })
+        };
+        Self::compact_query_result(&mut result);
+        Some(result)
+    }
+
+    /// Budget in bytes for MCP tool output (~10K tokens).
+    const OUTPUT_BUDGET_BYTES: usize = 40_000;
+
+    /// Strip internal-only data and progressively compact a query result
+    /// so that the serialized output stays within the token budget.
+    fn compact_query_result(r: &mut ConceptQueryResult) {
+        r.concept.occurrences.clear();
+        r.concept.embedding = None;
+        for sc in &mut r.concept.subconcepts {
+            sc.embedding = None;
+        }
+
+        if Self::estimated_json_len(r) <= Self::OUTPUT_BUDGET_BYTES {
+            return;
+        }
+
+        // Level 1: trim unbounded / low-priority fields
+        r.call_graph.truncate(10);
+        r.classes.truncate(3);
+        r.variants.truncate(10);
+        for sc in &mut r.concept.subconcepts {
+            sc.occurrences.truncate(3);
+        }
+
+        if Self::estimated_json_len(r) <= Self::OUTPUT_BUDGET_BYTES {
+            return;
+        }
+
+        // Level 2: aggressive — keep only the essentials
+        r.call_graph.clear();
+        r.classes.truncate(1);
+        r.signatures.truncate(2);
+        r.variants.truncate(5);
+        r.concept.subconcepts.clear();
+    }
+
+    fn estimated_json_len(r: &ConceptQueryResult) -> usize {
+        serde_json::to_string(r).map(|s| s.len()).unwrap_or(0)
     }
 
     /// Check an identifier against project conventions.
@@ -1179,6 +1221,7 @@ impl ConceptGraph {
         let mut concepts: Vec<&Concept> =
             self.concepts.values().collect();
         concepts.sort_by(|a, b| b.occurrences.len().cmp(&a.occurrences.len()));
+        concepts.truncate(350);
         concepts
     }
 

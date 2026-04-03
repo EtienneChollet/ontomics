@@ -11,10 +11,13 @@ use std::path::Path;
 
 /// Extract portable domain knowledge from a concept graph.
 pub fn export_domain_pack(graph: &ConceptGraph) -> DomainPack {
-    let abbreviations = export_abbreviations(graph);
-    let conventions = export_conventions(graph);
+    let mut abbreviations = export_abbreviations(graph);
+    let mut conventions = export_conventions(graph);
     let domain_terms = export_domain_terms(graph);
     let concept_associations = export_associations(graph);
+
+    abbreviations.truncate(30);
+    conventions.truncate(30);
 
     DomainPack {
         version: 1,
@@ -63,7 +66,7 @@ fn export_conventions(graph: &ConceptGraph) -> Vec<ConventionEntry> {
 fn export_domain_terms(graph: &ConceptGraph) -> Vec<DomainTerm> {
     let mut concepts: Vec<&Concept> = graph.concepts.values().collect();
     concepts.sort_by(|a, b| b.occurrences.len().cmp(&a.occurrences.len()));
-    concepts.truncate(100);
+    concepts.truncate(50);
 
     concepts
         .iter()
@@ -122,6 +125,7 @@ fn export_associations(graph: &ConceptGraph) -> Vec<ConceptAssociation> {
             if names.len() >= 2 {
                 let mut sorted_names = names.clone();
                 sorted_names.sort();
+                sorted_names.truncate(8);
                 associations.push(ConceptAssociation {
                     concepts: sorted_names,
                     kind: "cluster".to_string(),
@@ -130,6 +134,7 @@ fn export_associations(graph: &ConceptGraph) -> Vec<ConceptAssociation> {
         }
     }
 
+    associations.truncate(50);
     associations
 }
 

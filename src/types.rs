@@ -400,18 +400,36 @@ pub enum SymbolKind {
 
 // --- Ontology diff types ---
 
+/// Lightweight concept summary for diffs (no occurrences or embeddings).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffConceptSummary {
+    pub canonical: String,
+    pub frequency: usize,
+    pub entity_types: HashSet<EntityType>,
+}
+
+impl DiffConceptSummary {
+    pub fn from_concept(c: &Concept) -> Self {
+        Self {
+            canonical: c.canonical.clone(),
+            frequency: c.occurrences.len(),
+            entity_types: c.entity_types.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OntologyDiff {
     pub base_ref: String,
     pub head_ref: String,
-    pub added_concepts: Vec<Concept>,
-    pub removed_concepts: Vec<Concept>,
+    pub added_concepts: Vec<DiffConceptSummary>,
+    pub removed_concepts: Vec<DiffConceptSummary>,
     pub changed_concepts: Vec<ConceptDelta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConceptDelta {
-    pub concept: Concept,
+    pub concept: DiffConceptSummary,
     pub frequency_change: i64,
     pub new_variants: Vec<String>,
     pub removed_variants: Vec<String>,
