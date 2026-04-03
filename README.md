@@ -47,24 +47,21 @@ ontomics builds a semantic index of your project's domain — clustering related
 
 Install once, available in every project. No configuration needed — ontomics auto-detects the repo and indexes it on first run.
 
-### Claude Code
+### 1. Install the binary
 
 **npm (macOS/Linux):**
 ```bash
 npm install -g @ontomics/ontomics
-claude mcp add -s user ontomics -- ontomics
 ```
 
 **macOS (Homebrew):**
 ```bash
 brew install EtienneChollet/tap/ontomics
-claude mcp add -s user ontomics -- ontomics
 ```
 
 **Shell installer (macOS/Linux):**
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/EtienneChollet/ontomics/releases/latest/download/ontomics-installer.sh | sh
-claude mcp add -s user ontomics -- ontomics
 ```
 
 **From source:**
@@ -72,16 +69,29 @@ claude mcp add -s user ontomics -- ontomics
 git clone https://github.com/EtienneChollet/ontomics.git
 cd ontomics
 cargo build --release
+```
+
+### 2. Register with your harness
+
+**Claude Code:**
+```bash
 claude mcp add -s user ontomics -- ontomics
 ```
 
-### pi-coding-agent
+**Codex:**
+```bash
+codex mcp add ontomics -- ontomics
+```
 
+**OpenClaw:**
+```bash
+openclaw mcp set ontomics '{"command":"ontomics"}'
+```
+
+**pi-coding-agent:**
 ```bash
 pi install npm:@ontomics/ontomics
 ```
-
-Tools appear automatically as `ontomics_*` in `pi config`.
 
 **Share with your team** — drop an `.mcp.json` in your repo root:
 ```json
