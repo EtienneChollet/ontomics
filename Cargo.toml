@@ -71,6 +71,12 @@ ignore = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+# cargo-release: sync server.json version on release
+[package.metadata.release]
+pre-release-replacements = [
+  { file = "server.json", search = "\"version\": \"[0-9]+\\.[0-9]+\\.[0-9]+\"", replace = "\"version\": \"{{version}}\"" },
+]
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
