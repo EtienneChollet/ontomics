@@ -2,6 +2,27 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ABSOLUTE RULE — No AI attribution
+
+**NEVER mention Claude Code, Anthropic, ChatGPT, Codex, OpenAI, or any AI tool in commits, PRs, issues, comments, or any git artifact.** No "Co-Authored-By", no "Generated with", no AI attribution of any kind. This applies to all text that enters the git history or appears on GitHub.
+
+## ABSOLUTE RULE — Worktree workflow
+
+**ALL source code and test changes MUST go through a worktree branch and PR.** Never commit implementation work directly to main. **NEVER edit a single file before the worktree exists.**
+
+**The worktree MUST be created BEFORE any files are edited. This is the very first action for any implementation task. No exceptions. Do not edit on main and stash/move retroactively.**
+
+Worktree location: `./worktrees/per-<issue-number>-<issue-name>` (e.g., `worktrees/per-42-testbed-thread-cap`). **NEVER place worktrees outside the project root (e.g., `../`).**
+
+Workflow:
+1. Create a feature branch: `epc28/<description>` (associate with a Linear issue when one exists)
+2. Create the worktree: `git worktree add -b epc28/<name> worktrees/per-<issue>-<name> main`
+3. Work ONLY inside that worktree — all edits, tests, and commits happen there
+4. Create a PR from the feature branch to main
+5. Merge to main only after review/validation
+
+Direct commits to main are only acceptable for version bumps and release automation (cargo-release).
+
 ## ABSOLUTE RULE — Embeddings must stay enabled
 
 **NEVER disable embeddings** (`embeddings.enabled = false`) in any `.ontomics/config.toml` for any codebase without explicit permission from the user. Embeddings are a core part of the pipeline — disabling them silently degrades concept discovery, clustering, and suggest_name quality.
@@ -54,7 +75,7 @@ The pipeline runs in this order. Each module is a single file under `src/`.
 
 3. **`analyzer.rs`** — TF-IDF scoring on subtokens to find domain-specific concepts. Builds `Concept` nodes, `Convention` patterns, and `Relationship` edges (co-occurrence, abbreviation). Takes `AnalysisParams` (min_frequency, tfidf_threshold, convention_threshold).
 
-4. **`embeddings.rs`** — `EmbeddingIndex` wrapping fastembed (`BAAI/bge-small-en-v1.5`, local ONNX). Stores concept ID → vector mapping. Used for similarity queries and clustering.
+4. **`embeddings.rs`** — `EmbeddingIndex` using candle (`BAAI/bge-small-en-v1.5`, safetensors). Stores concept ID → vector mapping. Used for similarity queries and clustering.
 
 5. **`cluster.rs`** — Agglomerative clustering with average linkage (priority queue, O(N² log N)). Groups concepts by embedding similarity. Assigns `cluster_id` on each `Concept`.
 

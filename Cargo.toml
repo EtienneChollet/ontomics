@@ -10,6 +10,8 @@ readme = "README.md"
 
 [features]
 lsp = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
 
 [dependencies]
 # Parsing

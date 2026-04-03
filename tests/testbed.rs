@@ -76,9 +76,27 @@ mod testbed {
         CACHE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// Cap the rayon global thread pool to one-third of CPUs (matching
+    /// the production default in ResourcesConfig).
+    fn init_thread_pool() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let threads = (cpus / 3).max(1);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .ok();
+            eprintln!("Rayon global pool: {threads} threads ({cpus} CPUs)");
+        });
+    }
+
     /// Build or retrieve a cached BuiltGraph for the given repo.
     /// Returns None if the repo path doesn't exist (test should skip).
     pub fn get_or_build_graph(exp: &TestbedExpectations) -> Option<BuiltGraph> {
+        init_thread_pool();
         let repo = Path::new(exp.repo_path);
         if !repo.exists() {
             eprintln!("SKIP: {} not found at {}", exp.name, exp.repo_path);
