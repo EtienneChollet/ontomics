@@ -6,6 +6,7 @@
 ![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)
 ![platform](https://img.shields.io/badge/macOS_·_Linux-grey)
 ![MCP](https://img.shields.io/badge/MCP_Server-green)
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-listed-blue)](https://registry.modelcontextprotocol.io/)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c?logo=anthropic&logoColor=white)
 ![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
 
@@ -72,6 +73,18 @@ claude mcp add -s user ontomics -- ontomics
 ```
 
 No configuration needed. ontomics auto-detects the repo and indexes it on first run.
+
+**Share with your team** — drop an `.mcp.json` in your repo root:
+```json
+{
+  "mcpServers": {
+    "ontomics": {
+      "command": "npx",
+      "args": ["-y", "@ontomics/ontomics", "--repo", "."]
+    }
+  }
+}
+```
 
 ## Supported languages
 
