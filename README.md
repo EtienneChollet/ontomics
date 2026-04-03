@@ -47,6 +47,8 @@ ontomics builds a semantic index of your project's domain — clustering related
 
 Install once, available in every project. No configuration needed — ontomics auto-detects the repo and indexes it on first run.
 
+ontomics requires a git repository (`.git/` directory). It will refuse to index home, root, or temp directories. To index a non-git directory, pass `--force`.
+
 ### 1. Install the binary
 
 **npm (macOS/Linux):**
