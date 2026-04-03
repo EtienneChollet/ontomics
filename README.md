@@ -9,6 +9,7 @@
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-listed-blue)](https://registry.modelcontextprotocol.io/)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c?logo=anthropic&logoColor=white)
 ![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
+![pi](https://img.shields.io/badge/pi--coding--agent-blue)
 
 ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code and makes them queryable via [MCP](https://modelcontextprotocol.io/).
 
@@ -44,7 +45,9 @@ ontomics builds a semantic index of your project's domain — clustering related
 
 ## Install
 
-Install once, available in every project.
+Install once, available in every project. No configuration needed — ontomics auto-detects the repo and indexes it on first run.
+
+### Claude Code
 
 **npm (macOS/Linux):**
 ```bash
@@ -72,7 +75,13 @@ cargo build --release
 claude mcp add -s user ontomics -- ontomics
 ```
 
-No configuration needed. ontomics auto-detects the repo and indexes it on first run.
+### pi-coding-agent
+
+```bash
+pi install npm:@ontomics/ontomics
+```
+
+Tools appear automatically as `ontomics_*` in `pi config`.
 
 **Share with your team** — drop an `.mcp.json` in your repo root:
 ```json
