@@ -59,6 +59,10 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     language: String,
 
+    /// Index a directory even if it is not a git repository
+    #[arg(long)]
+    force: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -156,6 +160,34 @@ struct EmbeddingWork {
     similarity_threshold: f32,
     batch_size: usize,
     domain_packs: Vec<types::DomainPack>,
+}
+
+/// Paths that must never be indexed, regardless of `--force`.
+const BLACKLISTED_PATHS: &[&str] = &["/", "/tmp"];
+
+/// Reject blacklisted directories and require a git repo (unless `--force`).
+fn validate_repo_path(repo: &Path, force: bool) -> anyhow::Result<()> {
+    // Hard block: home, root, and temp directories.
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let is_blacklisted = BLACKLISTED_PATHS.iter().any(|p| repo == Path::new(p))
+        || home.as_deref() == Some(repo);
+    if is_blacklisted {
+        anyhow::bail!(
+            "Refusing to index {} — home, root, and temp directories are \
+             never valid indexing targets.",
+            repo.display(),
+        );
+    }
+
+    // Soft block: require .git/ unless --force.
+    if !force && !repo.join(".git").exists() {
+        anyhow::bail!(
+            "{} is not a git repository. Use --force to index anyway.",
+            repo.display(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Build or load the concept graph from cache.
@@ -698,13 +730,16 @@ async fn main() -> anyhow::Result<()> {
         return cmd_update();
     }
 
-    let mut config = config::Config::load(&cli.repo)?;
+    let repo = cli.repo.canonicalize().unwrap_or_else(|_| cli.repo.clone());
+    validate_repo_path(&repo, cli.force)?;
+
+    let mut config = config::Config::load(&repo)?;
 
     let mut startup_warnings: Vec<String> = Vec::new();
 
     // Resolve language: CLI flag > config file > auto-detection
     let (language, detected_file_count) = match cli.language.as_str() {
-        "auto" => config.language.resolve(&cli.repo),
+        "auto" => config.language.resolve(&repo),
         "python" | "py" => (config::Language::Python, u32::MAX),
         "typescript" | "ts" => (config::Language::TypeScript, u32::MAX),
         "javascript" | "js" => (config::Language::JavaScript, u32::MAX),
@@ -717,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
         startup_warnings.push(format!(
             "No supported source files found in {}. \
              ontomics supports Python, TypeScript, JavaScript, and Rust.",
-            cli.repo.display(),
+            repo.display(),
         ));
     }
     config.index.resolve_for_language(&language);
@@ -747,7 +782,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => {
             // Defer graph building to background — start MCP immediately
             run_server(
-                &cli.repo,
+                &repo,
                 &config,
                 active_parser,
                 lang_name,
@@ -758,7 +793,7 @@ async fn main() -> anyhow::Result<()> {
         cmd => {
             // CLI subcommands build the graph synchronously
             let result = build_graph(
-                &cli.repo, &config, false, &*active_parser, &lang_name,
+                &repo, &config, false, &*active_parser, &lang_name,
                 &mut startup_warnings,
             )?;
             match cmd {
@@ -771,7 +806,7 @@ async fn main() -> anyhow::Result<()> {
                     cmd_suggest(&result.graph, &description)
                 }
                 Command::Diff { since } => {
-                    cmd_diff(&cli.repo, &result.graph, &since, &*active_parser)
+                    cmd_diff(&repo, &result.graph, &since, &*active_parser)
                 }
                 Command::Concepts { top_k } => {
                     cmd_concepts(&result.graph, top_k)
