@@ -9,7 +9,6 @@ use rmcp::model::{
     ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use ontomics::types::ConceptQueryResult;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,47 +16,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 /// Budget in bytes for MCP tool output (~10K tokens).
 const OUTPUT_BUDGET_BYTES: usize = 40_000;
-
-/// Strip internal-only data and progressively compact a query result
-/// so that the serialized output stays within `OUTPUT_BUDGET_BYTES`.
-fn compact_query_result(r: &mut ConceptQueryResult) {
-    // Always strip data that is useless to MCP consumers:
-    // - concept.occurrences is redundant with top_occurrences
-    // - embedding vectors are internal implementation details
-    r.concept.occurrences.clear();
-    r.concept.embedding = None;
-    for sc in &mut r.concept.subconcepts {
-        sc.embedding = None;
-    }
-
-    if estimated_json_len(r) <= OUTPUT_BUDGET_BYTES {
-        return;
-    }
-
-    // Level 1: trim unbounded / low-priority fields
-    r.call_graph.truncate(10);
-    r.classes.truncate(3);
-    r.variants.truncate(10);
-    for sc in &mut r.concept.subconcepts {
-        sc.occurrences.truncate(3);
-    }
-
-    if estimated_json_len(r) <= OUTPUT_BUDGET_BYTES {
-        return;
-    }
-
-    // Level 2: aggressive — keep only the essentials
-    r.call_graph.clear();
-    r.classes.truncate(1);
-    r.signatures.truncate(2);
-    r.variants.truncate(5);
-    r.concept.subconcepts.clear();
-}
-
-/// Cheap size estimate: serialize to JSON and measure byte length.
-fn estimated_json_len(r: &ConceptQueryResult) -> usize {
-    serde_json::to_string(r).map(|s| s.len()).unwrap_or(0)
-}
 
 #[derive(Clone)]
 pub struct OntomicsServer {
@@ -146,8 +104,7 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         match graph.query_concept(term, &params) {
-            Some(mut result) => {
-                compact_query_result(&mut result);
+            Some(result) => {
                 serde_json::to_value(result)
                     .map_err(|e| format!("serialization error: {e}"))
             }
@@ -205,13 +162,12 @@ impl OntomicsServer {
         let top_k = args
             .get("top_k")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .unwrap_or(200);
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let mut concepts = graph.list_concepts();
-        if let Some(k) = top_k {
-            concepts.truncate(k);
-        }
+        concepts.truncate(top_k);
 
         let summary: Vec<Value> = concepts
             .iter()

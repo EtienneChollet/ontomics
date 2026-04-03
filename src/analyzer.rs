@@ -25,7 +25,9 @@ struct Corpus {
     nb_files: usize,
 }
 
-fn build_corpus(parse_results: &[ParseResult]) -> Corpus {
+fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
+    let stop_words: HashSet<&str> =
+        crate::tokenizer::language_stop_words(language).iter().copied().collect();
     let mut subtoken_file_counts: HashMap<String, HashMap<PathBuf, usize>> =
         HashMap::new();
     let mut subtoken_total_counts: HashMap<String, usize> = HashMap::new();
@@ -41,6 +43,9 @@ fn build_corpus(parse_results: &[ParseResult]) -> Corpus {
             let subtokens = split_identifier(&ident.name);
 
             for st in &subtokens {
+                if stop_words.contains(st.as_str()) {
+                    continue;
+                }
                 *subtoken_file_counts
                     .entry(st.clone())
                     .or_default()
@@ -584,6 +589,8 @@ pub struct AnalysisParams {
     pub min_frequency: usize,
     pub tfidf_threshold: f64,
     pub convention_threshold: usize,
+    /// Language name (e.g. "python", "rust") for stop-word filtering.
+    pub language: String,
 }
 
 impl Default for AnalysisParams {
@@ -592,6 +599,7 @@ impl Default for AnalysisParams {
             min_frequency: 2,
             tfidf_threshold: 0.1,
             convention_threshold: 3,
+            language: String::new(),
         }
     }
 }
@@ -607,7 +615,7 @@ pub fn analyze(
     parse_results: &[ParseResult],
     params: &AnalysisParams,
 ) -> Result<AnalysisResult> {
-    let corpus = build_corpus(parse_results);
+    let corpus = build_corpus(parse_results, &params.language);
     let tfidf_scores = compute_tfidf(&corpus);
     let concepts = build_concepts(
         &corpus,

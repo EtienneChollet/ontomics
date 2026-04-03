@@ -286,6 +286,7 @@ fn build_graph(
         min_frequency: config.index.min_frequency,
         tfidf_threshold: config.analysis.domain_specificity_threshold,
         convention_threshold: config.analysis.convention_threshold,
+        language: language_name.to_string(),
     };
     let mut analysis =
         analyzer::analyze(&parse_results, &analysis_params)?;
@@ -1243,6 +1244,7 @@ async fn run_server(
                         convention_threshold: watcher_config
                             .analysis
                             .convention_threshold,
+                        language: watcher_language_name.clone(),
                     };
                     let mut analysis = match analyzer::analyze(
                         &parse_results,

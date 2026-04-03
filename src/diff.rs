@@ -1,7 +1,7 @@
 use crate::analyzer;
 use crate::parser;
 use crate::parser::LanguageParser;
-use crate::types::{Concept, ConceptDelta, OntologyDiff, ParseResult};
+use crate::types::{Concept, ConceptDelta, DiffConceptSummary, OntologyDiff, ParseResult};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -45,13 +45,13 @@ pub fn ontology_diff(
 
     for (id, concept) in current_concepts {
         if !base_concepts.contains_key(id) {
-            added.push(concept.clone());
+            added.push(DiffConceptSummary::from_concept(concept));
         }
     }
 
     for (id, concept) in &base_concepts {
         if !current_concepts.contains_key(id) {
-            removed.push(concept.clone());
+            removed.push(DiffConceptSummary::from_concept(concept));
         }
     }
 
@@ -89,12 +89,27 @@ pub fn ontology_diff(
             || !removed_variants.is_empty()
         {
             changed.push(ConceptDelta {
-                concept: current.clone(),
+                concept: DiffConceptSummary::from_concept(current),
                 frequency_change: freq_change,
                 new_variants,
                 removed_variants,
             });
         }
+    }
+
+    // Sort by frequency descending so the most important entries survive truncation
+    added.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+    removed.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+    changed.sort_by(|a, b| {
+        b.frequency_change.unsigned_abs().cmp(&a.frequency_change.unsigned_abs())
+    });
+
+    added.truncate(40);
+    removed.truncate(40);
+    changed.truncate(50);
+    for delta in &mut changed {
+        delta.new_variants.truncate(5);
+        delta.removed_variants.truncate(5);
     }
 
     Ok(OntologyDiff {
