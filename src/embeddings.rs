@@ -18,6 +18,11 @@ struct BgeModel {
 
 impl BgeModel {
     fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        let device = Device::cuda_if_available(0)?;
+        #[cfg(feature = "metal")]
+        let device = Device::new_metal(0)?;
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let device = Device::Cpu;
 
         let mut builder = ApiBuilder::from_env();
