@@ -17,7 +17,6 @@ BENCHMARK_SPEC_A.md
 .mcpregistry_*
 rust_out
 testbed_timings.txt
-CONTRIBUTING.md
 DEFINITION_OF_DONE_GUIDE.md
 SPEC_ONTOLOGY_DIFF_TEST.md
 SPEC_TESTBED_QUALITY.md
