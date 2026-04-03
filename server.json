@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.etiennechollet/ontomics",
+  "name": "io.github.EtienneChollet/ontomics",
   "description": "MCP server that extracts domain ontologies — concepts, conventions, and naming.",
   "title": "ontomics",
   "websiteUrl": "https://github.com/EtienneChollet/ontomics",
@@ -8,13 +8,13 @@
     "url": "https://github.com/EtienneChollet/ontomics",
     "source": "github"
   },
-  "version": "0.2.2",
+  "version": "0.2.3",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@ontomics/ontomics",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
