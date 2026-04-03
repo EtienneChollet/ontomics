@@ -13,6 +13,7 @@ research/
 todo/
 BENCHMARK_SPEC_A.md
 *.tgz
+.mcpregistry_*
 rust_out
 testbed_timings.txt
 CONTRIBUTING.md
