@@ -26,8 +26,11 @@ struct Corpus {
 }
 
 fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
-    let stop_words: HashSet<&str> =
-        crate::tokenizer::language_stop_words(language).iter().copied().collect();
+    let stop_words: HashSet<&str> = language
+        .split(',')
+        .flat_map(|l| crate::tokenizer::language_stop_words(l.trim()))
+        .copied()
+        .collect();
     let mut subtoken_file_counts: HashMap<String, HashMap<PathBuf, usize>> =
         HashMap::new();
     let mut subtoken_total_counts: HashMap<String, usize> = HashMap::new();

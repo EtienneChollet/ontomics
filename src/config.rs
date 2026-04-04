@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::parser::{self, LanguageParser};
+
 /// Language to analyze.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -31,6 +33,36 @@ const DETECT_SKIP_DIRS: &[&str] = &[
 ];
 
 impl Language {
+    /// Detect all languages with at least `min_files` source files.
+    /// Returns `(Language, file_count)` pairs sorted by count descending.
+    /// Returns empty vec if no language meets the threshold.
+    pub fn detect_all(repo_root: &Path, min_files: u32) -> Vec<(Language, u32)> {
+        let mut py_count = 0u32;
+        let mut ts_count = 0u32;
+        let mut js_count = 0u32;
+        let mut rs_count = 0u32;
+        count_extensions(
+            repo_root, &mut py_count, &mut ts_count,
+            &mut js_count, &mut rs_count, 3,
+        );
+
+        let mut langs: Vec<(Language, u32)> = Vec::new();
+        if py_count >= min_files {
+            langs.push((Language::Python, py_count));
+        }
+        if ts_count >= min_files {
+            langs.push((Language::TypeScript, ts_count));
+        }
+        if js_count >= min_files {
+            langs.push((Language::JavaScript, js_count));
+        }
+        if rs_count >= min_files {
+            langs.push((Language::Rust, rs_count));
+        }
+        langs.sort_by(|a, b| b.1.cmp(&a.1));
+        langs
+    }
+
     /// Auto-detect language from file extensions in the repo root.
     /// Walks up to `max_depth` levels, skipping common non-source dirs.
     /// Returns `(language, total_files_found)` so the caller can
@@ -72,6 +104,28 @@ impl Language {
         match self {
             Language::Auto => Language::detect(repo_root),
             other => (other.clone(), u32::MAX),
+        }
+    }
+
+    /// Create a boxed `LanguageParser` for this language.
+    pub fn make_parser(&self) -> Box<dyn LanguageParser> {
+        match self {
+            Language::Python | Language::Auto => {
+                Box::new(parser::python_parser())
+            }
+            Language::TypeScript => Box::new(parser::typescript_parser()),
+            Language::JavaScript => Box::new(parser::javascript_parser()),
+            Language::Rust => Box::new(parser::rust_parser()),
+        }
+    }
+
+    /// Display-friendly name (capitalized).
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Language::Auto | Language::Python => "Python",
+            Language::TypeScript => "TypeScript",
+            Language::JavaScript => "JavaScript",
+            Language::Rust => "Rust",
         }
     }
 
@@ -234,6 +288,9 @@ pub struct IndexConfig {
     pub exclude: Vec<String>,
     pub min_frequency: usize,
     pub respect_gitignore: bool,
+    /// Minimum file count for a language to be included in multi-language
+    /// detection. Languages with fewer files are ignored.
+    pub min_files: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +327,7 @@ impl Default for IndexConfig {
             ],
             min_frequency: 2,
             respect_gitignore: true,
+            min_files: 5,
         }
     }
 }
@@ -284,6 +342,39 @@ impl IndexConfig {
         }
         if self.exclude == py_defaults.exclude {
             self.exclude = lang.default_exclude();
+        }
+    }
+
+    /// Apply multi-language defaults: union all include/exclude globs.
+    /// Only applies if the user hasn't customized them.
+    pub fn resolve_for_languages(&mut self, langs: &[Language]) {
+        assert!(!langs.is_empty(), "at least one language required");
+        if langs.len() == 1 {
+            self.resolve_for_language(&langs[0]);
+            return;
+        }
+        let py_defaults = IndexConfig::default();
+        if self.include == py_defaults.include {
+            let mut include = Vec::new();
+            for lang in langs {
+                for glob in lang.default_include() {
+                    if !include.contains(&glob) {
+                        include.push(glob);
+                    }
+                }
+            }
+            self.include = include;
+        }
+        if self.exclude == py_defaults.exclude {
+            let mut exclude = Vec::new();
+            for lang in langs {
+                for glob in lang.default_exclude() {
+                    if !exclude.contains(&glob) {
+                        exclude.push(glob);
+                    }
+                }
+            }
+            self.exclude = exclude;
         }
     }
 }
@@ -718,5 +809,72 @@ entity_types = ["Function"]
         // Custom values preserved (not replaced with TS defaults)
         assert_eq!(index.include, vec!["src/**/*.py"]);
         assert_eq!(index.exclude, vec!["**/vendor/**"]);
+    }
+
+    // --- Multi-language tests ---
+
+    #[test]
+    fn test_detect_all_polyglot() {
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_all");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("mod_{i}.py")), "").unwrap();
+        }
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("comp_{i}.ts")), "").unwrap();
+        }
+
+        // min_files=5: only Python qualifies
+        let langs = Language::detect_all(dir, 5);
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0].0, Language::Python);
+
+        // min_files=3: both qualify, Python first (more files)
+        let langs = Language::detect_all(dir, 3);
+        assert_eq!(langs.len(), 2);
+        assert_eq!(langs[0].0, Language::Python);
+        assert_eq!(langs[1].0, Language::TypeScript);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_detect_all_empty() {
+        let dir = std::path::Path::new("/tmp/ontomics_test_detect_all_empty");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let langs = Language::detect_all(dir, 5);
+        assert!(langs.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_resolve_for_languages_multi() {
+        let mut index = IndexConfig::default();
+        index.resolve_for_languages(&[Language::Python, Language::TypeScript]);
+        assert!(index.include.contains(&"**/*.py".to_string()));
+        assert!(index.include.contains(&"**/*.ts".to_string()));
+        assert!(index.include.contains(&"**/*.tsx".to_string()));
+        assert!(index.exclude.contains(&"**/test_*".to_string()));
+        assert!(index.exclude.contains(&"**/node_modules".to_string()));
+    }
+
+    #[test]
+    fn test_min_files_config() {
+        let toml_str = r#"
+[index]
+min_files = 10
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.index.min_files, 10);
+    }
+
+    #[test]
+    fn test_min_files_default() {
+        let config = Config::default();
+        assert_eq!(config.index.min_files, 5);
     }
 }
