@@ -35,7 +35,7 @@ rmcp = { version = "0.1", features = ["server", "transport-io"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Git
-git2 = { version = "0.19", features = ["vendored-openssl"] }
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
 # File watching
 notify = "7"
