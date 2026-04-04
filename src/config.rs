@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::parser::{self, LanguageParser};
@@ -241,6 +241,10 @@ pub struct Config {
     /// Weights for vocabulary health sub-scores.
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub logic: LogicConfig,
+    #[serde(default)]
+    pub centrality: CentralityConfig,
     #[cfg(feature = "lsp")]
     #[serde(default)]
     pub lsp: LspConfig,
@@ -457,6 +461,44 @@ impl Default for HealthConfig {
             convention_coverage_weight: 0.33,
             consistency_ratio_weight: 0.33,
             cluster_cohesion_weight: 0.33,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogicConfig {
+    pub enabled: bool,
+    pub similarity_threshold: f32,
+    pub max_pseudocode_lines: usize,
+    pub min_pseudocode_steps: usize,
+}
+
+impl Default for LogicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            similarity_threshold: 0.70,
+            max_pseudocode_lines: 30,
+            min_pseudocode_steps: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CentralityConfig {
+    pub enabled: bool,
+    pub damping: f32,
+    pub iterations: usize,
+}
+
+impl Default for CentralityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            damping: 0.85,
+            iterations: 50,
         }
     }
 }

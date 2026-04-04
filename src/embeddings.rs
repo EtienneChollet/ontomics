@@ -11,13 +11,13 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 
-struct BgeModel {
+pub(crate) struct BgeModel {
     model: BertModel,
     tokenizer: Tokenizer,
 }
 
 impl BgeModel {
-    fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
         #[cfg(feature = "cuda")]
         let device = Device::cuda_if_available(0)?;
         #[cfg(feature = "metal")]
@@ -59,7 +59,7 @@ impl BgeModel {
         Ok(BgeModel { model, tokenizer })
     }
 
-    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }

@@ -57,18 +57,14 @@ pub fn run_list_concepts(exp: &TestbedExpectations) {
         );
     }
 
-    // MCP response size limit: the MCP tool returns concept summaries
-    // (canonical, occurrences count, entity_types, entity_count) — not
-    // the full Concept struct. Simulate that lightweight serialization.
-    let summaries: Vec<serde_json::Value> = concepts.iter().map(|c| {
-        serde_json::json!({
-            "canonical": c.canonical,
-            "occurrences": c.occurrences.len(),
-            "entity_types": c.entity_types,
-            "entity_count": 0
-        })
-    }).collect();
-    let json = serde_json::to_string(&summaries).unwrap_or_default();
+    // MCP response size limit: the MCP tool returns concept names as a
+    // ranked list with a hint. Simulate that lightweight serialization.
+    let names: Vec<&str> = concepts.iter().map(|c| c.canonical.as_str()).collect();
+    let slim = serde_json::json!({
+        "concepts": names,
+        "hint": "Use query_concept(term) or locate_concept(term) to drill into any concept.",
+    });
+    let json = serde_json::to_string(&slim).unwrap_or_default();
     assert!(
         estimate_tokens(&json) < MCP_TOKEN_LIMIT,
         "{}: list_concepts response exceeds {} token limit (~{} tokens for {} concepts)",
@@ -322,6 +318,127 @@ pub fn run_describe_symbol(exp: &TestbedExpectations) {
             estimate_tokens(&json) < MCP_TOKEN_LIMIT,
             "{}: describe_symbol('{}') response exceeds token limit",
             exp.name, check.name
+        );
+    }
+}
+
+// ── describe_file ──────────────────────────────────────────────────────────
+
+pub fn run_describe_file(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    for check in &exp.describe_file_checks {
+        let results = bg.graph.describe_file(check.path);
+        assert!(
+            !results.is_empty(),
+            "{}: describe_file('{}') returned no results",
+            exp.name, check.path
+        );
+
+        // At least one result file must match the expected path substring
+        let matching_result = results.iter().find(|r| {
+            r.file.to_string_lossy().contains(check.file_contains)
+        });
+        assert!(
+            matching_result.is_some(),
+            "{}: describe_file('{}') no result file contains '{}'. Got: {:?}",
+            exp.name, check.path, check.file_contains,
+            results.iter().map(|r| r.file.to_string_lossy().to_string()).collect::<Vec<_>>()
+        );
+        let matched = matching_result.unwrap();
+
+        // Minimum symbol count: validates that the file was meaningfully parsed
+        assert!(
+            matched.symbols.len() >= check.min_symbols,
+            "{}: describe_file('{}') expected >= {} symbols, got {}. Symbols: {:?}",
+            exp.name, check.path, check.min_symbols, matched.symbols.len(),
+            matched.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        // Symbols must be sorted by line number (structural invariant)
+        for pair in matched.symbols.windows(2) {
+            assert!(
+                pair[0].line <= pair[1].line,
+                "{}: describe_file('{}') symbols not sorted by line: '{}' (L{}) before '{}' (L{})",
+                exp.name, check.path, pair[0].name, pair[0].line, pair[1].name, pair[1].line
+            );
+        }
+
+        // All symbols must have valid line numbers
+        for sym in &matched.symbols {
+            assert!(
+                sym.line > 0,
+                "{}: describe_file('{}') symbol '{}' has line 0",
+                exp.name, check.path, sym.name
+            );
+        }
+
+        // Validate each expected symbol
+        let all_symbols: Vec<&ontomics::types::FileSymbol> = matched.symbols.iter().collect();
+        for se in &check.must_have_symbols {
+            let found = all_symbols.iter().find(|s| s.name == se.name);
+            assert!(
+                found.is_some(),
+                "{}: describe_file('{}') missing expected symbol '{}'. Got: {:?}",
+                exp.name, check.path, se.name,
+                all_symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+            );
+            let sym = found.unwrap();
+
+            // Kind verification
+            let kind_str = format!("{:?}", sym.kind);
+            assert_eq!(
+                kind_str, se.expected_kind,
+                "{}: describe_file('{}') symbol '{}' expected kind {}, got {}",
+                exp.name, check.path, se.name, se.expected_kind, kind_str
+            );
+
+            // Concept annotation verification
+            if let Some(concept_substr) = se.concept_contains {
+                let has_concept = sym.concepts.iter().any(|c| c.contains(concept_substr));
+                assert!(
+                    has_concept,
+                    "{}: describe_file('{}') symbol '{}' expected concept containing '{}'. Got: {:?}",
+                    exp.name, check.path, se.name, concept_substr, sym.concepts
+                );
+            }
+
+            // Method nesting verification (for classes)
+            if se.min_methods > 0 {
+                assert!(
+                    sym.methods.len() >= se.min_methods,
+                    "{}: describe_file('{}') class '{}' expected >= {} methods, got {}. Methods: {:?}",
+                    exp.name, check.path, se.name, se.min_methods, sym.methods.len(),
+                    sym.methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()
+                );
+                // All nested methods must have kind Method
+                for m in &sym.methods {
+                    let m_kind = format!("{:?}", m.kind);
+                    assert_eq!(
+                        m_kind, "Method",
+                        "{}: describe_file('{}') nested method '{}' in '{}' has kind {}, expected Method",
+                        exp.name, check.path, m.name, se.name, m_kind
+                    );
+                }
+            }
+
+            // Base class verification (for classes)
+            if let Some(base_substr) = se.base_contains {
+                let has_base = sym.bases.iter().any(|b| b.contains(base_substr));
+                assert!(
+                    has_base,
+                    "{}: describe_file('{}') class '{}' expected base containing '{}'. Got: {:?}",
+                    exp.name, check.path, se.name, base_substr, sym.bases
+                );
+            }
+        }
+
+        // MCP token limit per file
+        let json = serde_json::to_string(&results).unwrap_or_default();
+        assert!(
+            estimate_tokens(&json) < MCP_TOKEN_LIMIT,
+            "{}: describe_file('{}') response exceeds token limit (~{} tokens)",
+            exp.name, check.path, estimate_tokens(&json)
         );
     }
 }

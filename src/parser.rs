@@ -1,6 +1,6 @@
 use crate::types::{
-    CallSite, ClassInfo, EntityType, Param, ParseResult, RawIdentifier,
-    Signature,
+    CallSite, ClassInfo, EntityType, FileNestingTree, FunctionBody, Param,
+    ParseResult, RawIdentifier, NestingKind, NestingNode, Signature,
 };
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -117,13 +117,164 @@ pub fn parse_content_with(
         &mut call_sites,
     );
 
+    let nesting_tree = build_nesting_tree(path, &signatures, &classes);
+
     Ok(ParseResult {
         identifiers,
         doc_texts,
         signatures,
         classes,
         call_sites,
+        nesting_trees: vec![nesting_tree],
     })
+}
+
+/// Build a nesting tree from already-parsed signatures and classes.
+///
+/// Creates a hierarchical representation of nesting: module -> class -> method,
+/// module -> function, etc. Uses the flat scope strings on signatures to
+/// determine parent-child relationships.
+pub fn build_nesting_tree(
+    path: &Path,
+    signatures: &[Signature],
+    classes: &[ClassInfo],
+) -> FileNestingTree {
+    let filename = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+
+    let mut root = NestingNode {
+        name: filename,
+        kind: NestingKind::Module,
+        line: 0,
+        children: Vec::new(),
+    };
+
+    // Index classes by name for lookup
+    let mut class_nodes: std::collections::HashMap<String, NestingNode> =
+        std::collections::HashMap::new();
+    for cls in classes {
+        if cls.file != path {
+            continue;
+        }
+        class_nodes.insert(
+            cls.name.clone(),
+            NestingNode {
+                name: cls.name.clone(),
+                kind: NestingKind::Class,
+                line: cls.line,
+                children: Vec::new(),
+            },
+        );
+    }
+
+    // Place each signature into the tree based on its scope
+    for sig in signatures {
+        if sig.file != path {
+            continue;
+        }
+        match &sig.scope {
+            None => {
+                // Top-level function
+                let node = NestingNode {
+                    name: sig.name.clone(),
+                    kind: NestingKind::Function,
+                    line: sig.line,
+                    children: Vec::new(),
+                };
+                root.children.push(node);
+            }
+            Some(scope) => {
+                // Split scope to find the immediate parent
+                let parts: Vec<&str> = scope.split('.').collect();
+                // Check if the first part is a known class
+                let is_method = class_nodes.contains_key(parts[0]);
+                let node = NestingNode {
+                    name: sig.name.clone(),
+                    kind: if is_method {
+                        NestingKind::Method
+                    } else {
+                        NestingKind::Function
+                    },
+                    line: sig.line,
+                    children: Vec::new(),
+                };
+                if is_method {
+                    if let Some(class_node) =
+                        class_nodes.get_mut(parts[0])
+                    {
+                        insert_into_scope(
+                            class_node, &parts[1..], node,
+                        );
+                    }
+                } else {
+                    // Parent is a function (inner function case) —
+                    // try to find it among root children
+                    insert_into_children(
+                        &mut root.children, &parts, node,
+                    );
+                }
+            }
+        }
+    }
+
+    // Add class nodes to root (sorted by line later)
+    for (_, class_node) in class_nodes {
+        // Sort class children by line
+        let mut cn = class_node;
+        cn.children.sort_by_key(|n| n.line);
+        root.children.push(cn);
+    }
+
+    // Sort root children by line
+    root.children.sort_by_key(|n| n.line);
+
+    FileNestingTree {
+        file: path.to_path_buf(),
+        root,
+    }
+}
+
+/// Insert a node into the correct nested position under `parent`,
+/// following the remaining scope path segments.
+fn insert_into_scope(
+    parent: &mut NestingNode,
+    remaining_path: &[&str],
+    node: NestingNode,
+) {
+    if remaining_path.is_empty() {
+        parent.children.push(node);
+        return;
+    }
+    // Find or create intermediate scope
+    let next = remaining_path[0];
+    if let Some(child) = parent.children.iter_mut().find(|c| c.name == next)
+    {
+        insert_into_scope(child, &remaining_path[1..], node);
+    } else {
+        // Intermediate scope doesn't exist yet — add directly to parent
+        parent.children.push(node);
+    }
+}
+
+/// Insert a node into an existing list of children, following the scope path.
+/// Used for inner functions where the parent is a top-level function.
+fn insert_into_children(
+    children: &mut Vec<NestingNode>,
+    path: &[&str],
+    node: NestingNode,
+) {
+    if path.is_empty() {
+        children.push(node);
+        return;
+    }
+    if let Some(parent) = children.iter_mut().find(|c| c.name == path[0]) {
+        insert_into_scope(parent, &path[1..], node);
+    } else {
+        // Parent not found — add as root-level child
+        children.push(node);
+    }
 }
 
 /// Options controlling which files are parsed.
@@ -197,6 +348,25 @@ pub fn rust_parser() -> RustParser {
 // ---------------------------------------------------------------------------
 // Shared helpers used across language parsers
 // ---------------------------------------------------------------------------
+
+/// Extract a `FunctionBody` from a body/block child node.
+fn extract_function_body(
+    body_node: tree_sitter::Node,
+    source: &[u8],
+    name: &str,
+    scope: &Option<String>,
+    path: &Path,
+) -> Option<FunctionBody> {
+    let body_text = body_node.utf8_text(source).ok()?.to_string();
+    Some(FunctionBody {
+        entity_name: name.to_string(),
+        scope: scope.clone(),
+        body_text,
+        file: path.to_path_buf(),
+        start_line: body_node.start_position().row + 1,
+        end_line: body_node.end_position().row + 1,
+    })
+}
 
 /// Recurse into all children, delegating each to the parser's `visit_node`.
 #[allow(clippy::too_many_arguments)]
@@ -772,6 +942,12 @@ fn py_extract_signature(
     let docstring_first_line =
         py_extract_body_docstring_first_line(node, source);
 
+    let body = node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, &name, scope, path)
+        });
+
     Some(Signature {
         name,
         params,
@@ -781,6 +957,7 @@ fn py_extract_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -1597,6 +1774,11 @@ fn rs_extract_function(
         ));
     }
 
+    let body = find_named_child_by_kind(node, "block")
+        .and_then(|b| {
+            extract_function_body(b, source, name, scope, path)
+        });
+
     signatures.push(Signature {
         name: name.to_string(),
         params,
@@ -1606,6 +1788,7 @@ fn rs_extract_function(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     });
 
     Some(name.to_string())
@@ -2760,6 +2943,12 @@ fn ts_extract_function_signature(
         })
         .filter(|s| !s.is_empty());
 
+    let body = node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, &name, scope, path)
+        });
+
     Some(Signature {
         name,
         params,
@@ -2769,6 +2958,7 @@ fn ts_extract_function_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -2818,6 +3008,12 @@ fn ts_extract_method_signature(
         .and_then(|s| s.lines().next().map(|l| l.to_string()))
         .filter(|s| !s.is_empty());
 
+    let body = node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, &name, scope, path)
+        });
+
     Some(Signature {
         name,
         params,
@@ -2827,6 +3023,7 @@ fn ts_extract_method_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -2856,6 +3053,12 @@ fn ts_extract_arrow_signature(
         .and_then(|n| n.utf8_text(source).ok())
         .map(|s| s.to_string());
 
+    let body = arrow_node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, name, scope, path)
+        });
+
     Some(Signature {
         name: name.to_string(),
         params,
@@ -2865,6 +3068,7 @@ fn ts_extract_arrow_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -3141,6 +3345,12 @@ fn js_extract_function_signature(
         .and_then(|s| s.lines().next().map(|l| l.to_string()))
         .filter(|s| !s.is_empty());
 
+    let body = node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, &name, scope, path)
+        });
+
     Some(Signature {
         name,
         params,
@@ -3150,6 +3360,7 @@ fn js_extract_function_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -3182,6 +3393,12 @@ fn js_extract_method_signature(
         .and_then(|s| s.lines().next().map(|l| l.to_string()))
         .filter(|s| !s.is_empty());
 
+    let body = node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, &name, scope, path)
+        });
+
     Some(Signature {
         name,
         params,
@@ -3191,6 +3408,7 @@ fn js_extract_method_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -3214,6 +3432,12 @@ fn js_extract_arrow_signature(
         }
     }
 
+    let body = arrow_node
+        .child_by_field_name("body")
+        .and_then(|b| {
+            extract_function_body(b, source, name, scope, path)
+        });
+
     Some(Signature {
         name: name.to_string(),
         params,
@@ -3223,6 +3447,7 @@ fn js_extract_arrow_signature(
         file: path.to_path_buf(),
         line,
         scope: scope.clone(),
+        body,
     })
 }
 
@@ -5597,5 +5822,212 @@ impl Counter {
             "self.step should produce an Attribute identifier. \
              Got: {attr_names:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod nesting_tree_tests {
+    use super::*;
+    use crate::types::{NestingKind, ClassInfo, Signature, Param};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_standalone_functions_at_module_level() {
+        let path = Path::new("utils.py");
+        let sigs = vec![
+            Signature {
+                name: "foo".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("utils.py"),
+                line: 1,
+                scope: None,
+                body: None,
+            },
+            Signature {
+                name: "bar".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("utils.py"),
+                line: 10,
+                scope: None,
+                body: None,
+            },
+        ];
+        let tree = build_nesting_tree(path, &sigs, &[]);
+
+        assert_eq!(tree.root.kind, NestingKind::Module);
+        assert_eq!(tree.root.children.len(), 2);
+        assert_eq!(tree.root.children[0].name, "foo");
+        assert_eq!(tree.root.children[0].kind, NestingKind::Function);
+        assert_eq!(tree.root.children[1].name, "bar");
+        assert_eq!(tree.root.children[1].kind, NestingKind::Function);
+    }
+
+    #[test]
+    fn test_class_method_nesting() {
+        let path = Path::new("model.py");
+        let classes = vec![ClassInfo {
+            name: "MyModel".to_string(),
+            bases: vec!["nn.Module".to_string()],
+            methods: vec!["forward".to_string(), "train_step".to_string()],
+            attributes: Vec::new(),
+            docstring_first_line: None,
+            file: PathBuf::from("model.py"),
+            line: 5,
+        }];
+        let sigs = vec![
+            Signature {
+                name: "forward".to_string(),
+                params: vec![Param {
+                    name: "self".to_string(),
+                    type_annotation: None,
+                    default: None,
+                }],
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("model.py"),
+                line: 10,
+                scope: Some("MyModel".to_string()),
+                body: None,
+            },
+            Signature {
+                name: "train_step".to_string(),
+                params: vec![Param {
+                    name: "self".to_string(),
+                    type_annotation: None,
+                    default: None,
+                }],
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("model.py"),
+                line: 20,
+                scope: Some("MyModel".to_string()),
+                body: None,
+            },
+        ];
+        let tree = build_nesting_tree(path, &sigs, &classes);
+
+        assert_eq!(tree.root.children.len(), 1);
+        let class_node = &tree.root.children[0];
+        assert_eq!(class_node.name, "MyModel");
+        assert_eq!(class_node.kind, NestingKind::Class);
+        assert_eq!(class_node.children.len(), 2);
+        assert_eq!(class_node.children[0].name, "forward");
+        assert_eq!(class_node.children[0].kind, NestingKind::Method);
+        assert_eq!(class_node.children[1].name, "train_step");
+        assert_eq!(class_node.children[1].kind, NestingKind::Method);
+    }
+
+    #[test]
+    fn test_inner_function_nesting() {
+        let path = Path::new("utils.py");
+        let sigs = vec![
+            Signature {
+                name: "outer".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("utils.py"),
+                line: 1,
+                scope: None,
+                body: None,
+            },
+            Signature {
+                name: "inner".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("utils.py"),
+                line: 5,
+                scope: Some("outer".to_string()),
+                body: None,
+            },
+        ];
+        let tree = build_nesting_tree(path, &sigs, &[]);
+
+        assert_eq!(tree.root.children.len(), 1);
+        let outer = &tree.root.children[0];
+        assert_eq!(outer.name, "outer");
+        assert_eq!(outer.kind, NestingKind::Function);
+        assert_eq!(outer.children.len(), 1);
+        assert_eq!(outer.children[0].name, "inner");
+        assert_eq!(outer.children[0].kind, NestingKind::Function);
+    }
+
+    #[test]
+    fn test_sorted_by_line() {
+        let path = Path::new("test.py");
+        let sigs = vec![
+            Signature {
+                name: "beta".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 20,
+                scope: None,
+                body: None,
+            },
+            Signature {
+                name: "alpha".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 5,
+                scope: None,
+                body: None,
+            },
+        ];
+        let tree = build_nesting_tree(path, &sigs, &[]);
+
+        assert_eq!(tree.root.children[0].name, "alpha");
+        assert_eq!(tree.root.children[0].line, 5);
+        assert_eq!(tree.root.children[1].name, "beta");
+        assert_eq!(tree.root.children[1].line, 20);
+    }
+
+    #[test]
+    fn test_filters_by_file() {
+        let path = Path::new("a.py");
+        let sigs = vec![
+            Signature {
+                name: "in_a".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("a.py"),
+                line: 1,
+                scope: None,
+                body: None,
+            },
+            Signature {
+                name: "in_b".to_string(),
+                params: Vec::new(),
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("b.py"),
+                line: 1,
+                scope: None,
+                body: None,
+            },
+        ];
+        let tree = build_nesting_tree(path, &sigs, &[]);
+
+        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(tree.root.children[0].name, "in_a");
     }
 }

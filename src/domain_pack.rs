@@ -407,6 +407,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let mut graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -549,6 +550,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
 
         merge_pack_into_analysis(&pack, &mut analysis);

@@ -370,6 +370,7 @@ mod tests {
             file: PathBuf::from("utils.py"),
             line: 5,
             scope: None,
+            body: None,
         }];
         let concepts = make_concepts(&[(1, "spatial"), (2, "transform")]);
         let (entities, _) = build_entities(&sigs, &[], &[], &concepts);
@@ -618,6 +619,7 @@ mod tests {
             file: PathBuf::from("loss.py"),
             line: 5,
             scope: Some("FocalDiceLoss".to_string()),
+            body: None,
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
         let (entities, _) = build_entities(&sigs, &classes, &[], &concepts);
@@ -656,6 +658,7 @@ mod tests {
             file: PathBuf::from("utils.py"),
             line: 1,
             scope: None,
+            body: None,
         }];
         let concepts = make_concepts(&[(1, "disp"), (2, "trf")]);
         let conventions = vec![Convention {
@@ -682,6 +685,7 @@ mod tests {
             file: PathBuf::from("utils.py"),
             line: 1,
             scope: None,
+            body: None,
         }];
         let concepts = make_concepts(&[(1, "spatial"), (2, "transform")]);
         let (mut entities, _) = build_entities(&sigs, &[], &[], &concepts);

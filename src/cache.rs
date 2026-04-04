@@ -1,8 +1,9 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
+use crate::logic::LogicIndex;
 use crate::types::{
-    CallSite, ClassInfo, Concept, Convention, Entity, ParseResult,
-    Relationship, Signature,
+    CallSite, CentralityScore, ClassInfo, Concept, Convention, Entity,
+    LogicCluster, ParseResult, Pseudocode, Relationship, Signature,
 };
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -37,6 +38,16 @@ struct CachedGraph {
     classes: Vec<ClassInfo>,
     call_sites: Vec<CallSite>,
     entities: HashMap<u64, Entity>,
+    #[serde(default)]
+    pseudocode: HashMap<u64, Pseudocode>,
+    #[serde(default)]
+    logic_index: LogicIndex,
+    #[serde(default)]
+    logic_clusters: Vec<LogicCluster>,
+    #[serde(default)]
+    centrality: HashMap<u64, CentralityScore>,
+    #[serde(default)]
+    logic_concept_overlaps: Vec<(usize, usize, f32)>,
 }
 
 impl IndexCache {
@@ -238,6 +249,11 @@ impl IndexCache {
             classes: graph.classes.clone(),
             call_sites: graph.call_sites.clone(),
             entities: graph.entities.clone(),
+            pseudocode: graph.pseudocode.clone(),
+            logic_index: serde_json::from_value(serde_json::to_value(&graph.logic_index)?)?,
+            logic_clusters: graph.logic_clusters.clone(),
+            centrality: graph.centrality.clone(),
+            logic_concept_overlaps: graph.logic_concept_overlaps.clone(),
         };
         let json = serde_json::to_vec(&cached)?;
 
@@ -424,6 +440,25 @@ impl IndexCache {
             Err(_) => return Ok(None),
         };
 
+        // Rebuild nesting trees from cached signatures and classes
+        let mut files: HashSet<PathBuf> = HashSet::new();
+        for sig in &cached.signatures {
+            files.insert(sig.file.clone());
+        }
+        for cls in &cached.classes {
+            files.insert(cls.file.clone());
+        }
+        let nesting_trees: Vec<crate::types::FileNestingTree> = files
+            .into_iter()
+            .map(|f| {
+                crate::parser::build_nesting_tree(
+                    &f,
+                    &cached.signatures,
+                    &cached.classes,
+                )
+            })
+            .collect();
+
         Ok(Some(ConceptGraph {
             concepts: cached.concepts,
             relationships: cached.relationships,
@@ -434,6 +469,12 @@ impl IndexCache {
             call_sites: cached.call_sites,
             entities: cached.entities,
             cluster_centroids: HashMap::new(),
+            pseudocode: cached.pseudocode,
+            logic_index: cached.logic_index,
+            logic_clusters: cached.logic_clusters,
+            centrality: cached.centrality,
+            logic_concept_overlaps: cached.logic_concept_overlaps,
+            nesting_trees,
         }))
     }
 
@@ -649,6 +690,12 @@ mod tests {
             call_sites: Vec::new(),
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: crate::logic::LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         }
     }
 
@@ -889,6 +936,7 @@ mod tests {
                 file: std::path::PathBuf::from(format!("file_{i}.py")),
                 line: i + 1,
                 scope: None,
+                body: None,
             })
             .collect();
 
@@ -923,6 +971,12 @@ mod tests {
             call_sites,
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: crate::logic::LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -1035,6 +1089,12 @@ mod tests {
             entities: HashMap::new(),
             call_sites: Vec::new(),
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: crate::logic::LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -1103,6 +1163,12 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: crate::logic::LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -1226,6 +1292,12 @@ mod tests {
             call_sites: Vec::new(),
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: crate::logic::LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         }
     }
 
@@ -1298,6 +1370,125 @@ mod tests {
 
         // Should still load — no manifest means skip check
         assert!(cache.load("python").unwrap().is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// L4 fields (pseudocode, logic_clusters, centrality) survive a cache
+    /// save/load round-trip without data loss.
+    #[test]
+    fn test_cache_roundtrip_l4_fields() {
+        use crate::types::{
+            CentralityScore, LogicCluster, Pseudocode, PseudocodeStep,
+        };
+
+        let dir = Path::new("/tmp/ontomics_test_cache_l4_roundtrip");
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+
+        let mut graph = make_test_graph();
+
+        // Populate pseudocode
+        graph.pseudocode.insert(
+            10,
+            Pseudocode {
+                entity_id: 10,
+                steps: vec![
+                    PseudocodeStep::Call {
+                        callee: "validate".to_string(),
+                        args: vec![],
+                    },
+                    PseudocodeStep::Return {
+                        value: Some("result".to_string()),
+                    },
+                ],
+                body_hash: 0xdeadbeef,
+                omitted_count: 0,
+            },
+        );
+        graph.pseudocode.insert(
+            20,
+            Pseudocode {
+                entity_id: 20,
+                steps: vec![PseudocodeStep::Call {
+                    callee: "compute".to_string(),
+                    args: vec![],
+                }],
+                body_hash: 0xcafe,
+                omitted_count: 0,
+            },
+        );
+
+        // Populate logic_clusters
+        graph.logic_clusters = vec![
+            LogicCluster {
+                id: 0,
+                entity_ids: vec![10, 20],
+                centroid: vec![0.5, 0.5],
+                behavioral_label: Some("validator".to_string()),
+            },
+            LogicCluster {
+                id: 1,
+                entity_ids: vec![30],
+                centroid: vec![1.0, 0.0],
+                behavioral_label: None,
+            },
+        ];
+
+        // Populate centrality
+        graph.centrality.insert(
+            10,
+            CentralityScore {
+                entity_id: 10,
+                in_degree: 5,
+                out_degree: 2,
+                pagerank: 0.37,
+            },
+        );
+        graph.centrality.insert(
+            20,
+            CentralityScore {
+                entity_id: 20,
+                in_degree: 1,
+                out_degree: 3,
+                pagerank: 0.12,
+            },
+        );
+
+        // Also inject a logic vector
+        graph.logic_index.insert_vector(10, vec![0.9, 0.1, 0.0]);
+        graph.logic_index.insert_vector(20, vec![0.1, 0.9, 0.0]);
+
+        let cache = IndexCache::open(dir).unwrap();
+        cache.save(&graph, "python").unwrap();
+        let loaded = cache.load("python").unwrap().expect("cache must load");
+
+        // Pseudocode keys preserved
+        assert_eq!(loaded.pseudocode.len(), 2);
+        assert!(loaded.pseudocode.contains_key(&10));
+        assert!(loaded.pseudocode.contains_key(&20));
+        assert_eq!(loaded.pseudocode[&10].body_hash, 0xdeadbeef);
+        assert_eq!(loaded.pseudocode[&10].steps.len(), 2);
+
+        // Logic clusters preserved
+        assert_eq!(loaded.logic_clusters.len(), 2);
+        let labeled = loaded
+            .logic_clusters
+            .iter()
+            .find(|lc| lc.behavioral_label.is_some())
+            .expect("one labeled cluster must survive");
+        assert_eq!(labeled.behavioral_label.as_deref(), Some("validator"));
+        assert_eq!(labeled.entity_ids, vec![10, 20]);
+
+        // Centrality preserved
+        assert_eq!(loaded.centrality.len(), 2);
+        assert!((loaded.centrality[&10].pagerank - 0.37).abs() < 1e-6);
+        assert_eq!(loaded.centrality[&20].in_degree, 1);
+
+        // Logic vectors preserved
+        assert_eq!(loaded.logic_index.nb_vectors(), 2);
+        assert!(loaded.logic_index.get_vector(10).is_some());
+        assert!(loaded.logic_index.get_vector(20).is_some());
 
         let _ = fs::remove_dir_all(dir);
     }

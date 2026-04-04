@@ -1,18 +1,49 @@
 use crate::embeddings::EmbeddingIndex;
+use crate::logic::LogicIndex;
+use crate::pseudocode::format_pseudocode;
 use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::config::HealthConfig;
 use crate::types::{
-    AnalysisResult, CallSite, ClassInfo, Concept, ConceptQueryResult,
-    ConceptTrace, Convention, DescribeSymbolResult, Entity,
-    InconsistencyPair, LocateConceptResult, NameSuggestion,
-    NamingCheckResult, PatternKind, QueryConceptParams,
-    RelatedConcept, Relationship, RelationshipKind,
-    SessionBriefing, Signature, Subconcept, SymbolKind,
-    TraceEdge, TraceNode, TraceRole, Verdict, VocabularyHealth,
+    AnalysisResult, CallSite, CentralityScore, ClassInfo, CompactContext,
+    Concept, ConceptMap, ConceptQueryResult, ConceptTrace, Convention,
+    DescribeFileResult, DescribeSymbolResult, Entity, EntitySummary,
+    FileSymbol, FileNestingTree, InconsistencyPair, LocateConceptResult,
+    LogicCluster, LogicClusterSummary, LogicDescription, MethodSummary,
+    ModuleMapEntry, NameSuggestion, NamingCheckResult, PatternKind,
+    Pseudocode, QueryConceptParams, RelatedConcept, Relationship,
+    RelationshipKind, SessionBriefing, Signature, SimilarLogicResult,
+    Subconcept, SymbolKind, TraceEdge, TraceNode, TraceRole, TypeFlow,
+    TypeFlowResult, TypeFrequency, Verdict, VocabularyHealth,
 };
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+/// Find the longest common directory prefix across a set of file paths.
+fn longest_common_directory(paths: &[&std::path::Path]) -> PathBuf {
+    if paths.is_empty() {
+        return PathBuf::new();
+    }
+    let first: Vec<_> = paths[0].components().collect();
+    let mut prefix_len = first.len();
+    for path in &paths[1..] {
+        let comps: Vec<_> = path.components().collect();
+        prefix_len = prefix_len.min(comps.len());
+        for i in 0..prefix_len {
+            if first[i] != comps[i] {
+                prefix_len = i;
+                break;
+            }
+        }
+    }
+    // Walk back to the last directory component (strip filename from prefix)
+    let prefix: PathBuf = first[..prefix_len].iter().collect();
+    if prefix.extension().is_some() || paths.iter().all(|p| *p == prefix) {
+        prefix.parent().unwrap_or(&prefix).to_path_buf()
+    } else {
+        prefix
+    }
+}
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -22,6 +53,59 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (norm_a * norm_b)
+}
+
+/// Normalize a type annotation for type-flow tracking.
+/// Strips `Optional[...]` to its inner type and `Union[..., None]`
+/// to its first non-None variant.
+fn normalize_type_annotation(ann: &str) -> String {
+    let trimmed = ann.trim();
+
+    // Optional[X] -> X
+    if let Some(inner) = trimmed
+        .strip_prefix("Optional[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return normalize_type_annotation(inner);
+    }
+
+    // Union[X, None] or Union[X, Y, ...] -> first non-None type
+    if let Some(inner) = trimmed
+        .strip_prefix("Union[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        // Simple split on top-level commas (handles nested brackets)
+        let parts = split_top_level_commas(inner);
+        for part in &parts {
+            let p = part.trim();
+            if !p.eq_ignore_ascii_case("none") {
+                return normalize_type_annotation(p);
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Split a string by commas, but only at the top level
+/// (not inside brackets).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 pub struct ConceptGraph {
@@ -35,6 +119,18 @@ pub struct ConceptGraph {
     pub entities: HashMap<u64, Entity>,
     /// Mean embedding per cluster label, computed after clustering.
     pub cluster_centroids: HashMap<usize, Vec<f32>>,
+    /// L4: Pseudocode for entities, keyed by entity ID.
+    pub pseudocode: HashMap<u64, Pseudocode>,
+    /// L4: Logic embedding index for behavioral similarity search.
+    pub logic_index: LogicIndex,
+    /// L4: Clusters of entities with similar behavioral patterns.
+    pub logic_clusters: Vec<LogicCluster>,
+    /// L4: PageRank centrality scores, keyed by entity ID.
+    pub centrality: HashMap<u64, CentralityScore>,
+    /// L4: Jaccard overlaps between logic clusters and concept clusters.
+    /// Each tuple is (logic_cluster_id, concept_cluster_id, jaccard_score).
+    pub logic_concept_overlaps: Vec<(usize, usize, f32)>,
+    pub nesting_trees: Vec<FileNestingTree>,
 }
 
 impl ConceptGraph {
@@ -63,6 +159,12 @@ impl ConceptGraph {
             call_sites: Vec::new(),
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         }
     }
 
@@ -113,6 +215,12 @@ impl ConceptGraph {
             call_sites: analysis.call_sites,
             entities: entity_map,
             cluster_centroids: HashMap::new(),
+            pseudocode: HashMap::new(),
+            logic_index: LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: analysis.nesting_trees,
         })
     }
 
@@ -371,10 +479,14 @@ impl ConceptGraph {
     /// Strip internal-only data and progressively compact a query result
     /// so that the serialized output stays within the token budget.
     fn compact_query_result(r: &mut ConceptQueryResult) {
+        // Strip internal-only fields from concept
         r.concept.occurrences.clear();
         r.concept.embedding = None;
+        r.concept.entity_types.clear();
+        r.concept.subtokens.clear();
         for sc in &mut r.concept.subconcepts {
             sc.embedding = None;
+            sc.identifiers.clear();
         }
 
         if Self::estimated_json_len(r) <= Self::OUTPUT_BUDGET_BYTES {
@@ -1471,21 +1583,6 @@ impl ConceptGraph {
                     })
             });
 
-        let semantic_role = entity
-            .map(|e| e.semantic_role.clone())
-            .unwrap_or_default();
-
-        let concept_tags: Vec<String> = entity
-            .map(|e| {
-                e.concept_tags
-                    .iter()
-                    .filter_map(|id| {
-                        self.concepts.get(id).map(|c| c.canonical.clone())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let related_entities: Vec<_> = entity
             .map(|e| {
                 self.relationships
@@ -1515,8 +1612,6 @@ impl ConceptGraph {
             callers,
             callees,
             concepts,
-            semantic_role,
-            concept_tags,
             related_entities,
         })
     }
@@ -2200,6 +2295,231 @@ impl ConceptGraph {
         }
     }
 
+    /// Semantic topology of the codebase: which directories concentrate
+    /// which domain concepts, with entity counts and concept density.
+    pub fn concept_map(&self) -> ConceptMap {
+        use crate::types::EntityKind;
+
+        if self.entities.is_empty() {
+            return ConceptMap {
+                modules: Vec::new(),
+                total_entities: 0,
+                total_concepts: self.concepts.len(),
+            };
+        }
+
+        // Find the longest common prefix of all entity file paths
+        let all_files: Vec<&std::path::Path> = self
+            .entities
+            .values()
+            .map(|e| e.file.as_path())
+            .collect();
+        let common_prefix = longest_common_directory(&all_files);
+
+        // Group entities by directory (relative to common prefix)
+        let mut dir_groups: HashMap<String, Vec<&Entity>> = HashMap::new();
+        for entity in self.entities.values() {
+            let rel = entity
+                .file
+                .strip_prefix(&common_prefix)
+                .unwrap_or(&entity.file);
+            let dir = rel
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let dir = if dir.is_empty() {
+                ".".to_string()
+            } else {
+                dir
+            };
+            dir_groups.entry(dir).or_default().push(entity);
+        }
+
+        // Build module entries
+        let mut modules: Vec<ModuleMapEntry> = dir_groups
+            .into_iter()
+            .map(|(path, entities)| {
+                let nb_classes = entities
+                    .iter()
+                    .filter(|e| e.kind == EntityKind::Class)
+                    .count();
+                let nb_functions = entities
+                    .iter()
+                    .filter(|e| {
+                        e.kind == EntityKind::Function
+                            || e.kind == EntityKind::Method
+                    })
+                    .count();
+                let nb_entities = entities.len();
+
+                // Collect concept tags, count frequency within directory
+                let mut concept_freq: HashMap<u64, usize> = HashMap::new();
+                let mut total_tags = 0usize;
+                for entity in &entities {
+                    for &cid in &entity.concept_tags {
+                        *concept_freq.entry(cid).or_insert(0) += 1;
+                        total_tags += 1;
+                    }
+                }
+
+                // Rank concepts by frequency, take top 5
+                let mut freq_vec: Vec<(u64, usize)> =
+                    concept_freq.into_iter().collect();
+                freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                let dominant_concepts: Vec<String> = freq_vec
+                    .iter()
+                    .take(5)
+                    .filter_map(|(id, _)| {
+                        self.concepts
+                            .get(id)
+                            .map(|c| c.canonical.clone())
+                    })
+                    .collect();
+
+                let concept_density = if nb_entities > 0 {
+                    Some(total_tags as f64 / nb_entities as f64)
+                } else {
+                    None
+                };
+
+                ModuleMapEntry {
+                    path,
+                    dominant_concepts,
+                    nb_classes,
+                    nb_functions,
+                    nb_entities,
+                    concept_density,
+                }
+            })
+            .collect();
+
+        // Sort by entity count descending
+        modules.sort_by(|a, b| b.nb_entities.cmp(&a.nb_entities));
+
+        ConceptMap {
+            total_entities: self.entities.len(),
+            total_concepts: self.concepts.len(),
+            modules,
+        }
+    }
+
+    /// Look up the nesting tree for a file whose path ends with `path`.
+    pub fn nesting_tree(&self, path: &str) -> Option<&FileNestingTree> {
+        self.nesting_trees
+            .iter()
+            .find(|st| st.file.to_string_lossy().ends_with(path))
+    }
+
+    /// Trace how declared type annotations propagate along call
+    /// edges. Builds TypeFlow edges from callee return types and
+    /// parameter types using existing signatures and call sites.
+    pub fn type_flows(&self) -> TypeFlowResult {
+        // Index signatures by name for callee lookup.
+        let mut sig_by_name: HashMap<&str, Vec<&Signature>> = HashMap::new();
+        for sig in &self.signatures {
+            sig_by_name
+                .entry(sig.name.as_str())
+                .or_default()
+                .push(sig);
+        }
+
+        let mut flows: Vec<TypeFlow> = Vec::new();
+        let mut typed_edges = 0usize;
+        let mut untyped_edges = 0usize;
+
+        for cs in &self.call_sites {
+            // Find callee signature (match by name, pick first)
+            let callee_sig = sig_by_name
+                .get(cs.callee.as_str())
+                .and_then(|sigs| sigs.first())
+                .copied();
+
+            // Determine caller display name from scope
+            let caller_name = cs
+                .caller_scope
+                .as_deref()
+                .unwrap_or("<module>");
+
+            let callee_sig = match callee_sig {
+                Some(s) => s,
+                None => {
+                    untyped_edges += 1;
+                    continue;
+                }
+            };
+
+            let mut found_type = false;
+
+            // Return type flow: callee -> caller
+            if let Some(ref ret) = callee_sig.return_type {
+                let normalized = normalize_type_annotation(ret);
+                if !normalized.is_empty() {
+                    flows.push(TypeFlow {
+                        from_entity: cs.callee.clone(),
+                        to_entity: caller_name.to_string(),
+                        type_name: normalized,
+                        from_file: callee_sig.file.clone(),
+                        to_file: cs.file.clone(),
+                    });
+                    found_type = true;
+                }
+            }
+
+            // Parameter type flows: for each typed param, create
+            // a flow from caller -> callee
+            for param in &callee_sig.params {
+                if let Some(ref ann) = param.type_annotation {
+                    let normalized = normalize_type_annotation(ann);
+                    if !normalized.is_empty() {
+                        flows.push(TypeFlow {
+                            from_entity: caller_name.to_string(),
+                            to_entity: cs.callee.clone(),
+                            type_name: normalized,
+                            from_file: cs.file.clone(),
+                            to_file: callee_sig.file.clone(),
+                        });
+                        found_type = true;
+                    }
+                }
+            }
+
+            if found_type {
+                typed_edges += 1;
+            } else {
+                untyped_edges += 1;
+            }
+        }
+
+        // Compute dominant types by frequency
+        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        for flow in &flows {
+            *type_counts.entry(flow.type_name.clone()).or_insert(0) += 1;
+        }
+        let mut dominant_types: Vec<TypeFrequency> = type_counts
+            .into_iter()
+            .map(|(type_name, count)| TypeFrequency { type_name, count })
+            .collect();
+        dominant_types.sort_by(|a, b| b.count.cmp(&a.count));
+
+        TypeFlowResult {
+            flows,
+            dominant_types,
+            total_typed_edges: typed_edges,
+            total_untyped_edges: untyped_edges,
+        }
+    }
+
+    /// Filter type flows to those involving a specific type name.
+    /// Matches by substring (case-insensitive).
+    pub fn trace_type(&self, type_name: &str) -> Vec<TypeFlow> {
+        let needle = type_name.to_lowercase();
+        self.type_flows()
+            .flows
+            .into_iter()
+            .filter(|f| f.type_name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
     /// Measure vocabulary health across three dimensions:
     /// convention coverage, spelling consistency, and cluster
     /// cohesion. Returns an overall weighted score plus
@@ -2424,39 +2744,71 @@ impl ConceptGraph {
         let term_lower = concept_name.to_lowercase();
         let subtokens = split_identifier(concept_name);
 
-        // 1. Resolve concept (same matching as query_concept)
-        let concept = self
-            .concepts
-            .values()
-            .find(|c| c.canonical == term_lower)
-            .or_else(|| {
-                subtokens.iter().find_map(|st| {
-                    self.concepts
-                        .values()
-                        .find(|c| c.canonical == *st)
-                })
-            })
-            .or_else(|| {
-                self.concepts.values().find(|c| {
-                    c.occurrences.iter().any(|o| {
-                        o.identifier
-                            .to_lowercase()
-                            .contains(&term_lower)
-                    })
-                })
-            })?;
-
-        // 2. Find seed entities tagged with this concept
-        let seed_ids: HashSet<u64> = self
+        // 1. Resolve: entity-first, then concept fallback.
+        //    If the query matches an entity name exactly, seed from that
+        //    entity rather than going through concept resolution (which
+        //    would split "BasicUNet" into subtoken "basic" and lose
+        //    specificity).
+        let entity_match: Option<&Entity> = self
             .entities
             .values()
-            .filter(|e| e.concept_tags.contains(&concept.id))
-            .map(|e| e.id)
-            .collect();
+            .find(|e| e.name.to_lowercase() == term_lower);
+
+        let is_entity_trace = entity_match.is_some();
+
+        let (concept_label, seed_ids) =
+            if let Some(matched) = entity_match {
+                let label = self
+                    .concepts
+                    .get(
+                        matched
+                            .concept_tags
+                            .first()
+                            .unwrap_or(&0),
+                    )
+                    .map(|c| c.canonical.clone())
+                    .unwrap_or_else(|| {
+                        matched.name.to_lowercase()
+                    });
+                let ids: HashSet<u64> =
+                    std::iter::once(matched.id).collect();
+                (label, ids)
+            } else {
+                // Concept-based fallback
+                let concept = self
+                    .concepts
+                    .values()
+                    .find(|c| c.canonical == term_lower)
+                    .or_else(|| {
+                        subtokens.iter().find_map(|st| {
+                            self.concepts
+                                .values()
+                                .find(|c| c.canonical == *st)
+                        })
+                    })
+                    .or_else(|| {
+                        self.concepts.values().find(|c| {
+                            c.occurrences.iter().any(|o| {
+                                o.identifier
+                                    .to_lowercase()
+                                    .contains(&term_lower)
+                            })
+                        })
+                    })?;
+                let ids: HashSet<u64> = self
+                    .entities
+                    .values()
+                    .filter(|e| {
+                        e.concept_tags.contains(&concept.id)
+                    })
+                    .map(|e| e.id)
+                    .collect();
+                (concept.canonical.clone(), ids)
+            };
 
         if seed_ids.is_empty() {
             return Some(ConceptTrace {
-                concept: concept.canonical.clone(),
+                concept: concept_label,
                 producers: Vec::new(),
                 consumers: Vec::new(),
                 call_chain: Vec::new(),
@@ -2464,7 +2816,19 @@ impl ConceptGraph {
             });
         }
 
-        // 3. Classify seeds as producer/consumer/both
+        // Collect concept subtokens for role classification
+        let role_subtokens: Vec<String> = seed_ids
+            .iter()
+            .filter_map(|id| self.entities.get(id))
+            .flat_map(|e| {
+                e.concept_tags.iter().filter_map(|cid| {
+                    self.concepts.get(cid)
+                })
+            })
+            .flat_map(|c| c.subtokens.clone())
+            .collect();
+
+        // 2. Classify seeds as producer/consumer/both
         let classify =
             |entity: &Entity| -> TraceRole {
                 let sig = entity
@@ -2473,30 +2837,33 @@ impl ConceptGraph {
                 let Some(sig) = sig else {
                     return TraceRole::Both;
                 };
-                let subs = &concept.subtokens;
                 let is_producer = sig
                     .return_type
                     .as_ref()
                     .map(|rt| {
                         let rt_lower = rt.to_lowercase();
-                        subs.iter().any(|s| {
-                            rt_lower.contains(&s.to_lowercase())
+                        role_subtokens.iter().any(|s| {
+                            rt_lower
+                                .contains(&s.to_lowercase())
                         })
                     })
                     .unwrap_or(false);
-                let is_consumer = sig.params.iter().any(|p| {
-                    let name_lower = p.name.to_lowercase();
-                    let type_lower = p
-                        .type_annotation
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase();
-                    subs.iter().any(|s| {
-                        let s_lower = s.to_lowercase();
-                        name_lower.contains(&s_lower)
-                            || type_lower.contains(&s_lower)
-                    })
-                });
+                let is_consumer =
+                    sig.params.iter().any(|p| {
+                        let name_lower =
+                            p.name.to_lowercase();
+                        let type_lower = p
+                            .type_annotation
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase();
+                        role_subtokens.iter().any(|s| {
+                            let s_lower = s.to_lowercase();
+                            name_lower.contains(&s_lower)
+                                || type_lower
+                                    .contains(&s_lower)
+                        })
+                    });
                 match (is_producer, is_consumer) {
                     (true, true) => TraceRole::Both,
                     (true, false) => TraceRole::Producer,
@@ -2505,15 +2872,21 @@ impl ConceptGraph {
                 }
             };
 
-        let mut seed_roles: HashMap<u64, TraceRole> = HashMap::new();
+        let mut seed_roles: HashMap<u64, TraceRole> =
+            HashMap::new();
         for &sid in &seed_ids {
             if let Some(e) = self.entities.get(&sid) {
                 seed_roles.insert(sid, classify(e));
             }
         }
 
-        // 4. Build petgraph DiGraph from call sites
-        let mut call_graph: DiGraph<String, ()> = DiGraph::new();
+        // 3. Build entity-level graph from call sites + entity
+        //    relationships.
+        //    Normalize scope names to entity level so that
+        //    "BasicUNet.__init__" → "BasicUNet" matches entity
+        //    names.
+        let mut call_graph: DiGraph<String, ()> =
+            DiGraph::new();
         let mut node_map: HashMap<String, NodeIndex> =
             HashMap::new();
 
@@ -2531,36 +2904,91 @@ impl ConceptGraph {
                 }
             };
 
+        // Normalize caller_scope to entity level (same as
+        // entity.rs): "Cls.method" → "Cls"
+        // Normalize callee to last component: "nn.Conv3d" →
+        // "Conv3d"
         for cs in &self.call_sites {
             let Some(ref caller) = cs.caller_scope else {
                 continue;
             };
+            let caller_name = caller
+                .split('.')
+                .next()
+                .unwrap_or(caller);
+            let callee_name = cs
+                .callee
+                .rsplit('.')
+                .next()
+                .unwrap_or(&cs.callee);
+            if caller_name == callee_name {
+                continue;
+            }
             let caller_idx = ensure_node(
                 &mut call_graph,
                 &mut node_map,
-                caller,
+                caller_name,
             );
             let callee_idx = ensure_node(
                 &mut call_graph,
                 &mut node_map,
-                &cs.callee,
+                callee_name,
             );
             call_graph.add_edge(caller_idx, callee_idx, ());
         }
 
-        // Map seed entity names to node indices
-        let seed_node_indices: HashMap<String, NodeIndex> = self
+        // Inject entity-level relationships (Uses,
+        // InheritsFrom) as additional edges
+        let entity_id_to_name: HashMap<u64, &str> = self
             .entities
             .values()
-            .filter(|e| seed_ids.contains(&e.id))
-            .filter_map(|e| {
-                node_map.get(&e.name).map(|&idx| {
-                    (e.name.clone(), idx)
-                })
-            })
+            .map(|e| (e.id, e.name.as_str()))
             .collect();
 
-        // 5. Find bridges via BFS forward/backward from seeds
+        for rel in &self.relationships {
+            let is_entity_rel = matches!(
+                rel.kind,
+                RelationshipKind::Uses
+                    | RelationshipKind::InheritsFrom
+            );
+            if !is_entity_rel {
+                continue;
+            }
+            let (Some(src), Some(tgt)) = (
+                entity_id_to_name.get(&rel.source),
+                entity_id_to_name.get(&rel.target),
+            ) else {
+                continue;
+            };
+            if src == tgt {
+                continue;
+            }
+            let src_idx = ensure_node(
+                &mut call_graph,
+                &mut node_map,
+                src,
+            );
+            let tgt_idx = ensure_node(
+                &mut call_graph,
+                &mut node_map,
+                tgt,
+            );
+            call_graph.add_edge(src_idx, tgt_idx, ());
+        }
+
+        // Map seed entity names to node indices
+        let seed_node_indices: HashMap<String, NodeIndex> =
+            self.entities
+                .values()
+                .filter(|e| seed_ids.contains(&e.id))
+                .filter_map(|e| {
+                    node_map.get(&e.name).map(|&idx| {
+                        (e.name.clone(), idx)
+                    })
+                })
+                .collect();
+
+        // 4. Find bridges via BFS forward/backward from seeds
         let bfs_reachable = |starts: &[NodeIndex],
                              forward: bool|
          -> HashSet<NodeIndex> {
@@ -2570,12 +2998,14 @@ impl ConceptGraph {
                 visited.insert(s);
                 queue.push_back((s, 0usize));
             }
-            while let Some((node, depth)) = queue.pop_front()
+            while let Some((node, depth)) =
+                queue.pop_front()
             {
                 if depth >= max_depth {
                     continue;
                 }
-                let neighbors: Vec<NodeIndex> = if forward {
+                let neighbors: Vec<NodeIndex> = if forward
+                {
                     call_graph
                         .neighbors_directed(
                             node,
@@ -2599,47 +3029,56 @@ impl ConceptGraph {
             visited
         };
 
-        // Build seed name→entity lookup for role classification
-        let seed_entity_by_name: HashMap<&str, &Entity> = self
-            .entities
-            .values()
-            .filter(|e| seed_ids.contains(&e.id))
-            .map(|e| (e.name.as_str(), e))
-            .collect();
+        // Build seed name→entity lookup for role
+        // classification
+        let seed_entity_by_name: HashMap<&str, &Entity> =
+            self.entities
+                .values()
+                .filter(|e| seed_ids.contains(&e.id))
+                .map(|e| (e.name.as_str(), e))
+                .collect();
 
         // Split seeds by role for directional BFS
-        let producer_indices: Vec<NodeIndex> = seed_node_indices
-            .iter()
-            .filter(|(name, _)| {
-                seed_entity_by_name
-                    .get(name.as_str())
-                    .and_then(|e| seed_roles.get(&e.id))
-                    .map(|r| {
-                        matches!(
-                            r,
-                            TraceRole::Producer | TraceRole::Both
-                        )
-                    })
-                    .unwrap_or(false)
-            })
-            .map(|(_, &idx)| idx)
-            .collect();
-        let consumer_indices: Vec<NodeIndex> = seed_node_indices
-            .iter()
-            .filter(|(name, _)| {
-                seed_entity_by_name
-                    .get(name.as_str())
-                    .and_then(|e| seed_roles.get(&e.id))
-                    .map(|r| {
-                        matches!(
-                            r,
-                            TraceRole::Consumer | TraceRole::Both
-                        )
-                    })
-                    .unwrap_or(false)
-            })
-            .map(|(_, &idx)| idx)
-            .collect();
+        let producer_indices: Vec<NodeIndex> =
+            seed_node_indices
+                .iter()
+                .filter(|(name, _)| {
+                    seed_entity_by_name
+                        .get(name.as_str())
+                        .and_then(|e| {
+                            seed_roles.get(&e.id)
+                        })
+                        .map(|r| {
+                            matches!(
+                                r,
+                                TraceRole::Producer
+                                    | TraceRole::Both
+                            )
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|(_, &idx)| idx)
+                .collect();
+        let consumer_indices: Vec<NodeIndex> =
+            seed_node_indices
+                .iter()
+                .filter(|(name, _)| {
+                    seed_entity_by_name
+                        .get(name.as_str())
+                        .and_then(|e| {
+                            seed_roles.get(&e.id)
+                        })
+                        .map(|r| {
+                            matches!(
+                                r,
+                                TraceRole::Consumer
+                                    | TraceRole::Both
+                            )
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|(_, &idx)| idx)
+                .collect();
         let forward_set =
             bfs_reachable(&producer_indices, true);
         let backward_set =
@@ -2648,25 +3087,81 @@ impl ConceptGraph {
         let seed_idx_set: HashSet<NodeIndex> =
             seed_node_indices.values().copied().collect();
 
-        let bridge_indices: HashSet<NodeIndex> = forward_set
-            .intersection(&backward_set)
-            .copied()
-            .filter(|n| !seed_idx_set.contains(n))
-            .collect();
+        // Entity name set for filtering reachable nodes to
+        // known entities only
+        let entity_name_set: HashSet<&str> =
+            entity_id_to_name.values().copied().collect();
 
-        // 6. Build subgraph with seeds + bridges
-        let subgraph_nodes: HashSet<NodeIndex> = seed_idx_set
-            .iter()
-            .chain(bridge_indices.iter())
-            .copied()
-            .collect();
+        // 5. Build subgraph nodes.
+        //    Entity-first traces: include all reachable
+        //    entity nodes (full depth BFS).
+        //    Concept-based traces: use forward∩backward
+        //    bridge intersection.
+        let subgraph_nodes: HashSet<NodeIndex> =
+            if is_entity_trace {
+                let all_seeds: Vec<NodeIndex> =
+                    seed_idx_set.iter().copied().collect();
+                let reachable_fwd =
+                    bfs_reachable(&all_seeds, true);
+                let reachable_bwd =
+                    bfs_reachable(&all_seeds, false);
+                reachable_fwd
+                    .union(&reachable_bwd)
+                    .copied()
+                    .filter(|n| {
+                        seed_idx_set.contains(n)
+                            || entity_name_set.contains(
+                                call_graph[*n].as_str(),
+                            )
+                    })
+                    .collect()
+            } else {
+                let bridge_indices: HashSet<NodeIndex> =
+                    forward_set
+                        .intersection(&backward_set)
+                        .copied()
+                        .filter(|n| {
+                            !seed_idx_set.contains(n)
+                        })
+                        .collect();
+                // Also include direct entity neighbors of
+                // seeds
+                let mut neighbor_indices: HashSet<NodeIndex> =
+                    HashSet::new();
+                for &seed_idx in seed_idx_set.iter() {
+                    for nb in call_graph
+                        .neighbors_directed(
+                            seed_idx,
+                            petgraph::Direction::Outgoing,
+                        )
+                        .chain(
+                            call_graph.neighbors_directed(
+                                seed_idx,
+                                petgraph::Direction::Incoming,
+                            ),
+                        )
+                    {
+                        if entity_name_set.contains(
+                            call_graph[nb].as_str(),
+                        ) {
+                            neighbor_indices.insert(nb);
+                        }
+                    }
+                }
+                seed_idx_set
+                    .iter()
+                    .chain(bridge_indices.iter())
+                    .chain(neighbor_indices.iter())
+                    .copied()
+                    .collect()
+            };
 
         let mut sub: DiGraph<String, ()> = DiGraph::new();
         let mut sub_map: HashMap<NodeIndex, NodeIndex> =
             HashMap::new();
         for &orig in &subgraph_nodes {
-            let new = sub
-                .add_node(call_graph[orig].clone());
+            let new =
+                sub.add_node(call_graph[orig].clone());
             sub_map.insert(orig, new);
         }
         for &orig in &subgraph_nodes {
@@ -2688,8 +3183,6 @@ impl ConceptGraph {
             match petgraph::algo::toposort(&sub, None) {
                 Ok(sorted) => sorted,
                 Err(_) => {
-                    // Cycle: BFS from roots, then sweep
-                    // disconnected components
                     let roots: Vec<NodeIndex> = sub
                         .node_indices()
                         .filter(|n| {
@@ -2727,7 +3220,6 @@ impl ConceptGraph {
                                 queue.push_back(nb);
                             }
                         }
-                        // Sweep disconnected components
                         if queue.is_empty() {
                             for c in sub.node_indices() {
                                 if visited.insert(c) {
@@ -2741,9 +3233,7 @@ impl ConceptGraph {
                 }
             };
 
-        // 7. Assemble result
-        // Reverse map: node name -> entity (for looking up
-        // metadata)
+        // 6. Assemble result
         let entity_by_name: HashMap<&str, &Entity> = self
             .entities
             .values()
@@ -2757,10 +3247,79 @@ impl ConceptGraph {
                 .unwrap_or_default()
         };
 
+        // Class info lookup for bases/methods
+        let class_by_name: HashMap<&str, &ClassInfo> = self
+            .classes
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        // Method signatures grouped by class name
+        let method_sigs_by_class: HashMap<&str, Vec<&Signature>> = {
+            let mut map: HashMap<&str, Vec<&Signature>> =
+                HashMap::new();
+            for sig in &self.signatures {
+                if let Some(ref scope) = sig.scope {
+                    let class_name = scope
+                        .split('.')
+                        .next()
+                        .unwrap_or(scope);
+                    if class_by_name.contains_key(class_name)
+                    {
+                        map.entry(class_name)
+                            .or_default()
+                            .push(sig);
+                    }
+                }
+            }
+            map
+        };
+
         let make_trace_node =
             |name: &str, role: TraceRole| -> TraceNode {
-                if let Some(entity) = entity_by_name.get(name)
+                if let Some(entity) =
+                    entity_by_name.get(name)
                 {
+                    let (bases, methods) =
+                        if entity.kind
+                            == crate::types::EntityKind::Class
+                        {
+                            let bases = class_by_name
+                                .get(name)
+                                .map(|c| c.bases.clone())
+                                .unwrap_or_default();
+                            let methods = method_sigs_by_class
+                                .get(name)
+                                .map(|sigs| {
+                                    sigs.iter()
+                                        .map(|s| MethodSummary {
+                                            name: s.name.clone(),
+                                            params: s
+                                                .params
+                                                .iter()
+                                                .filter(|p| {
+                                                    p.name != "self"
+                                                })
+                                                .map(|p| {
+                                                    match &p.type_annotation {
+                                                        Some(t) => format!("{}: {}", p.name, t),
+                                                        None => p.name.clone(),
+                                                    }
+                                                })
+                                                .collect(),
+                                            return_type: s
+                                                .return_type
+                                                .clone(),
+                                            line: s.line,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (bases, methods)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+
                     TraceNode {
                         entity_name: entity.name.clone(),
                         kind: entity.kind.clone(),
@@ -2772,6 +3331,8 @@ impl ConceptGraph {
                             .iter()
                             .map(concept_name_for_id)
                             .collect(),
+                        bases,
+                        methods,
                     }
                 } else {
                     TraceNode {
@@ -2781,6 +3342,8 @@ impl ConceptGraph {
                         line: 0,
                         role,
                         concept_tags: Vec::new(),
+                        bases: Vec::new(),
+                        methods: Vec::new(),
                     }
                 }
             };
@@ -2788,7 +3351,6 @@ impl ConceptGraph {
         let mut call_chain = Vec::new();
         for &sub_idx in &ordered {
             let name = &sub[sub_idx];
-            // Find original node index for role lookup
             let orig_idx = sub_map.iter().find_map(
                 |(&orig, &mapped)| {
                     if mapped == sub_idx {
@@ -2799,7 +3361,7 @@ impl ConceptGraph {
                 },
             );
             let role = if let Some(oi) = orig_idx {
-                if bridge_indices.contains(&oi) {
+                if !seed_idx_set.contains(&oi) {
                     TraceRole::Bridge
                 } else if let Some(entity) =
                     entity_by_name.get(name.as_str())
@@ -2817,7 +3379,8 @@ impl ConceptGraph {
             call_chain.push(make_trace_node(name, role));
         }
 
-        // Include orphan seeds (entities not in any call site)
+        // Include orphan seeds (entities not in any call
+        // site)
         let chain_names: HashSet<&str> = call_chain
             .iter()
             .map(|n| n.entity_name.as_str())
@@ -2826,7 +3389,8 @@ impl ConceptGraph {
             .iter()
             .filter_map(|(&sid, role)| {
                 let entity = self.entities.get(&sid)?;
-                if chain_names.contains(entity.name.as_str())
+                if chain_names
+                    .contains(entity.name.as_str())
                 {
                     return None;
                 }
@@ -2838,34 +3402,90 @@ impl ConceptGraph {
             .collect();
         call_chain.extend(orphans);
 
-        // Build edges from call sites within subgraph
+        // Build edges from the subgraph
         let subgraph_names: HashSet<&str> = subgraph_nodes
             .iter()
             .map(|&n| call_graph[n].as_str())
             .collect();
 
-        let edges: Vec<TraceEdge> = self
-            .call_sites
-            .iter()
-            .filter(|cs| {
-                cs.caller_scope.as_deref().is_some_and(
-                    |caller| {
-                        subgraph_names.contains(caller)
-                            && subgraph_names
-                                .contains(cs.callee.as_str())
-                    },
-                )
-            })
-            .map(|cs| TraceEdge {
-                caller: cs
-                    .caller_scope
-                    .clone()
-                    .unwrap_or_default(),
-                callee: cs.callee.clone(),
-                file: cs.file.clone(),
-                line: cs.line,
-            })
-            .collect();
+        let mut edges: Vec<TraceEdge> = Vec::new();
+        let mut seen_edges: HashSet<(String, String)> =
+            HashSet::new();
+
+        // Edges from call sites (normalized to entity level)
+        for cs in &self.call_sites {
+            let Some(ref caller) = cs.caller_scope else {
+                continue;
+            };
+            let caller_name = caller
+                .split('.')
+                .next()
+                .unwrap_or(caller);
+            let callee_name = cs
+                .callee
+                .rsplit('.')
+                .next()
+                .unwrap_or(&cs.callee);
+            if subgraph_names.contains(caller_name)
+                && subgraph_names.contains(callee_name)
+                && caller_name != callee_name
+            {
+                let key = (
+                    caller_name.to_string(),
+                    callee_name.to_string(),
+                );
+                if seen_edges.insert(key) {
+                    edges.push(TraceEdge {
+                        caller: caller_name.to_string(),
+                        callee: callee_name.to_string(),
+                        file: cs.file.clone(),
+                        line: cs.line,
+                    });
+                }
+            }
+        }
+
+        // Edges from entity relationships
+        for rel in &self.relationships {
+            let is_entity_rel = matches!(
+                rel.kind,
+                RelationshipKind::Uses
+                    | RelationshipKind::InheritsFrom
+            );
+            if !is_entity_rel {
+                continue;
+            }
+            let (Some(src), Some(tgt)) = (
+                entity_id_to_name.get(&rel.source),
+                entity_id_to_name.get(&rel.target),
+            ) else {
+                continue;
+            };
+            if subgraph_names.contains(src)
+                && subgraph_names.contains(tgt)
+            {
+                let key =
+                    (src.to_string(), tgt.to_string());
+                if seen_edges.insert(key) {
+                    let file = self
+                        .entities
+                        .get(&rel.source)
+                        .map(|e| e.file.clone())
+                        .unwrap_or_default();
+                    let line = self
+                        .entities
+                        .get(&rel.source)
+                        .map(|e| e.line)
+                        .unwrap_or(0);
+                    edges.push(TraceEdge {
+                        caller: src.to_string(),
+                        callee: tgt.to_string(),
+                        file,
+                        line,
+                    });
+                }
+            }
+        }
 
         let producers: Vec<TraceNode> = call_chain
             .iter()
@@ -2890,12 +3510,674 @@ impl ConceptGraph {
             .collect();
 
         Some(ConceptTrace {
-            concept: concept.canonical.clone(),
+            concept: concept_label,
             producers,
             consumers,
             call_chain,
             edges,
         })
+    }
+
+    // -- L4: Logic query methods --
+
+    /// Helper: build an EntitySummary from an Entity.
+    fn entity_summary(entity: &Entity) -> EntitySummary {
+        EntitySummary {
+            name: entity.name.clone(),
+            kind: entity.kind.clone(),
+            file: entity.file.clone(),
+            line: entity.line,
+        }
+    }
+
+    /// L4: Describe the behavioral logic of an entity.
+    pub fn describe_logic(&self, name: &str) -> Option<LogicDescription> {
+        let name_lower = name.to_lowercase();
+        let entity = self.entities.values().find(|e| {
+            e.name.to_lowercase() == name_lower
+        })?;
+
+        let pc_text = self.pseudocode.get(&entity.id)
+            .map(format_pseudocode)
+            .unwrap_or_default();
+
+        let cluster_summary = self.logic_clusters.iter()
+            .find(|lc| lc.entity_ids.contains(&entity.id))
+            .map(|lc| {
+                let members: Vec<EntitySummary> = lc.entity_ids.iter()
+                    .filter_map(|id| self.entities.get(id))
+                    .map(Self::entity_summary)
+                    .collect();
+                LogicClusterSummary {
+                    id: lc.id,
+                    size: lc.entity_ids.len(),
+                    behavioral_label: lc.behavioral_label.clone(),
+                    members,
+                }
+            });
+
+        let centrality = self.centrality.get(&entity.id)
+            .cloned()
+            .unwrap_or(CentralityScore {
+                entity_id: entity.id,
+                in_degree: 0,
+                out_degree: 0,
+                pagerank: 0.0,
+            });
+
+        Some(LogicDescription {
+            entity: Self::entity_summary(entity),
+            pseudocode_text: pc_text,
+            logic_cluster: cluster_summary,
+            centrality,
+        })
+    }
+
+    /// L4: Find entities with similar behavioral patterns.
+    pub fn find_similar_logic(
+        &self,
+        name: &str,
+        top_k: usize,
+    ) -> Option<SimilarLogicResult> {
+        let name_lower = name.to_lowercase();
+        let entity = self.entities.values().find(|e| {
+            e.name.to_lowercase() == name_lower
+        })?;
+
+        let similar_ids = self.logic_index
+            .find_similar_to_entity(entity.id, top_k);
+
+        let similar: Vec<(EntitySummary, f32)> = similar_ids.iter()
+            .filter_map(|(id, score)| {
+                self.entities.get(id)
+                    .map(|e| (Self::entity_summary(e), *score))
+            })
+            .collect();
+
+        Some(SimilarLogicResult {
+            query_entity: Self::entity_summary(entity),
+            similar,
+        })
+    }
+
+    /// L4: Assemble minimal context for a concept or entity.
+    ///
+    /// Scope resolution order: entity name > file path > concept name.
+    /// Uses tiered truncation to stay within token budget.
+    pub fn compact_context(
+        &self,
+        scope: &str,
+        max_tokens: usize,
+    ) -> Option<CompactContext> {
+        // Priority levels for tiered truncation.
+        // 1=highest (keep longest), 5=lowest (drop first).
+        struct Section {
+            priority: u8,
+            text: String,
+        }
+
+        let scope_lower = scope.to_lowercase();
+
+        // --- Scope resolution ---
+
+        // 1. Try entity name first
+        let mut entity = self.entities.values().find(|e| {
+            e.name.to_lowercase() == scope_lower
+        });
+
+        // 2. If no entity match, try file path resolution.
+        // Require a known extension to avoid false positives on concept
+        // names containing "/" (e.g. "encoder/decoder").
+        let has_ext = scope.ends_with(".py")
+            || scope.ends_with(".rs")
+            || scope.ends_with(".ts")
+            || scope.ends_with(".js")
+            || scope.ends_with(".tsx")
+            || scope.ends_with(".jsx");
+        let is_file_path = has_ext
+            || (scope.contains('/') && scope.starts_with('/'))
+            || (scope.contains('/') && scope.starts_with('.'));
+
+        if entity.is_none() && is_file_path {
+            let mut file_matches: Vec<&Entity> = self.entities.values()
+                .filter(|e| {
+                    let path_str = e.file.to_string_lossy();
+                    path_str.ends_with(scope) || path_str.contains(scope)
+                })
+                .collect();
+            // Rank by centrality (highest pagerank first)
+            file_matches.sort_by(|a, b| {
+                let pr_a = self.centrality.get(&a.id)
+                    .map(|c| c.pagerank)
+                    .unwrap_or(0.0);
+                let pr_b = self.centrality.get(&b.id)
+                    .map(|c| c.pagerank)
+                    .unwrap_or(0.0);
+                pr_b.partial_cmp(&pr_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            entity = file_matches.into_iter().next();
+            // File path scope: if no entity matches, return None
+            // (don't fall through to concept matching)
+            entity?;
+        }
+
+        // 3. If no entity, try matching a concept
+        let concept = if entity.is_none() {
+            self.concepts.values().find(|c| {
+                c.canonical == scope_lower
+            })
+        } else {
+            None
+        };
+
+        if entity.is_none() && concept.is_none() {
+            return None;
+        }
+
+        // --- Build sections with priority levels ---
+
+        // Priority 1: Header
+        let header = Section {
+            priority: 1,
+            text: format!("# {} — compact context", scope),
+        };
+
+        let mut tiered: Vec<Section> = vec![header];
+
+        if let Some(ent) = entity {
+            // Priority 2: Structure
+            let mut structure = format!(
+                "## Structure\n{} ({:?})",
+                ent.name, ent.kind
+            );
+            let class_info = self.classes.iter().find(|c| {
+                c.name == ent.name && c.file == ent.file
+            });
+            if let Some(cls) = class_info {
+                if !cls.bases.is_empty() {
+                    structure.push_str(&format!(
+                        "\n  inherits: {}",
+                        cls.bases.join(", ")
+                    ));
+                }
+            }
+
+            // Dependency names (outgoing: what this entity uses/inherits)
+            let mut depends_on: Vec<&str> = self.relationships.iter()
+                .filter(|r| {
+                    (r.kind == RelationshipKind::InheritsFrom
+                        || r.kind == RelationshipKind::Uses)
+                        && r.source == ent.id
+                })
+                .filter_map(|r| {
+                    self.entities.get(&r.target)
+                        .map(|e| e.name.as_str())
+                })
+                .collect();
+            depends_on.sort_unstable();
+            depends_on.dedup();
+            if !depends_on.is_empty() {
+                structure.push_str(&format!(
+                    "\n  depends on: {}",
+                    depends_on.join(", ")
+                ));
+            }
+
+            // Dependency names (incoming: what depends on this entity)
+            let mut depended_on_by: Vec<&str> = self.relationships.iter()
+                .filter(|r| {
+                    (r.kind == RelationshipKind::InheritsFrom
+                        || r.kind == RelationshipKind::Uses)
+                        && r.target == ent.id
+                })
+                .filter_map(|r| {
+                    self.entities.get(&r.source)
+                        .map(|e| e.name.as_str())
+                })
+                .collect();
+            depended_on_by.sort_unstable();
+            depended_on_by.dedup();
+            if !depended_on_by.is_empty() {
+                structure.push_str(&format!(
+                    "\n  depended on by: {}",
+                    depended_on_by.join(", "),
+                ));
+            }
+
+            if let Some(cs) = self.centrality.get(&ent.id) {
+                structure.push_str(&format!(
+                    "\n  centrality: pagerank={:.3}, in={}, out={}",
+                    cs.pagerank, cs.in_degree, cs.out_degree
+                ));
+            }
+            tiered.push(Section { priority: 2, text: structure });
+
+            // Priority 3: Behavior (pseudocode)
+            if let Some(pc) = self.pseudocode.get(&ent.id) {
+                let pc_text = format_pseudocode(pc);
+                if !pc_text.is_empty() {
+                    tiered.push(Section {
+                        priority: 3,
+                        text: format!("## Behavior\n{}", pc_text),
+                    });
+                }
+            }
+
+            // Priority 4: Domain
+            let mut domain_parts: Vec<String> = Vec::new();
+            let concept_names: Vec<&str> = ent.concept_tags.iter()
+                .filter_map(|id| {
+                    self.concepts.get(id).map(|c| c.canonical.as_str())
+                })
+                .collect();
+            if !concept_names.is_empty() {
+                domain_parts.push(format!(
+                    "Concepts: {}",
+                    concept_names.join(", ")
+                ));
+            }
+
+            let matching_convs: Vec<&str> = self.conventions.iter()
+                .filter(|conv| {
+                    conv.examples.iter().any(|ex| {
+                        ex.to_lowercase()
+                            .contains(&ent.name.to_lowercase())
+                    })
+                })
+                .map(|conv| conv.semantic_role.as_str())
+                .collect();
+            if !matching_convs.is_empty() {
+                domain_parts.push(format!(
+                    "Conventions: {}",
+                    matching_convs.join(", ")
+                ));
+            }
+
+            if let Some(lc) = self.logic_clusters.iter().find(|lc| {
+                lc.entity_ids.contains(&ent.id)
+            }) {
+                let label = lc.behavioral_label.as_deref()
+                    .unwrap_or("unlabeled");
+                let members: Vec<String> = lc.entity_ids.iter()
+                    .filter(|id| **id != ent.id)
+                    .filter_map(|id| {
+                        self.entities.get(id)
+                            .map(|e| e.name.clone())
+                    })
+                    .collect();
+                let member_list = if members.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", members.join(", "))
+                };
+                domain_parts.push(format!(
+                    "Logic cluster: \"{}\" ({} members){}",
+                    label, lc.entity_ids.len(), member_list,
+                ));
+            }
+
+            if !domain_parts.is_empty() {
+                tiered.push(Section {
+                    priority: 4,
+                    text: format!(
+                        "## Domain\n{}",
+                        domain_parts.join("\n"),
+                    ),
+                });
+            }
+
+            // Priority 5: Related (top-3 similar by logic)
+            let similar = self.logic_index
+                .find_similar_to_entity(ent.id, 3);
+            if !similar.is_empty() {
+                let related_lines: Vec<String> = similar.iter()
+                    .filter_map(|(id, score)| {
+                        self.entities.get(id).map(|e| {
+                            format!(
+                                "- {} (similarity: {:.2})",
+                                e.name, score,
+                            )
+                        })
+                    })
+                    .collect();
+                if !related_lines.is_empty() {
+                    tiered.push(Section {
+                        priority: 5,
+                        text: format!(
+                            "## Related\n{}",
+                            related_lines.join("\n"),
+                        ),
+                    });
+                }
+            }
+        } else if let Some(concept) = concept {
+            // Concept-based context (no tiered truncation needed,
+            // these are already compact)
+            let occ_count = concept.occurrences.len();
+            let files: HashSet<&str> = concept.occurrences.iter()
+                .filter_map(|o| o.file.to_str())
+                .collect();
+            tiered.push(Section {
+                priority: 2,
+                text: format!(
+                    "## Concept: {}\nOccurrences: {}, Files: {}",
+                    concept.canonical, occ_count, files.len(),
+                ),
+            });
+
+            let tagged_entities: Vec<&Entity> = self.entities.values()
+                .filter(|e| e.concept_tags.contains(&concept.id))
+                .collect();
+            if !tagged_entities.is_empty() {
+                let entity_lines: Vec<String> = tagged_entities.iter()
+                    .take(5)
+                    .map(|e| format!("- {} ({:?})", e.name, e.kind))
+                    .collect();
+                tiered.push(Section {
+                    priority: 5,
+                    text: format!(
+                        "## Entities\n{}",
+                        entity_lines.join("\n"),
+                    ),
+                });
+            }
+        }
+
+        // --- Tiered truncation ---
+        // Apply stages in order until under budget.
+
+        let estimate = |sections: &[Section]| -> usize {
+            let total_chars: usize = sections.iter()
+                .map(|s| s.text.len() + 2) // +2 for "\n\n" join
+                .sum();
+            total_chars / 4
+        };
+
+        // Stage 1: Trim pseudocode (Behavior, priority 3) to first 2
+        // + last 2 lines if >4 lines.
+        // Strip any existing omission banner from format_pseudocode to
+        // avoid double banners.
+        if estimate(&tiered) > max_tokens {
+            for s in &mut tiered {
+                if s.priority != 3 {
+                    continue;
+                }
+                let lines: Vec<&str> = s.text.lines()
+                    .filter(|l| !l.starts_with("... (") || !l.ends_with("omitted) ..."))
+                    .collect();
+                if lines.len() > 5 {
+                    let header_line = lines[0];
+                    let pc_lines = &lines[1..];
+                    let omitted = pc_lines.len() - 4;
+                    let trimmed = format!(
+                        "{}\n{}\n{}\n... ({} lines omitted) ...\n{}\n{}",
+                        header_line,
+                        pc_lines[0],
+                        pc_lines[1],
+                        omitted,
+                        pc_lines[pc_lines.len() - 2],
+                        pc_lines[pc_lines.len() - 1],
+                    );
+                    s.text = trimmed;
+                }
+            }
+        }
+
+        // Stage 2: Reduce Related (priority 5) to 1 entry, then remove
+        if estimate(&tiered) > max_tokens {
+            for s in &mut tiered {
+                if s.priority != 5
+                    || !s.text.starts_with("## Related")
+                {
+                    continue;
+                }
+                let lines: Vec<&str> = s.text.lines().collect();
+                // Keep header + first entry only
+                if lines.len() > 2 {
+                    s.text = format!("{}\n{}", lines[0], lines[1]);
+                }
+            }
+        }
+        if estimate(&tiered) > max_tokens {
+            tiered.retain(|s| {
+                s.priority != 5 || !s.text.starts_with("## Related")
+            });
+        }
+
+        // Stage 3: Remove logic cluster member list from Domain
+        // (keep label + count only)
+        if estimate(&tiered) > max_tokens {
+            for s in &mut tiered {
+                if s.priority != 4 {
+                    continue;
+                }
+                let new_lines: Vec<String> = s.text.lines()
+                    .map(|line| {
+                        if line.starts_with("Logic cluster: ") {
+                            // Strip member list after the closing paren
+                            if let Some(paren_end) =
+                                line.find(" members)")
+                            {
+                                let end = paren_end + " members)".len();
+                                line[..end].to_string()
+                            } else {
+                                line.to_string()
+                            }
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect();
+                s.text = new_lines.join("\n");
+            }
+        }
+
+        // Stage 4: Drop entire Domain section (priority 4)
+        if estimate(&tiered) > max_tokens {
+            tiered.retain(|s| s.priority != 4);
+        }
+
+        // Stage 5: Reduce Structure (priority 2) to just name (kind)
+        if estimate(&tiered) > max_tokens {
+            if let Some(ent) = entity {
+                for s in &mut tiered {
+                    if s.priority != 2
+                        || !s.text.starts_with("## Structure")
+                    {
+                        continue;
+                    }
+                    s.text = format!(
+                        "## Structure\n{} ({:?})",
+                        ent.name, ent.kind,
+                    );
+                }
+            }
+        }
+
+        let text = tiered.iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let token_estimate = text.len() / 4;
+
+        Some(CompactContext {
+            scope: scope.to_string(),
+            text,
+            token_estimate,
+        })
+    }
+
+    /// Return a concept-annotated structural overview of every file whose
+    /// path ends with `path`. Classes include nested method symbols.
+    pub fn describe_file(&self, path: &str) -> Vec<DescribeFileResult> {
+        // Collect all unique file paths from signatures and classes.
+        let mut all_files: HashSet<PathBuf> = HashSet::new();
+        for sig in &self.signatures {
+            all_files.insert(sig.file.clone());
+        }
+        for cls in &self.classes {
+            all_files.insert(cls.file.clone());
+        }
+
+        // Filter to files whose string path ends with the query.
+        let matching_files: Vec<PathBuf> = all_files
+            .into_iter()
+            .filter(|f| f.display().to_string().ends_with(path))
+            .collect();
+
+        let mut results = Vec::new();
+
+        for file in &matching_files {
+            let file_classes: Vec<&ClassInfo> = self
+                .classes
+                .iter()
+                .filter(|c| &c.file == file)
+                .collect();
+
+            let class_names: HashSet<&str> =
+                file_classes.iter().map(|c| c.name.as_str()).collect();
+
+            let mut symbols: Vec<FileSymbol> = Vec::new();
+
+            // Build class symbols with nested methods.
+            for cls in &file_classes {
+                let entity = self.entities.values().find(|e| {
+                    e.name == cls.name && e.file == cls.file
+                });
+
+                let concepts = self.resolve_concept_tags(entity);
+                let role = entity.map(|e| e.semantic_role.clone());
+
+                let methods: Vec<FileSymbol> = cls
+                    .methods
+                    .iter()
+                    .map(|method_name| {
+                        let method_sig =
+                            self.signatures.iter().find(|s| {
+                                s.file == cls.file
+                                    && s.name == *method_name
+                                    && s.scope.as_ref().is_some_and(
+                                        |sc| sc.starts_with(&cls.name),
+                                    )
+                            });
+
+                        let method_entity =
+                            self.entities.values().find(|e| {
+                                e.name == *method_name
+                                    && e.file == cls.file
+                                    && e.kind
+                                        == crate::types::EntityKind::Method
+                            });
+
+                        let m_concepts =
+                            self.resolve_concept_tags(method_entity);
+                        let m_role =
+                            method_entity.map(|e| e.semantic_role.clone());
+
+                        let (params, return_type, line) =
+                            match method_sig {
+                                Some(sig) => (
+                                    Self::format_params(&sig.params),
+                                    sig.return_type.clone(),
+                                    sig.line,
+                                ),
+                                None => (Vec::new(), None, cls.line),
+                            };
+
+                        FileSymbol {
+                            name: method_name.clone(),
+                            kind: SymbolKind::Method,
+                            line,
+                            concepts: m_concepts,
+                            role: m_role,
+                            params,
+                            return_type,
+                            bases: Vec::new(),
+                            methods: Vec::new(),
+                        }
+                    })
+                    .collect();
+
+                symbols.push(FileSymbol {
+                    name: cls.name.clone(),
+                    kind: SymbolKind::Class,
+                    line: cls.line,
+                    concepts,
+                    role,
+                    params: Vec::new(),
+                    return_type: None,
+                    bases: cls.bases.clone(),
+                    methods,
+                });
+            }
+
+            // Standalone functions: not scoped to any class in this file.
+            for sig in &self.signatures {
+                if sig.file != *file {
+                    continue;
+                }
+                let is_standalone =
+                    sig.scope.as_ref().is_none_or(|s| {
+                        !class_names.iter().any(|cn| s.starts_with(cn))
+                    });
+                if !is_standalone {
+                    continue;
+                }
+
+                let entity = self.entities.values().find(|e| {
+                    e.name == sig.name && e.file == sig.file
+                });
+
+                let concepts = self.resolve_concept_tags(entity);
+                let role = entity.map(|e| e.semantic_role.clone());
+
+                symbols.push(FileSymbol {
+                    name: sig.name.clone(),
+                    kind: SymbolKind::Function,
+                    line: sig.line,
+                    concepts,
+                    role,
+                    params: Self::format_params(&sig.params),
+                    return_type: sig.return_type.clone(),
+                    bases: Vec::new(),
+                    methods: Vec::new(),
+                });
+            }
+
+            symbols.sort_by_key(|s| s.line);
+
+            results.push(DescribeFileResult {
+                file: file.clone(),
+                symbols,
+            });
+        }
+
+        results.sort_by(|a, b| a.file.cmp(&b.file));
+        results
+    }
+
+    /// Resolve entity concept tags to canonical concept names.
+    fn resolve_concept_tags(&self, entity: Option<&Entity>) -> Vec<String> {
+        entity
+            .map(|e| {
+                e.concept_tags
+                    .iter()
+                    .filter_map(|id| self.concepts.get(id))
+                    .map(|c| c.canonical.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Format params as compact "name: Type" or just "name" strings.
+    fn format_params(params: &[crate::types::Param]) -> Vec<String> {
+        params
+            .iter()
+            .map(|p| match &p.type_annotation {
+                Some(ty) => format!("{}: {}", p.name, ty),
+                None => p.name.clone(),
+            })
+            .collect()
     }
 }
 
@@ -3005,6 +4287,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap()
     }
@@ -3098,9 +4381,11 @@ mod tests {
                 file: PathBuf::from("utils.py"),
                 line: 10,
                 scope: None,
+                body: None,
             }],
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         analysis.call_sites.push(crate::types::CallSite {
             caller_scope: Some("register".to_string()),
@@ -3132,6 +4417,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let mut graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty())
@@ -3217,6 +4503,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let mut embeddings = EmbeddingIndex::empty();
         embeddings.insert_vector(1, vec![1.0, 0.0, 0.0]);
@@ -3261,6 +4548,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let entities = vec![
             Entity {
@@ -3312,6 +4600,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let mut embeddings = EmbeddingIndex::empty();
         for (id, vec) in embedding_pairs {
@@ -3547,6 +4836,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty())
@@ -3603,6 +4893,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty())
@@ -3702,6 +4993,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build(
             analysis,
@@ -3744,6 +5036,7 @@ mod tests {
                 file: PathBuf::from("test.py"),
                 line: 1,
                 scope: None,
+                body: None,
             },
             Signature {
                 name: "apply_transform".to_string(),
@@ -3762,6 +5055,7 @@ mod tests {
                 file: PathBuf::from("test.py"),
                 line: 10,
                 scope: None,
+                body: None,
             },
             Signature {
                 name: "save_result".to_string(),
@@ -3778,6 +5072,7 @@ mod tests {
                 file: PathBuf::from("test.py"),
                 line: 20,
                 scope: None,
+                body: None,
             },
         ];
         let entities = vec![
@@ -3829,6 +5124,7 @@ mod tests {
             signatures: sigs,
             classes: Vec::new(),
             call_sites,
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -3885,6 +5181,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build(
             analysis,
@@ -3965,6 +5262,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites,
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -4047,6 +5345,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(), // zero call sites
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -4170,6 +5469,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites,
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -4230,6 +5530,7 @@ mod tests {
                 file: PathBuf::from("vol.py"),
                 line: 1,
                 scope: None,
+                body: None,
             },
             Signature {
                 // sig index 1: param type "Vol" → Consumer
@@ -4245,6 +5546,7 @@ mod tests {
                 file: PathBuf::from("vol.py"),
                 line: 10,
                 scope: None,
+                body: None,
             },
             Signature {
                 // sig index 2: returns "Vol" AND param named "vol" → Both
@@ -4260,6 +5562,7 @@ mod tests {
                 file: PathBuf::from("vol.py"),
                 line: 20,
                 scope: None,
+                body: None,
             },
         ];
         let entities = vec![
@@ -4304,6 +5607,7 @@ mod tests {
             signatures: sigs,
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -4341,6 +5645,1100 @@ mod tests {
             role_of("process_vol"),
             TraceRole::Both,
             "process_vol returns Vol AND takes vol param → Both"
+        );
+    }
+
+    fn make_entity(id: u64, name: &str) -> Entity {
+        Entity {
+            id,
+            name: name.to_string(),
+            kind: EntityKind::Function,
+            concept_tags: Vec::new(),
+            semantic_role: "utility".to_string(),
+            file: PathBuf::from("test.py"),
+            line: 1,
+            signature_idx: None,
+            class_info_idx: None,
+        }
+    }
+
+    fn make_graph_with_l4(
+        entities: Vec<Entity>,
+        pseudocode: HashMap<u64, Pseudocode>,
+        centrality: HashMap<u64, CentralityScore>,
+    ) -> ConceptGraph {
+        let mut graph = ConceptGraph::empty();
+        for entity in entities {
+            graph.entities.insert(entity.id, entity);
+        }
+        graph.pseudocode = pseudocode;
+        graph.centrality = centrality;
+        graph
+    }
+
+    // --- describe_logic tests ---
+
+    #[test]
+    fn test_describe_logic_basic_flow() {
+        let entity = make_entity(42, "process_data");
+        let pc = Pseudocode {
+            entity_id: 42,
+            steps: vec![PseudocodeStep::Call {
+                callee: "validate".into(),
+                args: vec![],
+            }],
+            body_hash: 0,
+            omitted_count: 0,
+        };
+        let centrality_score = CentralityScore {
+            entity_id: 42,
+            in_degree: 3,
+            out_degree: 1,
+            pagerank: 0.42,
+        };
+        let mut pseudocode = HashMap::new();
+        pseudocode.insert(42, pc);
+        let mut centrality = HashMap::new();
+        centrality.insert(42, centrality_score);
+
+        let graph = make_graph_with_l4(vec![entity], pseudocode, centrality);
+        let result = graph.describe_logic("process_data");
+
+        assert!(result.is_some());
+        let desc = result.unwrap();
+        assert_eq!(desc.entity.name, "process_data");
+        assert!(!desc.pseudocode_text.is_empty());
+        assert!((desc.centrality.pagerank - 0.42).abs() < 1e-6);
+        assert_eq!(desc.centrality.in_degree, 3);
+        assert_eq!(desc.centrality.out_degree, 1);
+    }
+
+    #[test]
+    fn test_describe_logic_missing_pseudocode_returns_empty_text() {
+        let entity = make_entity(10, "my_func");
+        let graph = make_graph_with_l4(vec![entity], HashMap::new(), HashMap::new());
+
+        let result = graph.describe_logic("my_func");
+        assert!(result.is_some());
+        let desc = result.unwrap();
+        assert_eq!(desc.pseudocode_text, "");
+        // Centrality defaults to zero when absent
+        assert_eq!(desc.centrality.in_degree, 0);
+        assert_eq!(desc.centrality.pagerank, 0.0);
+    }
+
+    #[test]
+    fn test_describe_logic_not_found_returns_none() {
+        let graph = ConceptGraph::empty();
+        assert!(graph.describe_logic("nonexistent_entity").is_none());
+    }
+
+    // --- find_similar_logic tests ---
+
+    #[test]
+    fn test_find_similar_logic_basic() {
+        let entities = vec![
+            make_entity(1, "entity_a"),
+            make_entity(2, "entity_b"),
+            make_entity(3, "entity_c"),
+        ];
+        let mut graph = make_graph_with_l4(entities, HashMap::new(), HashMap::new());
+        graph.logic_index.insert_vector(1, vec![1.0, 0.0, 0.0]);
+        graph.logic_index.insert_vector(2, vec![0.9, 0.1, 0.0]);
+        graph.logic_index.insert_vector(3, vec![0.0, 1.0, 0.0]);
+
+        let result = graph.find_similar_logic("entity_a", 2);
+        assert!(result.is_some());
+        let sim = result.unwrap();
+        assert_eq!(sim.query_entity.name, "entity_a");
+        assert_eq!(sim.similar.len(), 2);
+        // entity_b is more similar to entity_a than entity_c
+        assert_eq!(sim.similar[0].0.name, "entity_b");
+        assert!(sim.similar[0].1 > sim.similar[1].1);
+    }
+
+    #[test]
+    fn test_find_similar_logic_no_vector_returns_empty_similar() {
+        let entity = make_entity(5, "bare_entity");
+        let graph = make_graph_with_l4(vec![entity], HashMap::new(), HashMap::new());
+        // No vectors inserted into logic_index
+
+        let result = graph.find_similar_logic("bare_entity", 5);
+        assert!(result.is_some());
+        assert!(result.unwrap().similar.is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_logic_not_found_returns_none() {
+        let graph = ConceptGraph::empty();
+        assert!(graph.find_similar_logic("ghost", 3).is_none());
+    }
+
+    // --- compact_context tests ---
+
+    #[test]
+    fn test_compact_context_entity_scope_has_structure_and_behavior() {
+        let entity = make_entity(7, "transform_vol");
+        let pc = Pseudocode {
+            entity_id: 7,
+            steps: vec![PseudocodeStep::Return {
+                value: Some("result".into()),
+            }],
+            body_hash: 0,
+            omitted_count: 0,
+        };
+        let cs = CentralityScore {
+            entity_id: 7,
+            in_degree: 1,
+            out_degree: 2,
+            pagerank: 0.1,
+        };
+        let mut pseudocode = HashMap::new();
+        pseudocode.insert(7, pc);
+        let mut centrality = HashMap::new();
+        centrality.insert(7, cs);
+
+        let graph = make_graph_with_l4(vec![entity], pseudocode, centrality);
+        let result = graph.compact_context("transform_vol", 500);
+
+        assert!(result.is_some());
+        let ctx = result.unwrap();
+        assert!(ctx.text.contains("## Structure"));
+        assert!(ctx.text.contains("## Behavior"));
+        assert_eq!(ctx.scope, "transform_vol");
+    }
+
+    #[test]
+    fn test_compact_context_concept_scope_lists_entities() {
+        let mut graph = ConceptGraph::empty();
+
+        // Add a concept
+        let concept = make_concept(99, "segment", &["segment"]);
+        graph.concepts.insert(99, concept);
+
+        // Add entities tagged with that concept
+        let mut e1 = make_entity(100, "apply_segment");
+        e1.concept_tags = vec![99];
+        let mut e2 = make_entity(101, "segment_volume");
+        e2.concept_tags = vec![99];
+        graph.entities.insert(100, e1);
+        graph.entities.insert(101, e2);
+
+        let result = graph.compact_context("segment", 500);
+        assert!(result.is_some());
+        let ctx = result.unwrap();
+        // Concept scope renders entity list
+        assert!(ctx.text.contains("## Entities"));
+        assert!(ctx.scope == "segment");
+    }
+
+    #[test]
+    fn test_compact_context_not_found_returns_none() {
+        let graph = ConceptGraph::empty();
+        assert!(graph.compact_context("no_such_scope", 500).is_none());
+    }
+
+    #[test]
+    fn test_l4_tools_return_none_on_empty_graph() {
+        let graph = ConceptGraph::empty();
+        assert!(graph.describe_logic("anything").is_none());
+        assert!(graph.find_similar_logic("anything", 5).is_none());
+        assert!(graph.compact_context("anything", 500).is_none());
+    }
+
+    #[test]
+    fn test_compact_context_tiered_truncation_drops_low_priority_sections() {
+        // Entity with pseudocode (many steps), concept tags, logic cluster,
+        // centrality, and logic embeddings for "similar" entities — build a
+        // graph whose full context exceeds a tiny token budget so every
+        // truncation stage fires.
+        let steps: Vec<PseudocodeStep> = (0..10)
+            .map(|i| PseudocodeStep::Call {
+                callee: format!("step_{}", i),
+                args: vec![],
+            })
+            .collect();
+        let pc = Pseudocode {
+            entity_id: 1,
+            steps,
+            body_hash: 0,
+            omitted_count: 0,
+        };
+        let cs = CentralityScore {
+            entity_id: 1,
+            in_degree: 5,
+            out_degree: 3,
+            pagerank: 0.5,
+        };
+
+        let mut entity = make_entity(1, "fn_a");
+        let concept = make_concept(10, "volume", &["volume"]);
+        entity.concept_tags = vec![10];
+
+        // Logic cluster containing the entity and a peer
+        let cluster = LogicCluster {
+            id: 0,
+            entity_ids: vec![1, 2],
+            centroid: vec![],
+            behavioral_label: Some("transform".into()),
+        };
+
+        let mut pseudocode = HashMap::new();
+        pseudocode.insert(1, pc);
+        let mut centrality = HashMap::new();
+        centrality.insert(1, cs);
+
+        let peer = make_entity(2, "fn_b");
+        let mut graph = make_graph_with_l4(
+            vec![entity, peer],
+            pseudocode,
+            centrality,
+        );
+        graph.concepts.insert(10, concept);
+        graph.logic_clusters.push(cluster);
+
+        // Insert logic vectors so ## Related fires before truncation
+        graph.logic_index.insert_vector(1, vec![1.0, 0.0]);
+        graph.logic_index.insert_vector(2, vec![0.9, 0.1]);
+
+        // Budget of 10 tokens forces maximum truncation.
+        // The minimum achievable output is header + minimal structure
+        // (~12-15 tokens), so we assert that low-priority sections are gone.
+        let result = graph.compact_context("fn_a", 10);
+        assert!(result.is_some());
+        let ctx = result.unwrap();
+
+        // Entity name must survive (Structure section kept at minimum)
+        assert!(ctx.text.contains("fn_a"), "entity name must survive truncation");
+
+        // Low-priority sections must be dropped under tight budget
+        assert!(!ctx.text.contains("## Related"), "## Related must be dropped");
+        assert!(!ctx.text.contains("## Domain"), "## Domain must be dropped");
+
+        // Full context (no truncation) would carry header + structure +
+        // 10-step behavior + domain + related — well over 100 tokens.
+        // With budget=10 every stage fires; the survivor is header +
+        // minimal structure + trimmed behavior (first 2 + last 2 steps).
+        // That is ≤ 50 tokens, which proves the heavy sections were discarded.
+        let full_ctx = graph.compact_context("fn_a", 10_000).unwrap();
+        assert!(
+            ctx.token_estimate < full_ctx.token_estimate,
+            "truncated output ({} tokens) must be smaller than full output ({} tokens)",
+            ctx.token_estimate,
+            full_ctx.token_estimate,
+        );
+        assert!(
+            ctx.token_estimate <= 50,
+            "expected truncated output ≤50 tokens, got {}",
+            ctx.token_estimate
+        );
+    }
+
+    #[test]
+    fn test_compact_context_resolves_file_path_scope() {
+        // make_entity uses `file: PathBuf::from("test.py")` by default.
+        // compact_context should resolve "test.py" to that entity.
+        let entity = make_entity(20, "my_func");
+        let graph = make_graph_with_l4(
+            vec![entity],
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        let result = graph.compact_context("test.py", 500);
+        assert!(result.is_some(), "file path scope must resolve to an entity");
+        let ctx = result.unwrap();
+        assert_eq!(ctx.scope, "test.py");
+        assert!(ctx.text.contains("my_func"), "resolved entity name must appear");
+    }
+
+    #[test]
+    fn test_compact_context_shows_dependency_names() {
+        // Entity A (id=30) uses entity B (id=31).
+        // compact_context("entity_a", 500) must contain "depends on: entity_b".
+        let entity_a = make_entity(30, "entity_a");
+        let entity_b = make_entity(31, "entity_b");
+        let rel = Relationship {
+            source: 30,
+            target: 31,
+            kind: RelationshipKind::Uses,
+            weight: 1.0,
+        };
+
+        let mut graph = make_graph_with_l4(
+            vec![entity_a, entity_b],
+            HashMap::new(),
+            HashMap::new(),
+        );
+        graph.relationships.push(rel);
+
+        let result = graph.compact_context("entity_a", 500);
+        assert!(result.is_some());
+        let ctx = result.unwrap();
+        assert!(
+            ctx.text.contains("depends on: entity_b"),
+            "outgoing Uses edge must appear as 'depends on: entity_b', got:\n{}",
+            ctx.text
+        );
+    }
+
+    /// Build a graph with classes, methods, and standalone functions
+    /// spread across two files for describe_file tests.
+    fn make_describe_file_graph() -> ConceptGraph {
+        let concepts = vec![
+            make_concept(1, "transform", &["spatial_transform"]),
+            make_concept(2, "spatial", &["spatial_transform"]),
+            make_concept(3, "loss", &["dice_loss"]),
+            make_concept(4, "network", &["VoxNet"]),
+        ];
+
+        let signatures = vec![
+            Signature {
+                name: "forward".to_string(),
+                params: vec![Param {
+                    name: "x".to_string(),
+                    type_annotation: Some("Tensor".to_string()),
+                    default: None,
+                }],
+                return_type: Some("Tensor".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("src/networks.py"),
+                line: 15,
+                scope: Some("VoxNet".to_string()),
+                body: None,
+            },
+            Signature {
+                name: "init_weights".to_string(),
+                params: vec![],
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("src/networks.py"),
+                line: 25,
+                scope: Some("VoxNet".to_string()),
+                body: None,
+            },
+            Signature {
+                name: "spatial_transform".to_string(),
+                params: vec![
+                    Param {
+                        name: "vol".to_string(),
+                        type_annotation: Some("Tensor".to_string()),
+                        default: None,
+                    },
+                    Param {
+                        name: "trf".to_string(),
+                        type_annotation: None,
+                        default: None,
+                    },
+                ],
+                return_type: Some("Tensor".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("src/networks.py"),
+                line: 40,
+                scope: None,
+                body: None,
+            },
+            Signature {
+                name: "dice_loss".to_string(),
+                params: vec![Param {
+                    name: "pred".to_string(),
+                    type_annotation: Some("Tensor".to_string()),
+                    default: None,
+                }],
+                return_type: Some("float".to_string()),
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("src/losses.py"),
+                line: 5,
+                scope: None,
+                body: None,
+            },
+        ];
+
+        let classes = vec![ClassInfo {
+            name: "VoxNet".to_string(),
+            bases: vec!["nn.Module".to_string()],
+            methods: vec![
+                "forward".to_string(),
+                "init_weights".to_string(),
+            ],
+            attributes: Vec::new(),
+            docstring_first_line: Some("Voxel network.".to_string()),
+            file: PathBuf::from("src/networks.py"),
+            line: 10,
+        }];
+
+        let entities = vec![
+            Entity {
+                id: 100,
+                name: "VoxNet".to_string(),
+                kind: EntityKind::Class,
+                concept_tags: vec![4],
+                semantic_role: "network".to_string(),
+                file: PathBuf::from("src/networks.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 101,
+                name: "forward".to_string(),
+                kind: EntityKind::Method,
+                concept_tags: vec![],
+                semantic_role: "entry point".to_string(),
+                file: PathBuf::from("src/networks.py"),
+                line: 15,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 102,
+                name: "spatial_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1, 2],
+                semantic_role: "transform".to_string(),
+                file: PathBuf::from("src/networks.py"),
+                line: 40,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: 103,
+                name: "dice_loss".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![3],
+                semantic_role: "loss".to_string(),
+                file: PathBuf::from("src/losses.py"),
+                line: 5,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+
+        let analysis = AnalysisResult {
+            concepts,
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures,
+            classes,
+            call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
+        };
+        ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_describe_file_exact_match() {
+        let graph = make_describe_file_graph();
+        let results = graph.describe_file("src/losses.py");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].file,
+            PathBuf::from("src/losses.py")
+        );
+        assert_eq!(results[0].symbols.len(), 1);
+        let sym = &results[0].symbols[0];
+        assert_eq!(sym.name, "dice_loss");
+        assert!(matches!(sym.kind, SymbolKind::Function));
+        assert_eq!(sym.concepts, vec!["loss".to_string()]);
+        assert_eq!(sym.params, vec!["pred: Tensor".to_string()]);
+        assert_eq!(sym.return_type.as_deref(), Some("float"));
+    }
+
+    #[test]
+    fn test_describe_file_partial_match() {
+        let graph = make_describe_file_graph();
+        let results = graph.describe_file("networks.py");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].file,
+            PathBuf::from("src/networks.py")
+        );
+        // Should have VoxNet class + spatial_transform function
+        assert_eq!(results[0].symbols.len(), 2);
+    }
+
+    #[test]
+    fn test_describe_file_no_match() {
+        let graph = make_describe_file_graph();
+        let results = graph.describe_file("nonexistent.py");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_describe_file_classes_with_methods() {
+        let graph = make_describe_file_graph();
+        let results = graph.describe_file("src/networks.py");
+        assert_eq!(results.len(), 1);
+
+        let symbols = &results[0].symbols;
+        // Sorted by line: VoxNet (10), spatial_transform (40)
+        let class_sym = symbols
+            .iter()
+            .find(|s| s.name == "VoxNet")
+            .expect("VoxNet must be present");
+        assert!(matches!(class_sym.kind, SymbolKind::Class));
+        assert_eq!(class_sym.line, 10);
+        assert_eq!(class_sym.concepts, vec!["network".to_string()]);
+        assert_eq!(
+            class_sym.bases,
+            vec!["nn.Module".to_string()]
+        );
+        assert_eq!(class_sym.role.as_deref(), Some("network"));
+
+        // Methods nested under class
+        assert_eq!(class_sym.methods.len(), 2);
+        let forward = class_sym
+            .methods
+            .iter()
+            .find(|m| m.name == "forward")
+            .expect("forward must be a method");
+        assert!(matches!(forward.kind, SymbolKind::Method));
+        assert_eq!(forward.params, vec!["x: Tensor".to_string()]);
+        assert_eq!(forward.return_type.as_deref(), Some("Tensor"));
+        assert_eq!(forward.role.as_deref(), Some("entry point"));
+
+        // Standalone function
+        let st = symbols
+            .iter()
+            .find(|s| s.name == "spatial_transform")
+            .expect("spatial_transform must be present");
+        assert!(matches!(st.kind, SymbolKind::Function));
+        assert_eq!(st.line, 40);
+        assert!(st.concepts.contains(&"transform".to_string()));
+        assert!(st.concepts.contains(&"spatial".to_string()));
+        assert_eq!(
+            st.params,
+            vec!["vol: Tensor".to_string(), "trf".to_string()]
+        );
+    }
+
+    fn make_concept_map_graph() -> ConceptGraph {
+        let analysis = AnalysisResult {
+            concepts: vec![
+                make_concept(1, "transform", &["spatial_transform"]),
+                make_concept(2, "spatial", &["spatial_transform"]),
+                make_concept(3, "loss", &["dice_loss", "ncc_loss"]),
+            ],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: Vec::new(),
+            classes: Vec::new(),
+            call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
+        };
+        let entities = vec![
+            Entity {
+                id: Entity::hash_id(
+                    "SpatialTransformer",
+                    std::path::Path::new("proj/nn/transform.py"),
+                    10,
+                ),
+                name: "SpatialTransformer".to_string(),
+                kind: EntityKind::Class,
+                concept_tags: vec![1, 2],
+                semantic_role: "module".to_string(),
+                file: PathBuf::from("proj/nn/transform.py"),
+                line: 10,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: Entity::hash_id(
+                    "apply_transform",
+                    std::path::Path::new("proj/nn/transform.py"),
+                    50,
+                ),
+                name: "apply_transform".to_string(),
+                kind: EntityKind::Function,
+                concept_tags: vec![1],
+                semantic_role: "utility".to_string(),
+                file: PathBuf::from("proj/nn/transform.py"),
+                line: 50,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: Entity::hash_id(
+                    "DiceLoss",
+                    std::path::Path::new("proj/losses/dice.py"),
+                    5,
+                ),
+                name: "DiceLoss".to_string(),
+                kind: EntityKind::Class,
+                concept_tags: vec![3],
+                semantic_role: "module".to_string(),
+                file: PathBuf::from("proj/losses/dice.py"),
+                line: 5,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+            Entity {
+                id: Entity::hash_id(
+                    "NccLoss",
+                    std::path::Path::new("proj/losses/ncc.py"),
+                    5,
+                ),
+                name: "NccLoss".to_string(),
+                kind: EntityKind::Class,
+                concept_tags: vec![3],
+                semantic_role: "module".to_string(),
+                file: PathBuf::from("proj/losses/ncc.py"),
+                line: 5,
+                signature_idx: None,
+                class_info_idx: None,
+            },
+        ];
+        ConceptGraph::build_with_entities(
+            analysis,
+            EmbeddingIndex::empty(),
+            entities,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_concept_map_returns_modules() {
+        let graph = make_concept_map_graph();
+        let map = graph.concept_map();
+        assert!(!map.modules.is_empty(), "concept_map must return modules");
+        assert_eq!(map.total_entities, 4);
+        assert_eq!(map.total_concepts, 3);
+    }
+
+    #[test]
+    fn test_concept_map_sorted_by_entity_count() {
+        let graph = make_concept_map_graph();
+        let map = graph.concept_map();
+        for i in 1..map.modules.len() {
+            assert!(
+                map.modules[i - 1].nb_entities
+                    >= map.modules[i].nb_entities,
+                "modules must be sorted by entity count descending"
+            );
+        }
+    }
+
+    #[test]
+    fn test_concept_map_dominant_concepts_present() {
+        let graph = make_concept_map_graph();
+        let map = graph.concept_map();
+        // nn/transform.py has transform and spatial concepts
+        let nn_module = map
+            .modules
+            .iter()
+            .find(|m| m.path.contains("nn"))
+            .expect("nn module must exist");
+        assert!(
+            nn_module
+                .dominant_concepts
+                .iter()
+                .any(|c| c == "transform"),
+            "nn module must have 'transform' as dominant concept"
+        );
+        // losses dir has loss concept
+        let losses_module = map
+            .modules
+            .iter()
+            .find(|m| m.path.contains("losses"))
+            .expect("losses module must exist");
+        assert!(
+            losses_module
+                .dominant_concepts
+                .iter()
+                .any(|c| c == "loss"),
+            "losses module must have 'loss' as dominant concept"
+        );
+    }
+
+    #[test]
+    fn test_concept_map_empty_graph() {
+        let graph = ConceptGraph::empty();
+        let map = graph.concept_map();
+        assert!(map.modules.is_empty());
+        assert_eq!(map.total_entities, 0);
+        assert_eq!(map.total_concepts, 0);
+    }
+
+    #[test]
+    fn test_concept_map_entity_counts() {
+        let graph = make_concept_map_graph();
+        let map = graph.concept_map();
+        let nn_module = map
+            .modules
+            .iter()
+            .find(|m| m.path.contains("nn"))
+            .expect("nn module must exist");
+        assert_eq!(nn_module.nb_classes, 1);
+        assert_eq!(nn_module.nb_functions, 1);
+        assert_eq!(nn_module.nb_entities, 2);
+    }
+
+    #[test]
+    fn test_nesting_tree_lookup() {
+        use crate::types::{FileNestingTree, NestingKind, NestingNode};
+
+        let mut graph = make_test_graph();
+        graph.nesting_trees = vec![FileNestingTree {
+            file: PathBuf::from("src/model.py"),
+            root: NestingNode {
+                name: "model.py".to_string(),
+                kind: NestingKind::Module,
+                line: 0,
+                children: vec![
+                    NestingNode {
+                        name: "train".to_string(),
+                        kind: NestingKind::Function,
+                        line: 1,
+                        children: Vec::new(),
+                    },
+                    NestingNode {
+                        name: "MyModel".to_string(),
+                        kind: NestingKind::Class,
+                        line: 10,
+                        children: vec![NestingNode {
+                            name: "forward".to_string(),
+                            kind: NestingKind::Method,
+                            line: 15,
+                            children: Vec::new(),
+                        }],
+                    },
+                ],
+            },
+        }];
+
+        // Exact suffix match
+        let tree = graph.nesting_tree("src/model.py");
+        assert!(tree.is_some());
+        let tree = tree.unwrap();
+        assert_eq!(tree.root.kind, NestingKind::Module);
+        assert_eq!(tree.root.children.len(), 2);
+
+        // Partial suffix match
+        assert!(graph.nesting_tree("model.py").is_some());
+
+        // No match
+        assert!(graph.nesting_tree("nonexistent.py").is_none());
+    }
+
+    #[test]
+    fn test_nesting_tree_class_nesting() {
+        use crate::types::{FileNestingTree, NestingKind, NestingNode};
+
+        let mut graph = make_test_graph();
+        graph.nesting_trees = vec![FileNestingTree {
+            file: PathBuf::from("layers.py"),
+            root: NestingNode {
+                name: "layers.py".to_string(),
+                kind: NestingKind::Module,
+                line: 0,
+                children: vec![NestingNode {
+                    name: "ConvBlock".to_string(),
+                    kind: NestingKind::Class,
+                    line: 5,
+                    children: vec![
+                        NestingNode {
+                            name: "__init__".to_string(),
+                            kind: NestingKind::Method,
+                            line: 6,
+                            children: Vec::new(),
+                        },
+                        NestingNode {
+                            name: "forward".to_string(),
+                            kind: NestingKind::Method,
+                            line: 20,
+                            children: Vec::new(),
+                        },
+                    ],
+                }],
+            },
+        }];
+
+        let tree = graph.nesting_tree("layers.py").unwrap();
+        let class_node = &tree.root.children[0];
+        assert_eq!(class_node.name, "ConvBlock");
+        assert_eq!(class_node.kind, NestingKind::Class);
+        assert_eq!(class_node.children.len(), 2);
+        assert_eq!(class_node.children[0].kind, NestingKind::Method);
+        assert_eq!(class_node.children[1].kind, NestingKind::Method);
+    }
+
+    // --- Type flow tests ---
+
+    #[test]
+    fn test_type_flows_basic() {
+        let analysis = AnalysisResult {
+            concepts: vec![make_concept(1, "transform", &["transform"])],
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: vec![
+                Signature {
+                    name: "transform".to_string(),
+                    params: vec![Param {
+                        name: "image".to_string(),
+                        type_annotation: Some("Tensor".to_string()),
+                        default: None,
+                    }],
+                    return_type: Some("Tensor".to_string()),
+                    decorators: Vec::new(),
+                    docstring_first_line: None,
+                    file: PathBuf::from("ops.py"),
+                    line: 10,
+                    scope: None,
+                    body: None,
+                },
+                Signature {
+                    name: "warp".to_string(),
+                    params: vec![Param {
+                        name: "field".to_string(),
+                        type_annotation: Some("Tensor".to_string()),
+                        default: None,
+                    }],
+                    return_type: Some("Tensor".to_string()),
+                    decorators: Vec::new(),
+                    docstring_first_line: None,
+                    file: PathBuf::from("warp.py"),
+                    line: 5,
+                    scope: None,
+                    body: None,
+                },
+            ],
+            classes: Vec::new(),
+            call_sites: vec![CallSite {
+                caller_scope: Some("warp".to_string()),
+                callee: "transform".to_string(),
+                file: PathBuf::from("warp.py"),
+                line: 8,
+            }],
+            nesting_trees: Vec::new(),
+        };
+        let graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
+        let result = graph.type_flows();
+
+        // Call from warp -> transform should produce:
+        // 1. return type flow: transform -> warp (Tensor)
+        // 2. param type flow: warp -> transform (Tensor)
+        assert!(result.flows.len() >= 2);
+        assert!(result.total_typed_edges >= 1);
+
+        // All flows should have type "Tensor"
+        assert!(result.flows.iter().all(|f| f.type_name == "Tensor"));
+
+        // Dominant types should list Tensor
+        assert!(!result.dominant_types.is_empty());
+        assert_eq!(result.dominant_types[0].type_name, "Tensor");
+    }
+
+    #[test]
+    fn test_type_flows_untyped_signatures() {
+        let analysis = AnalysisResult {
+            concepts: Vec::new(),
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: vec![Signature {
+                name: "foo".to_string(),
+                params: vec![Param {
+                    name: "x".to_string(),
+                    type_annotation: None,
+                    default: None,
+                }],
+                return_type: None,
+                decorators: Vec::new(),
+                docstring_first_line: None,
+                file: PathBuf::from("a.py"),
+                line: 1,
+                scope: None,
+                body: None,
+            }],
+            classes: Vec::new(),
+            call_sites: vec![CallSite {
+                caller_scope: Some("bar".to_string()),
+                callee: "foo".to_string(),
+                file: PathBuf::from("b.py"),
+                line: 5,
+            }],
+            nesting_trees: Vec::new(),
+        };
+        let graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
+        let result = graph.type_flows();
+
+        // No type annotations -> no flows, one untyped edge
+        assert!(result.flows.is_empty());
+        assert_eq!(result.total_typed_edges, 0);
+        assert_eq!(result.total_untyped_edges, 1);
+    }
+
+    #[test]
+    fn test_type_flows_dominant_types_ranking() {
+        let analysis = AnalysisResult {
+            concepts: Vec::new(),
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: vec![
+                Signature {
+                    name: "load".to_string(),
+                    params: vec![Param {
+                        name: "path".to_string(),
+                        type_annotation: Some("str".to_string()),
+                        default: None,
+                    }],
+                    return_type: Some("Tensor".to_string()),
+                    decorators: Vec::new(),
+                    docstring_first_line: None,
+                    file: PathBuf::from("io.py"),
+                    line: 1,
+                    scope: None,
+                    body: None,
+                },
+                Signature {
+                    name: "save".to_string(),
+                    params: vec![
+                        Param {
+                            name: "data".to_string(),
+                            type_annotation: Some("Tensor".to_string()),
+                            default: None,
+                        },
+                        Param {
+                            name: "path".to_string(),
+                            type_annotation: Some("str".to_string()),
+                            default: None,
+                        },
+                    ],
+                    return_type: None,
+                    decorators: Vec::new(),
+                    docstring_first_line: None,
+                    file: PathBuf::from("io.py"),
+                    line: 10,
+                    scope: None,
+                    body: None,
+                },
+            ],
+            classes: Vec::new(),
+            call_sites: vec![
+                CallSite {
+                    caller_scope: Some("main".to_string()),
+                    callee: "load".to_string(),
+                    file: PathBuf::from("run.py"),
+                    line: 5,
+                },
+                CallSite {
+                    caller_scope: Some("main".to_string()),
+                    callee: "save".to_string(),
+                    file: PathBuf::from("run.py"),
+                    line: 8,
+                },
+            ],
+            nesting_trees: Vec::new(),
+        };
+        let graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
+        let result = graph.type_flows();
+
+        // Should have flows for: load->main (Tensor ret), main->load (str param),
+        // main->save (Tensor param), main->save (str param)
+        assert!(!result.flows.is_empty());
+        assert!(result.dominant_types.len() >= 2);
+
+        // Dominant types are sorted by count descending
+        for i in 1..result.dominant_types.len() {
+            assert!(
+                result.dominant_types[i - 1].count
+                    >= result.dominant_types[i].count
+            );
+        }
+    }
+
+    #[test]
+    fn test_trace_type_filters() {
+        let analysis = AnalysisResult {
+            concepts: Vec::new(),
+            conventions: Vec::new(),
+            co_occurrence_matrix: Vec::new(),
+            signatures: vec![
+                Signature {
+                    name: "process".to_string(),
+                    params: vec![Param {
+                        name: "img".to_string(),
+                        type_annotation: Some("torch.Tensor".to_string()),
+                        default: None,
+                    }],
+                    return_type: Some("np.ndarray".to_string()),
+                    decorators: Vec::new(),
+                    docstring_first_line: None,
+                    file: PathBuf::from("proc.py"),
+                    line: 1,
+                    scope: None,
+                    body: None,
+                },
+            ],
+            classes: Vec::new(),
+            call_sites: vec![CallSite {
+                caller_scope: Some("main".to_string()),
+                callee: "process".to_string(),
+                file: PathBuf::from("run.py"),
+                line: 5,
+            }],
+            nesting_trees: Vec::new(),
+        };
+        let graph =
+            ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
+
+        // Trace "Tensor" should find the param flow
+        let tensor_flows = graph.trace_type("Tensor");
+        assert!(!tensor_flows.is_empty());
+        assert!(tensor_flows.iter().all(|f| f.type_name.contains("Tensor")));
+
+        // Trace "ndarray" should find the return flow
+        let array_flows = graph.trace_type("ndarray");
+        assert!(!array_flows.is_empty());
+        assert!(array_flows.iter().all(|f| f.type_name.contains("ndarray")));
+
+        // Trace nonexistent type -> empty
+        let empty = graph.trace_type("DataFrame");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_type_annotation_optional() {
+        assert_eq!(
+            super::normalize_type_annotation("Optional[Tensor]"),
+            "Tensor"
+        );
+    }
+
+    #[test]
+    fn test_normalize_type_annotation_union_with_none() {
+        assert_eq!(
+            super::normalize_type_annotation("Union[Tensor, None]"),
+            "Tensor"
+        );
+    }
+
+    #[test]
+    fn test_normalize_type_annotation_plain() {
+        assert_eq!(
+            super::normalize_type_annotation("torch.Tensor"),
+            "torch.Tensor"
+        );
+    }
+
+    #[test]
+    fn test_normalize_type_annotation_nested_optional() {
+        assert_eq!(
+            super::normalize_type_annotation("Optional[List[int]]"),
+            "List[int]"
         );
     }
 

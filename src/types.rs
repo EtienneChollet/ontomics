@@ -86,6 +86,31 @@ pub enum PatternKind {
     Conversion(String),
 }
 
+// --- Nesting tree types ---
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NestingKind {
+    Module,
+    Class,
+    Function,
+    Method,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestingNode {
+    pub name: String,
+    pub kind: NestingKind,
+    pub line: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<NestingNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileNestingTree {
+    pub file: PathBuf,
+    pub root: NestingNode,
+}
+
 // --- Parser output types ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +131,8 @@ pub struct ParseResult {
     pub signatures: Vec<Signature>,
     pub classes: Vec<ClassInfo>,
     pub call_sites: Vec<CallSite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nesting_trees: Vec<FileNestingTree>,
 }
 
 // --- Analysis output types ---
@@ -118,6 +145,7 @@ pub struct AnalysisResult {
     pub signatures: Vec<Signature>,
     pub classes: Vec<ClassInfo>,
     pub call_sites: Vec<CallSite>,
+    pub nesting_trees: Vec<FileNestingTree>,
 }
 
 // --- Query result types ---
@@ -248,6 +276,8 @@ pub struct Signature {
     pub file: PathBuf,
     pub line: usize,
     pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<FunctionBody>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,12 +329,11 @@ pub enum EntityKind {
     Method,
 }
 
-/// Lightweight entity summary for inclusion in query results.
+/// Lightweight entity reference for drill-down query results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntitySummary {
     pub name: String,
     pub kind: EntityKind,
-    pub semantic_role: String,
     pub file: PathBuf,
     pub line: usize,
 }
@@ -330,7 +359,6 @@ impl Entity {
         EntitySummary {
             name: self.name.clone(),
             kind: self.kind.clone(),
-            semantic_role: self.semantic_role.clone(),
             file: self.file.clone(),
             line: self.line,
         }
@@ -348,6 +376,14 @@ pub enum TraceRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MethodSummary {
+    pub name: String,
+    pub params: Vec<String>,
+    pub return_type: Option<String>,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceNode {
     pub entity_name: String,
     pub kind: EntityKind,
@@ -355,6 +391,10 @@ pub struct TraceNode {
     pub line: usize,
     pub role: TraceRole,
     pub concept_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<MethodSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,10 +424,6 @@ pub struct DescribeSymbolResult {
     pub callees: Vec<CallSite>,
     pub concepts: Vec<String>,
     #[serde(default)]
-    pub semantic_role: String,
-    #[serde(default)]
-    pub concept_tags: Vec<String>,
-    #[serde(default)]
     pub related_entities: Vec<EntitySummary>,
 }
 
@@ -398,6 +434,35 @@ pub enum SymbolKind {
     Method,
 }
 
+// --- File description types ---
+
+/// A symbol within a file overview — compact, concept-annotated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub line: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concepts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<FileSymbol>,
+}
+
+/// Result of `describe_file` — one entry per matching file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeFileResult {
+    pub file: PathBuf,
+    pub symbols: Vec<FileSymbol>,
+}
+
 // --- Ontology diff types ---
 
 /// Lightweight concept summary for diffs (no occurrences or embeddings).
@@ -405,7 +470,6 @@ pub enum SymbolKind {
 pub struct DiffConceptSummary {
     pub canonical: String,
     pub frequency: usize,
-    pub entity_types: HashSet<EntityType>,
 }
 
 impl DiffConceptSummary {
@@ -413,7 +477,6 @@ impl DiffConceptSummary {
         Self {
             canonical: c.canonical.clone(),
             frequency: c.occurrences.len(),
-            entity_types: c.entity_types.clone(),
         }
     }
 }
@@ -478,6 +541,141 @@ pub struct DomainTerm {
 pub struct ConceptAssociation {
     pub concepts: Vec<String>,
     pub kind: String,
+}
+
+// --- L4: Logic types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionBody {
+    pub entity_name: String,
+    pub scope: Option<String>,
+    pub body_text: String,
+    pub file: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pseudocode {
+    pub entity_id: u64,
+    pub steps: Vec<PseudocodeStep>,
+    pub body_hash: u64,
+    #[serde(default)]
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PseudocodeStep {
+    Call { callee: String, args: Vec<String> },
+    Conditional { branches: Vec<ConditionalBranch> },
+    Loop { kind: LoopKind, body: Vec<PseudocodeStep> },
+    Return { value: Option<String> },
+    Assignment { target: String, source: String },
+    Yield { value: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalBranch {
+    pub condition: Option<String>,
+    pub body: Vec<PseudocodeStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LoopKind {
+    For { variable: String, iterable: String },
+    While { condition: String },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LogicCluster {
+    pub id: usize,
+    pub entity_ids: Vec<u64>,
+    #[serde(default)]
+    pub centroid: Vec<f32>,
+    pub behavioral_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CentralityScore {
+    pub entity_id: u64,
+    pub in_degree: usize,
+    pub out_degree: usize,
+    pub pagerank: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogicDescription {
+    pub entity: EntitySummary,
+    pub pseudocode_text: String,
+    pub logic_cluster: Option<LogicClusterSummary>,
+    pub centrality: CentralityScore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogicClusterSummary {
+    pub id: usize,
+    pub size: usize,
+    pub behavioral_label: Option<String>,
+    pub members: Vec<EntitySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimilarLogicResult {
+    pub query_entity: EntitySummary,
+    pub similar: Vec<(EntitySummary, f32)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactContext {
+    pub scope: String,
+    pub text: String,
+    pub token_estimate: usize,
+}
+
+// --- Concept map types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleMapEntry {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dominant_concepts: Vec<String>,
+    pub nb_classes: usize,
+    pub nb_functions: usize,
+    pub nb_entities: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_density: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptMap {
+    pub modules: Vec<ModuleMapEntry>,
+    pub total_entities: usize,
+    pub total_concepts: usize,
+}
+
+// --- Type flow types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeFlow {
+    pub from_entity: String,
+    pub to_entity: String,
+    pub type_name: String,
+    pub from_file: PathBuf,
+    pub to_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeFlowResult {
+    pub flows: Vec<TypeFlow>,
+    pub dominant_types: Vec<TypeFrequency>,
+    pub total_typed_edges: usize,
+    pub total_untyped_edges: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeFrequency {
+    pub type_name: String,
+    pub count: usize,
 }
 
 #[cfg(test)]

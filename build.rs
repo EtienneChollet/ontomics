@@ -10,6 +10,9 @@ const INDEX_FILES: &[&str] = &[
     "src/cache.rs",
     "src/tokenizer.rs",
     "src/types.rs",
+    "src/pseudocode.rs",
+    "src/logic.rs",
+    "src/centrality.rs",
 ];
 
 fn main() {

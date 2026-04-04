@@ -1,7 +1,8 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
-use crate::types::Concept;
-use std::collections::HashSet;
+use crate::logic::LogicIndex;
+use crate::types::{Concept, Pseudocode};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Determine which concepts still need embedding vectors.
@@ -40,6 +41,39 @@ pub fn is_generation_stale(
     my_generation: u64,
 ) -> bool {
     current.load(Ordering::SeqCst) != my_generation
+}
+
+/// Determine which entities still need logic embedding vectors.
+pub fn compute_logic_plan(
+    pseudocode: &HashMap<u64, Pseudocode>,
+    already_embedded: &HashSet<u64>,
+    min_steps: usize,
+) -> Vec<(u64, String)> {
+    pseudocode
+        .iter()
+        .filter(|(id, pc)| {
+            !already_embedded.contains(id) && pc.steps.len() >= min_steps
+        })
+        .map(|(id, pc)| {
+            (*id, crate::pseudocode::format_pseudocode(pc))
+        })
+        .collect()
+}
+
+/// Merge newly-computed logic vectors from `source` into `graph.logic_index`.
+pub fn merge_logic_vectors(
+    graph: &mut ConceptGraph,
+    source: &LogicIndex,
+    entity_ids: &[u64],
+) -> usize {
+    let mut merged = 0;
+    for &id in entity_ids {
+        if let Some(v) = source.get_vector(id) {
+            graph.logic_index.insert_vector(id, v.clone());
+            merged += 1;
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -81,6 +115,12 @@ mod tests {
             call_sites: Vec::new(),
             entities: std::collections::HashMap::new(),
             cluster_centroids: std::collections::HashMap::new(),
+            pseudocode: std::collections::HashMap::new(),
+            logic_index: crate::logic::LogicIndex::empty(),
+            logic_clusters: Vec::new(),
+            centrality: std::collections::HashMap::new(),
+            logic_concept_overlaps: Vec::new(),
+            nesting_trees: Vec::new(),
         }
     }
 
@@ -273,5 +313,59 @@ mod tests {
 
         cache.release_embedding_lock();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- L4: compute_logic_plan and merge_logic_vectors tests ---
+
+    fn make_pseudocode(entity_id: u64, nb_steps: usize) -> Pseudocode {
+        Pseudocode {
+            entity_id,
+            steps: (0..nb_steps)
+                .map(|i| crate::types::PseudocodeStep::Call {
+                    callee: format!("callee_{i}"),
+                    args: vec![],
+                })
+                .collect(),
+            body_hash: 0,
+            omitted_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_compute_logic_plan_filters_by_min_steps() {
+        let mut pseudocode = HashMap::new();
+        pseudocode.insert(1, make_pseudocode(1, 1));
+        pseudocode.insert(2, make_pseudocode(2, 3));
+        pseudocode.insert(3, make_pseudocode(3, 5));
+
+        let already: HashSet<u64> = HashSet::new();
+        let plan = super::compute_logic_plan(&pseudocode, &already, 3);
+
+        // Only entity_ids 2 and 3 have >= 3 steps
+        assert_eq!(plan.len(), 2);
+        let ids: HashSet<u64> = plan.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+        assert!(!ids.contains(&1));
+    }
+
+    #[test]
+    fn test_merge_logic_vectors_merges_selected_ids() {
+        let mut graph = make_empty_graph(0);
+        assert_eq!(graph.logic_index.nb_vectors(), 0);
+
+        let mut source = crate::logic::LogicIndex::empty();
+        source.insert_vector(1, vec![1.0, 0.0, 0.0]);
+        source.insert_vector(2, vec![0.0, 1.0, 0.0]);
+        source.insert_vector(3, vec![0.0, 0.0, 1.0]);
+
+        // Only merge ids 1 and 3, not 2
+        let merged = super::merge_logic_vectors(&mut graph, &source, &[1, 3]);
+
+        assert_eq!(merged, 2);
+        assert_eq!(graph.logic_index.nb_vectors(), 2);
+        assert!(graph.logic_index.get_vector(1).is_some());
+        assert!(graph.logic_index.get_vector(2).is_none());
+        assert!(graph.logic_index.get_vector(3).is_some());
     }
 }

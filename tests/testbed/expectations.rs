@@ -43,6 +43,33 @@ pub struct LocateConceptCheck {
     pub file_contains: &'static str,
 }
 
+/// Expected properties of a single symbol in describe_file output.
+pub struct SymbolExpectation {
+    /// Symbol name (exact match)
+    pub name: &'static str,
+    /// "Class", "Function", or "Method"
+    pub expected_kind: &'static str,
+    /// At least one concept tag must contain this substring (if set)
+    pub concept_contains: Option<&'static str>,
+    /// Class must have at least this many methods (0 for non-classes)
+    pub min_methods: usize,
+    /// If set, at least one base class must contain this substring
+    pub base_contains: Option<&'static str>,
+}
+
+/// A single describe_file check — validates structural correctness,
+/// concept annotation quality, and method nesting for a specific file.
+pub struct DescribeFileCheck {
+    /// Partial file path to query (supports partial matching)
+    pub path: &'static str,
+    /// At least one result file must contain this substring
+    pub file_contains: &'static str,
+    /// Minimum total symbols (classes + standalone functions) expected
+    pub min_symbols: usize,
+    /// Specific symbols that must appear with validated properties
+    pub must_have_symbols: Vec<SymbolExpectation>,
+}
+
 /// A convention that must be detected.
 pub struct ConventionCheck {
     /// "Prefix", "Suffix", "Conversion", or "Compound"
@@ -80,6 +107,9 @@ pub struct TestbedExpectations {
 
     // describe_symbol
     pub describe_symbol_checks: Vec<DescribeSymbolCheck>,
+
+    // describe_file
+    pub describe_file_checks: Vec<DescribeFileCheck>,
 
     // locate_concept
     pub locate_concept_checks: Vec<LocateConceptCheck>,
@@ -151,6 +181,74 @@ pub fn voxelmorph_expectations() -> TestbedExpectations {
             DescribeSymbolCheck { name: "spatial_transform", expected_kind: "Function" },
             DescribeSymbolCheck { name: "disp_to_trf", expected_kind: "Function" },
         ],
+        describe_file_checks: vec![
+            // modules.py: core neural network modules with inheritance and methods
+            DescribeFileCheck {
+                path: "modules.py",
+                file_contains: "nn/modules",
+                min_symbols: 3,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "SpatialTransformer",
+                        expected_kind: "Class",
+                        concept_contains: Some("spatial"),
+                        min_methods: 2,
+                        base_contains: Some("Module"),
+                    },
+                    SymbolExpectation {
+                        name: "IntegrateVelocityField",
+                        expected_kind: "Class",
+                        concept_contains: Some("field"),
+                        min_methods: 2,
+                        base_contains: Some("Module"),
+                    },
+                    SymbolExpectation {
+                        name: "ResizeDisplacementField",
+                        expected_kind: "Class",
+                        concept_contains: Some("field"),
+                        min_methods: 2,
+                        base_contains: Some("Module"),
+                    },
+                ],
+            },
+            // functional.py: standalone conversion/transform functions
+            // Partial match returns TWO files (voxelmorph/functional.py AND nn/functional.py)
+            DescribeFileCheck {
+                path: "functional.py",
+                file_contains: "voxelmorph/functional.py",
+                min_symbols: 10,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "spatial_transform",
+                        expected_kind: "Function",
+                        concept_contains: Some("spatial"),
+                        min_methods: 0,
+                        base_contains: None,
+                    },
+                    SymbolExpectation {
+                        name: "disp_to_trf",
+                        expected_kind: "Function",
+                        concept_contains: Some("disp"),
+                        min_methods: 0,
+                        base_contains: None,
+                    },
+                    SymbolExpectation {
+                        name: "affine_to_disp",
+                        expected_kind: "Function",
+                        concept_contains: Some("affine"),
+                        min_methods: 0,
+                        base_contains: None,
+                    },
+                    SymbolExpectation {
+                        name: "compose",
+                        expected_kind: "Function",
+                        concept_contains: Some("compose"),
+                        min_methods: 0,
+                        base_contains: None,
+                    },
+                ],
+            },
+        ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "transform", file_contains: "functional.py" },
         ],
@@ -218,6 +316,30 @@ pub fn neurite_expectations() -> TestbedExpectations {
             DescribeSymbolCheck { name: "BasicUNet", expected_kind: "Class" },
             DescribeSymbolCheck { name: "Dice", expected_kind: "Class" },
         ],
+        describe_file_checks: vec![
+            // nn/models.py: core model architectures with UNet and autoencoder
+            DescribeFileCheck {
+                path: "nn/models.py",
+                file_contains: "nn/models",
+                min_symbols: 2,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "BasicUNet",
+                        expected_kind: "Class",
+                        concept_contains: None,
+                        min_methods: 2,
+                        base_contains: Some("Module"),
+                    },
+                    SymbolExpectation {
+                        name: "BasicAutoencoder",
+                        expected_kind: "Class",
+                        concept_contains: Some("basic"),
+                        min_methods: 2,
+                        base_contains: Some("Module"),
+                    },
+                ],
+            },
+        ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "conv", file_contains: "nn/" },
         ],
@@ -282,6 +404,23 @@ pub fn interseg3d_expectations() -> TestbedExpectations {
             DescribeSymbolCheck { name: "CrossBlock", expected_kind: "Class" },
             DescribeSymbolCheck { name: "PerPixelSetSelfAttention", expected_kind: "Class" },
         ],
+        describe_file_checks: vec![
+            // universeg_3d.py: main segmentation model
+            DescribeFileCheck {
+                path: "universeg_3d.py",
+                file_contains: "universeg_3d",
+                min_symbols: 1,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "UniverSeg3d",
+                        expected_kind: "Class",
+                        concept_contains: Some("seg"),
+                        min_methods: 2,
+                        base_contains: Some("Module"),
+                    },
+                ],
+            },
+        ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "click", file_contains: "click" },
             LocateConceptCheck { term: "attention", file_contains: "attention" },
@@ -338,6 +477,30 @@ pub fn scribbleprompt_expectations() -> TestbedExpectations {
             DescribeSymbolCheck { name: "FocalDiceLoss", expected_kind: "Class" },
             DescribeSymbolCheck { name: "RandomClick", expected_kind: "Class" },
         ],
+        describe_file_checks: vec![
+            // models/unet.py: UNet model with predict, standalone interaction helpers
+            DescribeFileCheck {
+                path: "models/unet.py",
+                file_contains: "models/unet",
+                min_symbols: 3,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "ScribblePromptUNet",
+                        expected_kind: "Class",
+                        concept_contains: Some("prompt"),
+                        min_methods: 3,
+                        base_contains: None,
+                    },
+                    SymbolExpectation {
+                        name: "click_onehot",
+                        expected_kind: "Function",
+                        concept_contains: Some("click"),
+                        min_methods: 0,
+                        base_contains: None,
+                    },
+                ],
+            },
+        ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "scribble", file_contains: "interactions/" },
             LocateConceptCheck { term: "augmentation", file_contains: "augmentation/" },
@@ -383,6 +546,23 @@ pub fn freebrowse_expectations() -> TestbedExpectations {
         must_have_conventions: vec![],
         describe_symbol_checks: vec![
             DescribeSymbolCheck { name: "FreeBrowse", expected_kind: "Function" },
+        ],
+        describe_file_checks: vec![
+            // freebrowse.tsx: main React component (function, not class — TypeScript)
+            DescribeFileCheck {
+                path: "freebrowse.tsx",
+                file_contains: "freebrowse.tsx",
+                min_symbols: 1,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "FreeBrowse",
+                        expected_kind: "Function",
+                        concept_contains: Some("browse"),
+                        min_methods: 0,
+                        base_contains: None,
+                    },
+                ],
+            },
         ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "volume", file_contains: "volume" },
@@ -436,6 +616,23 @@ pub fn pylot_expectations() -> TestbedExpectations {
         must_have_conventions: vec![],
         describe_symbol_checks: vec![
             DescribeSymbolCheck { name: "Config", expected_kind: "Class" },
+        ],
+        describe_file_checks: vec![
+            // experiment/train.py: training experiment runner class
+            DescribeFileCheck {
+                path: "experiment/train.py",
+                file_contains: "experiment/train",
+                min_symbols: 1,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "TrainExperiment",
+                        expected_kind: "Class",
+                        concept_contains: Some("experiment"),
+                        min_methods: 2,
+                        base_contains: None,
+                    },
+                ],
+            },
         ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "experiment", file_contains: "experiment/" },
@@ -492,6 +689,23 @@ pub fn pytorch_expectations() -> TestbedExpectations {
             DescribeSymbolCheck { name: "Linear", expected_kind: "Class" },
             DescribeSymbolCheck { name: "Conv2d", expected_kind: "Class" },
             DescribeSymbolCheck { name: "Adam", expected_kind: "Class" },
+        ],
+        describe_file_checks: vec![
+            // torch/_tensor.py: core Tensor class with extensive methods
+            DescribeFileCheck {
+                path: "torch/_tensor.py",
+                file_contains: "_tensor",
+                min_symbols: 1,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "Tensor",
+                        expected_kind: "Class",
+                        concept_contains: Some("tensor"),
+                        min_methods: 5,
+                        base_contains: None,
+                    },
+                ],
+            },
         ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "conv", file_contains: "conv" },
@@ -563,6 +777,23 @@ pub fn pandas_expectations() -> TestbedExpectations {
             DescribeSymbolCheck { name: "Series", expected_kind: "Class" },
             DescribeSymbolCheck { name: "Index", expected_kind: "Class" },
             DescribeSymbolCheck { name: "MultiIndex", expected_kind: "Class" },
+        ],
+        describe_file_checks: vec![
+            // core/frame.py: core DataFrame class with extensive API
+            DescribeFileCheck {
+                path: "core/frame.py",
+                file_contains: "core/frame",
+                min_symbols: 1,
+                must_have_symbols: vec![
+                    SymbolExpectation {
+                        name: "DataFrame",
+                        expected_kind: "Class",
+                        concept_contains: Some("frame"),
+                        min_methods: 5,
+                        base_contains: None,
+                    },
+                ],
+            },
         ],
         locate_concept_checks: vec![
             LocateConceptCheck { term: "frame", file_contains: "frame.py" },

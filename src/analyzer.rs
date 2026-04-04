@@ -644,6 +644,10 @@ pub fn analyze(
         .iter()
         .flat_map(|pr| pr.call_sites.clone())
         .collect();
+    let nesting_trees = parse_results
+        .iter()
+        .flat_map(|pr| pr.nesting_trees.clone())
+        .collect();
 
     Ok(AnalysisResult {
         concepts,
@@ -652,6 +656,7 @@ pub fn analyze(
         signatures,
         classes,
         call_sites,
+        nesting_trees,
     })
 }
 
@@ -683,6 +688,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         }
     }
 

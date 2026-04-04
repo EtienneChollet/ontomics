@@ -105,8 +105,34 @@ impl OntomicsServer {
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         match graph.query_concept(term, &params) {
             Some(result) => {
-                serde_json::to_value(result)
-                    .map_err(|e| format!("serialization error: {e}"))
+                // Build slim output, omitting internal Concept fields
+                let subconcepts: Vec<Value> = result
+                    .concept
+                    .subconcepts
+                    .iter()
+                    .map(|sc| {
+                        json!({
+                            "qualifier": sc.qualifier,
+                            "canonical": sc.canonical,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "concept": {
+                        "canonical": result.concept.canonical,
+                        "subconcepts": subconcepts,
+                    },
+                    "variants": result.variants,
+                    "related": result.related,
+                    "conventions": result.conventions,
+                    "top_occurrences": result.top_occurrences,
+                    "signatures": result.signatures,
+                    "classes": result.classes,
+                    "call_graph": result.call_graph,
+                    "entities": result.entities,
+                    "hint": "Use locate_concept(term) for file locations \
+                             or describe_symbol(name) for any entity.",
+                }))
             }
             None => Ok(json!({
                 "error": "not_found",
@@ -123,8 +149,15 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let result = graph.check_naming(identifier);
-        serde_json::to_value(result)
-            .map_err(|e| format!("serialization error: {e}"))
+        let mut val = serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "hint".into(),
+                json!("Use suggest_name(description) for project-consistent alternatives."),
+            );
+        }
+        Ok(val)
     }
 
     fn handle_suggest_name(&self, args: &Value) -> Result<Value, String> {
@@ -135,8 +168,12 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let result = graph.suggest_name(description);
-        serde_json::to_value(result)
-            .map_err(|e| format!("serialization error: {e}"))
+        let suggestions = serde_json::to_value(&result)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        Ok(json!({
+            "suggestions": suggestions,
+            "hint": "Use check_naming(identifier) to validate a suggestion.",
+        }))
     }
 
     fn handle_ontology_diff(&self, args: &Value) -> Result<Value, String> {
@@ -154,8 +191,15 @@ impl OntomicsServer {
         )
         .map_err(|e| format!("ontology_diff failed: {e}"))?;
 
-        serde_json::to_value(result)
-            .map_err(|e| format!("serialization error: {e}"))
+        let mut val = serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "hint".into(),
+                json!("Use query_concept(term) for any added or changed concept."),
+            );
+        }
+        Ok(val)
     }
 
     fn handle_list_concepts(&self, args: &Value) -> Result<Value, String> {
@@ -169,32 +213,26 @@ impl OntomicsServer {
         let mut concepts = graph.list_concepts();
         concepts.truncate(top_k);
 
-        let summary: Vec<Value> = concepts
+        let names: Vec<&str> = concepts
             .iter()
-            .map(|c| {
-                let entity_count = graph
-                    .entities
-                    .values()
-                    .filter(|e| e.concept_tags.contains(&c.id))
-                    .count();
-                json!({
-                    "canonical": c.canonical,
-                    "occurrences": c.occurrences.len(),
-                    "entity_types": c.entity_types,
-                    "entity_count": entity_count,
-                })
-            })
+            .map(|c| c.canonical.as_str())
             .collect();
 
         let warnings = self.warnings.lock()
             .map(|w| w.clone())
             .unwrap_or_default();
+        let hint = "Use query_concept(term) or locate_concept(term) \
+                    to drill into any concept.";
         if warnings.is_empty() {
-            Ok(json!(summary))
+            Ok(json!({
+                "concepts": names,
+                "hint": hint,
+            }))
         } else {
             Ok(json!({
                 "warnings": warnings,
-                "concepts": summary,
+                "concepts": names,
+                "hint": hint,
             }))
         }
     }
@@ -207,8 +245,17 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         match graph.describe_symbol(name) {
-            Some(result) => serde_json::to_value(result)
-                .map_err(|e| format!("serialization error: {e}")),
+            Some(result) => {
+                let mut val = serde_json::to_value(result)
+                    .map_err(|e| format!("serialization error: {e}"))?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "hint".into(),
+                        json!("Use locate_concept(term) for broader concept context."),
+                    );
+                }
+                Ok(val)
+            }
             None => Ok(json!({
                 "error": "not_found",
                 "message": format!("no symbol matching '{name}'"),
@@ -224,8 +271,17 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         match graph.locate_concept(term) {
-            Some(result) => serde_json::to_value(result)
-                .map_err(|e| format!("serialization error: {e}")),
+            Some(result) => {
+                let mut val = serde_json::to_value(result)
+                    .map_err(|e| format!("serialization error: {e}"))?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "hint".into(),
+                        json!("Use describe_symbol(name) for any entity in the results."),
+                    );
+                }
+                Ok(val)
+            }
             None => Ok(json!({
                 "error": "not_found",
                 "message": format!("no concept matching '{term}'"),
@@ -236,8 +292,12 @@ impl OntomicsServer {
     fn handle_list_conventions(&self, _args: &Value) -> Result<Value, String> {
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let conventions = graph.list_conventions();
-        serde_json::to_value(conventions)
-            .map_err(|e| format!("serialization error: {e}"))
+        let val = serde_json::to_value(conventions)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        Ok(json!({
+            "conventions": val,
+            "hint": "Use check_naming(identifier) to test an identifier against these conventions.",
+        }))
     }
 
     fn handle_export_domain_pack(&self, _args: &Value) -> Result<Value, String> {
@@ -269,8 +329,15 @@ impl OntomicsServer {
             .map_err(|e| format!("lock error: {e}"))?;
         let config = HealthConfig::default();
         let result = graph.vocabulary_health(&config);
-        serde_json::to_value(result)
-            .map_err(|e| format!("serialization error: {e}"))
+        let mut val = serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "hint".into(),
+                json!("Use check_naming(identifier) for any flagged inconsistency."),
+            );
+        }
+        Ok(val)
     }
 
     fn handle_list_entities(&self, args: &Value) -> Result<Value, String> {
@@ -293,8 +360,167 @@ impl OntomicsServer {
 
         let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
         let results = graph.list_entities(concept, role, kind.as_ref(), top_k);
-        serde_json::to_value(results)
-            .map_err(|e| format!("serialization error: {e}"))
+
+        let items: Vec<Value> = results
+            .iter()
+            .map(|ent| {
+                // Resolve concept tags by finding the full Entity
+                let concepts: Vec<&str> = graph
+                    .entities
+                    .values()
+                    .find(|e| e.name == ent.name && e.file == ent.file)
+                    .map(|e| {
+                        e.concept_tags
+                            .iter()
+                            .filter_map(|id| {
+                                graph.concepts.get(id).map(|c| c.canonical.as_str())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                json!({
+                    "name": ent.name,
+                    "kind": ent.kind,
+                    "concepts": concepts,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "entities": items,
+            "hint": "Use describe_symbol(name) for signatures, callers, and callees.",
+        }))
+    }
+
+    fn handle_describe_logic(&self, args: &Value) -> Result<Value, String> {
+        let name = args.get("name").and_then(|v| v.as_str())
+            .ok_or("missing required argument 'name'")?;
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        match graph.describe_logic(name) {
+            Some(result) => serde_json::to_value(result)
+                .map_err(|e| format!("serialization error: {e}")),
+            None => Ok(json!({
+                "error": "not_found",
+                "message": format!("no entity matching '{name}'"),
+            })),
+        }
+    }
+
+    fn handle_find_similar_logic(&self, args: &Value) -> Result<Value, String> {
+        let name = args.get("name").and_then(|v| v.as_str())
+            .ok_or("missing required argument 'name'")?;
+        let top_k = args.get("top_k").and_then(|v| v.as_u64())
+            .map(|v| v as usize).unwrap_or(5);
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        match graph.find_similar_logic(name, top_k) {
+            Some(result) => serde_json::to_value(result)
+                .map_err(|e| format!("serialization error: {e}")),
+            None => Ok(json!({
+                "error": "not_found",
+                "message": format!("no entity matching '{name}'"),
+            })),
+        }
+    }
+
+    fn handle_compact_context(&self, args: &Value) -> Result<Value, String> {
+        let scope = args.get("scope").and_then(|v| v.as_str())
+            .ok_or("missing required argument 'scope'")?;
+        let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64())
+            .map(|v| v as usize).unwrap_or(500);
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        match graph.compact_context(scope, max_tokens) {
+            Some(result) => serde_json::to_value(result)
+                .map_err(|e| format!("serialization error: {e}")),
+            None => Ok(json!({
+                "error": "not_found",
+                "message": format!("no matching concept or entity for '{scope}'"),
+            })),
+        }
+    }
+
+    fn handle_describe_file(&self, args: &Value) -> Result<Value, String> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required argument 'path'")?;
+
+        let graph = self.graph.read().map_err(|e| format!("lock error: {e}"))?;
+        let results = graph.describe_file(path);
+        if results.is_empty() {
+            Ok(json!({
+                "error": "not_found",
+                "message": format!("no files matching '{path}'"),
+            }))
+        } else {
+            serde_json::to_value(results)
+                .map_err(|e| format!("serialization error: {e}"))
+        }
+    }
+
+    fn handle_concept_map(
+        &self,
+        _args: &Value,
+    ) -> Result<Value, String> {
+        let graph = self
+            .graph
+            .read()
+            .map_err(|e| format!("lock error: {e}"))?;
+        let result = graph.concept_map();
+        let mut val = serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "hint".into(),
+                json!("Use query_concept(term) or locate_concept(term) \
+                    to drill into any concept. Use list_entities(concept) \
+                    to see entities for a module's dominant concept."),
+            );
+        }
+        Ok(val)
+    }
+
+    fn handle_type_flows(
+        &self,
+        _args: &Value,
+    ) -> Result<Value, String> {
+        let graph = self
+            .graph
+            .read()
+            .map_err(|e| format!("lock error: {e}"))?;
+        let result = graph.type_flows();
+        let mut val = serde_json::to_value(result)
+            .map_err(|e| format!("serialization error: {e}"))?;
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "hint".into(),
+                json!("Use trace_type(type_name) to filter flows \
+                    for a specific type."),
+            );
+        }
+        Ok(val)
+    }
+
+    fn handle_trace_type(
+        &self,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let type_name = args
+            .get("type_name")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required argument 'type_name'")?;
+
+        let graph = self
+            .graph
+            .read()
+            .map_err(|e| format!("lock error: {e}"))?;
+        let flows = graph.trace_type(type_name);
+        Ok(json!({
+            "type_name": type_name,
+            "flows": flows,
+            "total": flows.len(),
+            "hint": "Use describe_symbol(name) for any entity \
+                in the results.",
+        }))
     }
 
     fn handle_trace_concept(
@@ -316,8 +542,17 @@ impl OntomicsServer {
             .read()
             .map_err(|e| format!("lock error: {e}"))?;
         match graph.trace_concept(concept, max_depth) {
-            Some(result) => serde_json::to_value(result)
-                .map_err(|e| format!("serialization error: {e}")),
+            Some(result) => {
+                let mut val = serde_json::to_value(result)
+                    .map_err(|e| format!("serialization error: {e}"))?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "hint".into(),
+                        json!("Use describe_symbol(name) for any node in the call chain."),
+                    );
+                }
+                Ok(val)
+            }
             None => Ok(json!({
                 "error": "not_found",
                 "message": format!(
@@ -433,10 +668,11 @@ fn tool_definitions() -> Vec<Tool> {
             "list_concepts",
             "List the project's domain vocabulary ranked by importance — a \
              semantic overview of what this codebase is about that reading \
-             individual files cannot provide. Returns concept names with \
-             occurrence counts and entity counts. Use when asked 'what is \
-             this project about', 'what are the main concepts', or when \
-             orienting in an unfamiliar codebase.",
+             individual files cannot provide. Returns concept names as a \
+             ranked list. Use query_concept or locate_concept to drill \
+             into any result. Use when asked 'what is this project about', \
+             'what are the main concepts', or when orienting in an \
+             unfamiliar codebase.",
             tool_schema(
                 json!({
                     "top_k": {
@@ -460,10 +696,10 @@ fn tool_definitions() -> Vec<Tool> {
         Tool::new(
             "describe_symbol",
             "Describe a function or class WITHOUT reading its source file — \
-             returns signature, parameters, callers, callees, semantic role, \
-             and related domain concepts. Faster and more informative than \
-             Read for understanding what a symbol does and how it fits into \
-             the codebase. Use when asked 'what does function X do' or \
+             returns signature, parameters, callers, callees, and related \
+             domain concepts. Faster and more informative than Read for \
+             understanding what a symbol does and how it fits into the \
+             codebase. Use when asked 'what does function X do' or \
              'what is class X'.",
             tool_schema(
                 json!({
@@ -473,6 +709,25 @@ fn tool_definitions() -> Vec<Tool> {
                     }
                 }),
                 &["name"],
+            ),
+        ),
+        Tool::new(
+            "describe_file",
+            "Describe a file's structure WITHOUT reading it — returns classes, \
+             functions, and methods annotated with domain concepts and semantic \
+             roles. Use when you need to understand a file's shape, what symbols \
+             it contains, or what concepts it implements. Accepts partial paths \
+             (e.g. 'networks.py' matches 'src/networks.py'). Use describe_symbol \
+             to drill into any symbol shown.",
+            tool_schema(
+                json!({
+                    "path": {
+                        "type": "string",
+                        "description": "File path or partial path to describe \
+                            (e.g. 'networks.py')",
+                    }
+                }),
+                &["path"],
             ),
         ),
         Tool::new(
@@ -504,13 +759,14 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             "list_entities",
-            "Find all classes and functions matching a semantic role or concept — \
-             e.g. all loss functions, all network architectures, all transform \
-             utilities. Returns entities with semantic roles and concept tags. \
-             Impossible with grep alone because it understands which functions \
-             *implement* a concept, not just mention it. Use when asked 'what \
-             loss functions exist', 'show me the network classes', 'what uses \
-             concept X', or 'list all X'.",
+            "Find all classes and functions matching a concept — e.g. all \
+             loss functions, all network architectures, all transform \
+             utilities. Returns entity names with their domain concept \
+             tags. Use describe_symbol to drill into any result. \
+             Impossible with grep alone because it understands which \
+             functions *implement* a concept, not just mention it. Use \
+             when asked 'what loss functions exist', 'show me the \
+             network classes', 'what uses concept X', or 'list all X'.",
             tool_schema(
                 json!({
                     "concept": {
@@ -572,6 +828,104 @@ fn tool_definitions() -> Vec<Tool> {
                 &["concept"],
             ),
         ),
+        Tool::new(
+            "describe_logic",
+            "Describe the behavioral logic of a function or class — returns \
+             pseudocode (structured control flow summary), logic cluster \
+             membership (which other entities behave similarly), and structural \
+             centrality (PageRank importance in the dependency graph). Use when \
+             asked 'what does this function do internally', 'how does X work at \
+             a high level', or 'what is the logic of X'.",
+            tool_schema(
+                json!({
+                    "name": {
+                        "type": "string",
+                        "description": "Function or class name",
+                    }
+                }),
+                &["name"],
+            ),
+        ),
+        Tool::new(
+            "find_similar_logic",
+            "Find entities with similar behavioral patterns — uses logic \
+             embeddings to find functions/classes that do similar things \
+             regardless of naming. Returns similarity scores. Use when asked \
+             'what other functions do the same thing', 'find similar \
+             implementations', or 'what behaves like X'.",
+            tool_schema(
+                json!({
+                    "name": {
+                        "type": "string",
+                        "description": "Entity name to compare against",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Max similar entities to return \
+                            (default: 5)",
+                    }
+                }),
+                &["name"],
+            ),
+        ),
+        Tool::new(
+            "compact_context",
+            "Assemble minimal, token-efficient context for a concept, entity, \
+             or file — combines pseudocode + structural summary + domain \
+             concepts + logic cluster into a compact text block suitable for \
+             LLM prompt injection. Much smaller than raw source while \
+             preserving behavioral and structural information. Use when \
+             assembling context for another LLM, when asked to 'summarize X \
+             compactly', or when building prompts about codebase entities.",
+            tool_schema(
+                json!({
+                    "scope": {
+                        "type": "string",
+                        "description": "Concept name, entity name, or \
+                            file path",
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Token budget (default: 500)",
+                    }
+                }),
+                &["scope"],
+            ),
+        ),
+        Tool::new(
+            "concept_map",
+            "Semantic topology of the codebase — shows which directories \
+             concentrate which domain concepts, with entity counts and \
+             concept density. Use as a first call to understand codebase \
+             layout before drilling into specific concepts or symbols.",
+            tool_schema(json!({}), &[]),
+        ),
+        Tool::new(
+            "type_flows",
+            "Trace how types flow through the codebase along call edges. \
+             Shows which types dominate the data pipeline and how they \
+             propagate between functions. Returns all typed data-flow \
+             edges, dominant types ranked by frequency, and counts of \
+             typed vs untyped call edges.",
+            tool_schema(json!({}), &[]),
+        ),
+        Tool::new(
+            "trace_type",
+            "Find all data-flow edges involving a specific type. Shows \
+             which functions pass and receive this type through call \
+             edges. Use when asked 'where does Tensor flow', 'how is \
+             type X passed around', or 'which functions use type X'.",
+            tool_schema(
+                json!({
+                    "type_name": {
+                        "type": "string",
+                        "description": "The type to trace \
+                            (e.g. 'Tensor', 'np.ndarray')",
+                    }
+                }),
+                &["type_name"],
+            ),
+        ),
     ]
 }
 
@@ -600,11 +954,18 @@ impl ServerHandler for OntomicsServer {
                  - \"what is X\" / \"what does X mean\" → query_concept\n\
                  - \"where is X\" / \"how does X work\" / \"where are X defined\" → locate_concept\n\
                  - \"what does function/class X do\" → describe_symbol\n\
+                 - \"what's in this file\" / \"show me file X\" / \"file overview\" → describe_file\n\
                  - \"what X functions/classes exist\" / \"list all X\" → list_entities\n\
                  - \"what naming conventions\" / \"what style\" → list_conventions\n\
                  - \"is this name right\" → check_naming\n\
                  - \"what should I call this\" → suggest_name\n\
                  - \"how does X flow\" / \"trace X\" / \"call chain for X\" → trace_concept\n\
+                 - \"what is the logic of X\" / \"how does X work internally\" → describe_logic\n\
+                 - \"what behaves like X\" / \"find similar functions\" → find_similar_logic\n\
+                 - \"summarize X compactly\" / \"context for X\" → compact_context\n\
+                 - \"what is the codebase layout\" / \"which modules have X\" → concept_map\n\
+                 - \"how does type X flow\" / \"where does Tensor propagate\" → trace_type\n\
+                 - \"what types dominate\" / \"type data flow\" → type_flows\n\
                  \n\
                  Fall back to file reading ONLY when ontomics returns insufficient detail."
                     .to_string(),
@@ -660,11 +1021,18 @@ impl ServerHandler for OntomicsServer {
             "list_concepts" => self.handle_list_concepts(&args),
             "list_conventions" => self.handle_list_conventions(&args),
             "describe_symbol" => self.handle_describe_symbol(&args),
+            "describe_file" => self.handle_describe_file(&args),
             "locate_concept" => self.handle_locate_concept(&args),
             "list_entities" => self.handle_list_entities(&args),
             "export_domain_pack" => self.handle_export_domain_pack(&args),
             "vocabulary_health" => self.handle_vocabulary_health(&args),
             "trace_concept" => self.handle_trace_concept(&args),
+            "describe_logic" => self.handle_describe_logic(&args),
+            "find_similar_logic" => self.handle_find_similar_logic(&args),
+            "compact_context" => self.handle_compact_context(&args),
+            "concept_map" => self.handle_concept_map(&args),
+            "type_flows" => self.handle_type_flows(&args),
+            "trace_type" => self.handle_trace_type(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -823,6 +1191,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            nesting_trees: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -908,7 +1277,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 19);
     }
 
     #[test]

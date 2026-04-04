@@ -25,6 +25,9 @@ macro_rules! testbed_tests {
             fn describe_symbol() { universal::run_describe_symbol(&$expectations_fn()); }
 
             #[test]
+            fn describe_file() { universal::run_describe_file(&$expectations_fn()); }
+
+            #[test]
             fn locate_concept() { universal::run_locate_concept(&$expectations_fn()); }
 
             #[test]
@@ -61,6 +64,9 @@ macro_rules! testbed_tests {
 
             #[test] #[ignore]
             fn describe_symbol() { universal::run_describe_symbol(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn describe_file() { universal::run_describe_file(&$expectations_fn()); }
 
             #[test] #[ignore]
             fn locate_concept() { universal::run_locate_concept(&$expectations_fn()); }
