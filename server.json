@@ -8,13 +8,13 @@
     "url": "https://github.com/EtienneChollet/ontomics",
     "source": "github"
   },
-  "version": "0.2.8",
+  "version": "0.2.9",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@ontomics/ontomics",
-      "version": "0.2.8",
+      "version": "0.2.9",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

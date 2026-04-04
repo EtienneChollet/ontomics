@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "ontomics"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "candle-core",
