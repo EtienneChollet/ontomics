@@ -193,14 +193,22 @@ fn validate_repo_path(repo: &Path, force: bool) -> anyhow::Result<()> {
 /// Build or load the concept graph from cache.
 /// When `defer_embeddings` is true, skips the slow embedding step and
 /// returns `EmbeddingWork` so it can be done in the background.
+/// A language-parser pair: `(parser, language_name)`.
+type LangParser = (Box<dyn parser::LanguageParser>, String);
+
 fn build_graph(
     repo: &Path,
     config: &config::Config,
     defer_embeddings: bool,
-    lang: &dyn parser::LanguageParser,
-    language_name: &str,
+    lang_parsers: &[LangParser],
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<BuildResult> {
+    assert!(!lang_parsers.is_empty(), "at least one language required");
+
+    let lang_names: Vec<&str> =
+        lang_parsers.iter().map(|(_, n)| n.as_str()).collect();
+    let lang_key = lang_names.join(",");
+
     let cache = match cache::IndexCache::open(repo) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -221,7 +229,7 @@ fn build_graph(
     let loaded_packs = load_domain_packs(repo, config);
 
     let cached_graph = cache.as_ref()
-        .and_then(|c| c.load(language_name).transpose())
+        .and_then(|c| c.load_multi(&lang_names).transpose())
         .transpose()?;
     if let Some(mut cached) = cached_graph {
         let nb_concepts = cached.concepts.len();
@@ -273,23 +281,68 @@ fn build_graph(
         });
     }
 
+    // Determine which languages need re-parsing vs loading from cache
+    let stale = cache
+        .as_ref()
+        .and_then(|c| c.stale_languages(&lang_names).ok())
+        .unwrap_or_else(|| lang_names.iter().map(|s| s.to_string()).collect());
+
     eprintln!("Indexing {}...", repo.display());
-    let parse_opts = parser::ParseOptions {
-        include: config.index.include.clone(),
-        exclude: config.index.exclude.clone(),
-        respect_gitignore: config.index.respect_gitignore,
-    };
-    let parse_results = parser::parse_directory_with(repo, &parse_opts, lang)?;
-    eprintln!("Parsed {} files", parse_results.len());
+
+    // Parse each language, using cached parse results for fresh ones
+    let mut all_parse_results: Vec<types::ParseResult> = Vec::new();
+    let mut per_lang_results: Vec<(String, Vec<types::ParseResult>)> =
+        Vec::new();
+
+    for (parser, lang_name) in lang_parsers {
+        if stale.contains(lang_name) {
+            let lang_enum = match lang_name.as_str() {
+                "python" => config::Language::Python,
+                "typescript" => config::Language::TypeScript,
+                "javascript" => config::Language::JavaScript,
+                "rust" => config::Language::Rust,
+                _ => config::Language::Python,
+            };
+            let parse_opts = parser::ParseOptions {
+                include: lang_enum.default_include(),
+                exclude: lang_enum.default_exclude(),
+                respect_gitignore: config.index.respect_gitignore,
+            };
+            let results =
+                parser::parse_directory_with(repo, &parse_opts, &**parser)?;
+            eprintln!(
+                "Parsed {} {} files",
+                results.len(),
+                lang_name,
+            );
+            all_parse_results.extend(results.clone());
+            per_lang_results.push((lang_name.clone(), results));
+        } else if let Some(ref c) = cache {
+            if let Some(cached_results) =
+                c.load_parse_results(lang_name)?
+            {
+                eprintln!(
+                    "Loaded {} cached {} parse results",
+                    cached_results.len(),
+                    lang_name,
+                );
+                all_parse_results.extend(cached_results.clone());
+                per_lang_results
+                    .push((lang_name.clone(), cached_results));
+            }
+        }
+    }
+
+    eprintln!("Total: {} parsed files", all_parse_results.len());
 
     let analysis_params = analyzer::AnalysisParams {
         min_frequency: config.index.min_frequency,
         tfidf_threshold: config.analysis.domain_specificity_threshold,
         convention_threshold: config.analysis.convention_threshold,
-        language: language_name.to_string(),
+        language: lang_key.clone(),
     };
     let mut analysis =
-        analyzer::analyze(&parse_results, &analysis_params)?;
+        analyzer::analyze(&all_parse_results, &analysis_params)?;
 
     // Merge bootstrap conventions from config (if any)
     for conv_cfg in &config.conventions {
@@ -412,7 +465,14 @@ fn build_graph(
         }
 
         if let Some(ref cache) = cache {
-            if let Err(e) = cache.save(&graph, language_name) {
+            let per_lang_refs: Vec<(&str, &[types::ParseResult])> =
+                per_lang_results
+                    .iter()
+                    .map(|(n, r)| (n.as_str(), r.as_slice()))
+                    .collect();
+            if let Err(e) =
+                cache.save_multi(&graph, &lang_names, &per_lang_refs)
+            {
                 eprintln!("Warning: failed to cache initial index: {e}");
             }
         }
@@ -515,7 +575,14 @@ fn build_graph(
     }
 
     if let Some(ref cache) = cache {
-        if let Err(e) = cache.save(&graph, language_name) {
+        let per_lang_refs: Vec<(&str, &[types::ParseResult])> =
+            per_lang_results
+                .iter()
+                .map(|(n, r)| (n.as_str(), r.as_slice()))
+                .collect();
+        if let Err(e) =
+            cache.save_multi(&graph, &lang_names, &per_lang_refs)
+        {
             eprintln!("Warning: failed to cache index: {e}");
         } else {
             eprintln!("Cached index to .ontomics/index.db");
@@ -705,9 +772,10 @@ fn enrich_graph_with_embeddings_inner(
         eprintln!("Background: graph enriched with embeddings");
     }
 
-    // Final cache save
+    // Final cache save — split comma-joined language key back to slice
     if let Ok(g) = graph_handle.read() {
-        if let Err(e) = cache.save(&g, language_name) {
+        let lang_names: Vec<&str> = language_name.split(',').collect();
+        if let Err(e) = cache.save_multi(&g, &lang_names, &[]) {
             eprintln!("Background: cache save failed: {e}");
         } else {
             eprintln!(
@@ -738,34 +806,74 @@ async fn main() -> anyhow::Result<()> {
 
     let mut startup_warnings: Vec<String> = Vec::new();
 
-    // Resolve language: CLI flag > config file > auto-detection
-    let (language, detected_file_count) = match cli.language.as_str() {
-        "auto" => config.language.resolve(&repo),
-        "python" | "py" => (config::Language::Python, u32::MAX),
-        "typescript" | "ts" => (config::Language::TypeScript, u32::MAX),
-        "javascript" | "js" => (config::Language::JavaScript, u32::MAX),
-        "rust" | "rs" => (config::Language::Rust, u32::MAX),
-        other => anyhow::bail!(
-            "Unknown language: {other}. Use: auto, python, typescript, javascript, rust"
-        ),
-    };
-    if detected_file_count == 0 {
-        startup_warnings.push(format!(
-            "No supported source files found in {}. \
-             ontomics supports Python, TypeScript, JavaScript, and Rust.",
-            repo.display(),
-        ));
-    }
-    config.index.resolve_for_language(&language);
+    // Resolve languages: CLI flag > config file > auto-detection.
+    // Produces a Vec of (Language, file_count) pairs.
+    let detected_languages: Vec<(config::Language, u32)> =
+        match cli.language.as_str() {
+            "auto" => {
+                // If config forces a specific language, honor it
+                if config.language != config::Language::Auto {
+                    let (lang, count) = config.language.resolve(&repo);
+                    vec![(lang, count)]
+                } else {
+                    let all = config::Language::detect_all(
+                        &repo,
+                        config.index.min_files,
+                    );
+                    if all.is_empty() {
+                        // No language meets threshold — fall back to
+                        // dominant language via detect()
+                        let (lang, count) =
+                            config::Language::detect(&repo);
+                        if count == 0 {
+                            startup_warnings.push(format!(
+                                "No supported source files found in {}. \
+                                 ontomics supports Python, TypeScript, \
+                                 JavaScript, and Rust.",
+                                repo.display(),
+                            ));
+                        }
+                        vec![(lang, count)]
+                    } else {
+                        all
+                    }
+                }
+            }
+            "python" | "py" => {
+                vec![(config::Language::Python, u32::MAX)]
+            }
+            "typescript" | "ts" => {
+                vec![(config::Language::TypeScript, u32::MAX)]
+            }
+            "javascript" | "js" => {
+                vec![(config::Language::JavaScript, u32::MAX)]
+            }
+            "rust" | "rs" => {
+                vec![(config::Language::Rust, u32::MAX)]
+            }
+            other => anyhow::bail!(
+                "Unknown language: {other}. \
+                 Use: auto, python, typescript, javascript, rust"
+            ),
+        };
 
-    let active_parser: Box<dyn parser::LanguageParser> = match &language {
-        config::Language::Python => Box::new(parser::python_parser()),
-        config::Language::TypeScript => Box::new(parser::typescript_parser()),
-        config::Language::JavaScript => Box::new(parser::javascript_parser()),
-        config::Language::Rust => Box::new(parser::rust_parser()),
-        config::Language::Auto => unreachable!("Language::Auto must be resolved before parser instantiation"),
-    };
-    eprintln!("Language: {language:?}");
+    let languages: Vec<config::Language> =
+        detected_languages.iter().map(|(l, _)| l.clone()).collect();
+    config.index.resolve_for_languages(&languages);
+
+    // Build parser-name pairs for build_graph
+    let lang_parsers: Vec<LangParser> = languages
+        .iter()
+        .map(|l| (l.make_parser(), l.name().to_string()))
+        .collect();
+
+    if languages.len() == 1 {
+        eprintln!("Language: {}", languages[0].display_name());
+    } else {
+        let names: Vec<&str> =
+            languages.iter().map(|l| l.display_name()).collect();
+        eprintln!("Languages: {}", names.join(", "));
+    }
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.resources.max_threads)
@@ -777,16 +885,13 @@ async fn main() -> anyhow::Result<()> {
         config.resources.embedding_batch_size,
     );
 
-    let lang_name = language.name().to_string();
-
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             // Defer graph building to background — start MCP immediately
             run_server(
                 &repo,
                 &config,
-                active_parser,
-                lang_name,
+                lang_parsers,
                 startup_warnings,
             )
             .await
@@ -794,9 +899,11 @@ async fn main() -> anyhow::Result<()> {
         cmd => {
             // CLI subcommands build the graph synchronously
             let result = build_graph(
-                &repo, &config, false, &*active_parser, &lang_name,
+                &repo, &config, false, &lang_parsers,
                 &mut startup_warnings,
             )?;
+            // Use first (dominant) parser for diff
+            let primary_parser = &lang_parsers[0].0;
             match cmd {
                 Command::Serve | Command::Update => unreachable!(),
                 Command::Query { term } => cmd_query(&result.graph, &term),
@@ -807,7 +914,7 @@ async fn main() -> anyhow::Result<()> {
                     cmd_suggest(&result.graph, &description)
                 }
                 Command::Diff { since } => {
-                    cmd_diff(&repo, &result.graph, &since, &*active_parser)
+                    cmd_diff(&repo, &result.graph, &since, &**primary_parser)
                 }
                 Command::Concepts { top_k } => {
                     cmd_concepts(&result.graph, top_k)
@@ -1072,13 +1179,20 @@ fn print_json(value: &impl serde::Serialize) {
 async fn run_server(
     repo: &Path,
     config: &config::Config,
-    active_parser: Box<dyn parser::LanguageParser>,
-    language_name: String,
+    lang_parsers: Vec<LangParser>,
     startup_warnings: Vec<String>,
 ) -> anyhow::Result<()> {
     spawn_parent_watchdog();
 
-    let active_parser: Arc<dyn parser::LanguageParser> = Arc::from(active_parser);
+    // Convert parsers to Arc for sharing across threads
+    let arc_parsers: Vec<(Arc<dyn parser::LanguageParser>, String)> =
+        lang_parsers
+            .into_iter()
+            .map(|(p, n)| (Arc::from(p), n))
+            .collect();
+
+    // Use primary (dominant) parser for OntomicsServer (diff)
+    let primary_parser = Arc::clone(&arc_parsers[0].0);
 
     // Shared state — graph starts empty, populated by background thread
     let graph_handle = Arc::new(std::sync::RwLock::new(
@@ -1093,19 +1207,39 @@ async fn run_server(
     let server = tools::OntomicsServer::new_deferred(
         Arc::clone(&graph_handle),
         repo.to_path_buf(),
-        Arc::clone(&active_parser),
+        Arc::clone(&primary_parser),
         Arc::clone(&warnings),
         Arc::clone(&indexing_ready),
     );
 
     let repo_root = repo.to_path_buf();
 
+    // Build LangParser vec for background thread
+    let bg_parsers: Vec<LangParser> = arc_parsers
+        .iter()
+        .map(|(_p, n)| {
+            let lang = match n.as_str() {
+                "python" => config::Language::Python,
+                "typescript" => config::Language::TypeScript,
+                "javascript" => config::Language::JavaScript,
+                "rust" => config::Language::Rust,
+                _ => config::Language::Python,
+            };
+            (lang.make_parser(), n.clone())
+        })
+        .collect();
+
+    let lang_key: String = arc_parsers
+        .iter()
+        .map(|(_, n)| n.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+
     // Spawn background graph building
     {
         let bg_repo = repo_root.clone();
         let bg_config = config.clone();
-        let bg_parser = Arc::clone(&active_parser);
-        let bg_lang_name = language_name.clone();
+        let bg_lang_key = lang_key.clone();
         let bg_graph_handle = Arc::clone(&graph_handle);
         let bg_generation = Arc::clone(&generation);
         let bg_warnings = Arc::clone(&warnings);
@@ -1113,7 +1247,7 @@ async fn run_server(
         std::thread::spawn(move || {
             let mut bg_startup_warnings = Vec::new();
             match build_graph(
-                &bg_repo, &bg_config, true, &*bg_parser, &bg_lang_name,
+                &bg_repo, &bg_config, true, &bg_parsers,
                 &mut bg_startup_warnings,
             ) {
                 Ok(result) => {
@@ -1136,7 +1270,7 @@ async fn run_server(
                             bg_graph_handle,
                             bg_generation,
                             bg_repo,
-                            bg_lang_name,
+                            bg_lang_key,
                         );
                     }
                 }
@@ -1154,14 +1288,34 @@ async fn run_server(
         });
     }
 
-    // File watcher
+    // File watcher — collect extensions from ALL active parsers
     let watcher_config = config.clone();
-    let watcher_language_name = language_name;
-    let watcher_extensions: Vec<String> = active_parser
-        .extensions()
-        .iter()
-        .map(|e| e.to_string())
-        .collect();
+    let watcher_lang_key = lang_key;
+    let mut watcher_extensions: Vec<String> = Vec::new();
+    for (p, _) in &arc_parsers {
+        for ext in p.extensions() {
+            let s = ext.to_string();
+            if !watcher_extensions.contains(&s) {
+                watcher_extensions.push(s);
+            }
+        }
+    }
+    // Re-create parsers for the watcher thread
+    let watcher_parsers: Vec<(Box<dyn parser::LanguageParser>, String)> =
+        arc_parsers
+            .iter()
+            .map(|(_, n)| {
+                let lang = match n.as_str() {
+                    "python" => config::Language::Python,
+                    "typescript" => config::Language::TypeScript,
+                    "javascript" => config::Language::JavaScript,
+                    "rust" => config::Language::Rust,
+                    _ => config::Language::Python,
+                };
+                (lang.make_parser(), n.clone())
+            })
+            .collect();
+
     let watcher_indexing_ready = Arc::clone(&indexing_ready);
     tokio::task::spawn_blocking(move || {
         let watcher_cache = match cache::IndexCache::open(&repo_root) {
@@ -1212,27 +1366,40 @@ async fn run_server(
                         all_changed.len()
                     );
 
-                    let watcher_parse_opts = parser::ParseOptions {
-                        include: watcher_config.index.include.clone(),
-                        exclude: watcher_config.index.exclude.clone(),
-                        respect_gitignore: watcher_config
-                            .index
-                            .respect_gitignore,
-                    };
-                    let parse_results =
+                    // Re-parse all languages
+                    let mut parse_results = Vec::new();
+                    let mut parse_failed = false;
+                    for (wp, wn) in &watcher_parsers {
+                        let lang_enum = match wn.as_str() {
+                            "python" => config::Language::Python,
+                            "typescript" => config::Language::TypeScript,
+                            "javascript" => config::Language::JavaScript,
+                            "rust" => config::Language::Rust,
+                            _ => config::Language::Python,
+                        };
+                        let opts = parser::ParseOptions {
+                            include: lang_enum.default_include(),
+                            exclude: lang_enum.default_exclude(),
+                            respect_gitignore: watcher_config
+                                .index
+                                .respect_gitignore,
+                        };
                         match parser::parse_directory_with(
-                            &repo_root,
-                            &watcher_parse_opts,
-                            &*active_parser,
+                            &repo_root, &opts, &**wp,
                         ) {
-                            Ok(r) => r,
+                            Ok(r) => parse_results.extend(r),
                             Err(e) => {
                                 eprintln!(
                                     "Warning: re-parse failed: {e}"
                                 );
-                                continue;
+                                parse_failed = true;
+                                break;
                             }
-                        };
+                        }
+                    }
+                    if parse_failed {
+                        continue;
+                    }
 
                     let analysis_params = analyzer::AnalysisParams {
                         min_frequency: watcher_config
@@ -1244,7 +1411,7 @@ async fn run_server(
                         convention_threshold: watcher_config
                             .analysis
                             .convention_threshold,
-                        language: watcher_language_name.clone(),
+                        language: watcher_lang_key.clone(),
                     };
                     let mut analysis = match analyzer::analyze(
                         &parse_results,
@@ -1355,7 +1522,7 @@ async fn run_server(
                         let bg_handle = Arc::clone(&graph_handle);
                         let bg_gen = Arc::clone(&generation);
                         let bg_repo = repo_root.clone();
-                        let bg_lang_name = watcher_language_name.clone();
+                        let bg_lang_name = watcher_lang_key.clone();
                         std::thread::spawn(move || {
                             enrich_graph_with_embeddings(
                                 work, bg_handle, bg_gen, bg_repo, bg_lang_name,

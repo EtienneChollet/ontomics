@@ -1,7 +1,8 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
 use crate::types::{
-    CallSite, ClassInfo, Concept, Convention, Entity, Relationship, Signature,
+    CallSite, ClassInfo, Concept, Convention, Entity, ParseResult,
+    Relationship, Signature,
 };
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -194,21 +195,45 @@ impl IndexCache {
     }
 
     /// Save full graph to cache, tagged with the active language.
+    /// For single-language mode — delegates to `save_multi`.
     pub fn save(&self, graph: &ConceptGraph, language: &str) -> Result<()> {
+        self.save_multi(graph, &[language], &[])
+    }
+
+    /// Save graph with per-language parse results and file manifests.
+    ///
+    /// `languages` is the sorted list of active language names.
+    /// `per_lang_results` contains `(lang_name, parse_results)` pairs
+    /// for each language — stored so stale languages can be selectively
+    /// re-parsed without touching fresh partitions.
+    pub fn save_multi(
+        &self,
+        graph: &ConceptGraph,
+        languages: &[&str],
+        per_lang_results: &[(&str, &[ParseResult])],
+    ) -> Result<()> {
         self.acquire_lock()
             .context("failed to acquire cache lock")?;
 
-        let result = self.save_inner(graph, language);
+        let result =
+            self.save_multi_inner(graph, languages, per_lang_results);
         self.release_lock();
         result
     }
 
-    fn save_inner(&self, graph: &ConceptGraph, language: &str) -> Result<()> {
+    fn save_multi_inner(
+        &self,
+        graph: &ConceptGraph,
+        languages: &[&str],
+        per_lang_results: &[(&str, &[ParseResult])],
+    ) -> Result<()> {
         let cached = CachedGraph {
             concepts: graph.concepts.clone(),
             relationships: graph.relationships.clone(),
             conventions: graph.conventions.clone(),
-            embeddings: serde_json::from_value(serde_json::to_value(&graph.embeddings)?)?,
+            embeddings: serde_json::from_value(
+                serde_json::to_value(&graph.embeddings)?,
+            )?,
             signatures: graph.signatures.clone(),
             classes: graph.classes.clone(),
             call_sites: graph.call_sites.clone(),
@@ -230,21 +255,63 @@ impl IndexCache {
                 CACHE_VERSION.as_bytes()
             ],
         )?;
+
+        // Store sorted, comma-joined language key
+        let lang_key = languages.join(",");
         conn.execute(
             "INSERT OR REPLACE INTO cache (key, value, updated_at)
              VALUES (?1, ?2, datetime('now'))",
-            rusqlite::params!["language", language.as_bytes()],
+            rusqlite::params!["languages", lang_key.as_bytes()],
         )?;
 
-        // Store file manifest for staleness detection
-        let files = Self::referenced_files(graph);
-        let manifest = Self::build_manifest(self.repo_root(), &files);
-        let manifest_json = serde_json::to_vec(&manifest)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO cache (key, value, updated_at)
-             VALUES (?1, ?2, datetime('now'))",
-            rusqlite::params!["file_manifest", &manifest_json],
-        )?;
+        // Per-language parse results and file manifests
+        let repo_root = self.repo_root().to_path_buf();
+        for &(lang, results) in per_lang_results {
+            let pr_json = serde_json::to_vec(results)?;
+            let pr_key = format!("parse:{lang}");
+            conn.execute(
+                "INSERT OR REPLACE INTO cache (key, value, updated_at)
+                 VALUES (?1, ?2, datetime('now'))",
+                rusqlite::params![pr_key, &pr_json],
+            )?;
+
+            let mut files = HashSet::new();
+            for pr in results {
+                for ident in &pr.identifiers {
+                    files.insert(ident.file.clone());
+                }
+                for sig in &pr.signatures {
+                    files.insert(sig.file.clone());
+                }
+                for cls in &pr.classes {
+                    files.insert(cls.file.clone());
+                }
+                for cs in &pr.call_sites {
+                    files.insert(cs.file.clone());
+                }
+            }
+            let manifest = Self::build_manifest(&repo_root, &files);
+            let manifest_json = serde_json::to_vec(&manifest)?;
+            let mf_key = format!("manifest:{lang}");
+            conn.execute(
+                "INSERT OR REPLACE INTO cache (key, value, updated_at)
+                 VALUES (?1, ?2, datetime('now'))",
+                rusqlite::params![mf_key, &manifest_json],
+            )?;
+        }
+
+        // Fallback: store combined file manifest for single-language
+        // callers (save() with no per_lang_results)
+        if per_lang_results.is_empty() {
+            let files = Self::referenced_files(graph);
+            let manifest = Self::build_manifest(&repo_root, &files);
+            let manifest_json = serde_json::to_vec(&manifest)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO cache (key, value, updated_at)
+                 VALUES (?1, ?2, datetime('now'))",
+                rusqlite::params!["file_manifest", &manifest_json],
+            )?;
+        }
 
         Ok(())
     }
@@ -283,15 +350,24 @@ impl IndexCache {
         Ok((watcher, rx))
     }
 
-    /// Load cached graph. Returns None if cache is missing, corrupt, stale,
-    /// or was built for a different language.
+    /// Load cached graph (single-language). Returns None if cache is
+    /// missing, corrupt, stale, or was built for a different language.
     pub fn load(&self, language: &str) -> Result<Option<ConceptGraph>> {
+        self.load_multi(&[language])
+    }
+
+    /// Load cached graph for a set of languages. Returns `Ok(None)` if
+    /// the cache is stale, missing, or the language set doesn't match.
+    pub fn load_multi(
+        &self,
+        languages: &[&str],
+    ) -> Result<Option<ConceptGraph>> {
         if !self.db_path.exists() {
             return Ok(None);
         }
         let conn = Connection::open(&self.db_path)?;
 
-        // Check cache version — stale cache triggers re-index
+        // Check cache version
         let stored_version: Option<String> = conn
             .query_row(
                 "SELECT value FROM cache WHERE key = ?1",
@@ -305,68 +381,32 @@ impl IndexCache {
             return Ok(None);
         }
 
-        let stored_language: Option<String> = conn
+        // Check language set match
+        let lang_key = languages.join(",");
+        let stored_langs: Option<String> = conn
             .query_row(
                 "SELECT value FROM cache WHERE key = ?1",
-                rusqlite::params!["language"],
+                rusqlite::params!["languages"],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .ok()
             .and_then(|b| String::from_utf8(b).ok());
-        if stored_language.as_deref() != Some(language) {
+        if stored_langs.as_deref() != Some(&lang_key) {
             eprintln!(
-                "Cache language mismatch (cached {:?}, active {:?}) — re-indexing",
-                stored_language.as_deref().unwrap_or("unknown"),
-                language,
+                "Cache language mismatch (cached {:?}, active {:?}) \
+                 — re-indexing",
+                stored_langs.as_deref().unwrap_or("unknown"),
+                lang_key,
             );
             return Ok(None);
         }
 
-        // Check file manifest — deleted or modified files trigger re-index
-        let manifest_blob: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT value FROM cache WHERE key = ?1",
-                rusqlite::params!["file_manifest"],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(blob) = manifest_blob {
-            if let Ok(manifest) =
-                serde_json::from_slice::<HashMap<PathBuf, u64>>(&blob)
-            {
-                let repo_root = self.repo_root();
-                for (file, cached_mtime) in &manifest {
-                    let abs = if file.is_relative() {
-                        repo_root.join(file)
-                    } else {
-                        file.clone()
-                    };
-                    let current_mtime = fs::metadata(&abs)
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs());
-                    match current_mtime {
-                        None => {
-                            eprintln!(
-                                "Cached file deleted: {} — re-indexing",
-                                file.display(),
-                            );
-                            return Ok(None);
-                        }
-                        Some(mtime) if mtime != *cached_mtime => {
-                            eprintln!(
-                                "Cached file modified: {} — re-indexing",
-                                file.display(),
-                            );
-                            return Ok(None);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        // Check per-language file manifests
+        if !self.check_manifests(&conn, languages)? {
+            return Ok(None);
         }
 
+        // Load graph blob
         let result: rusqlite::Result<Vec<u8>> = conn.query_row(
             "SELECT value FROM cache WHERE key = ?1",
             rusqlite::params!["graph"],
@@ -381,7 +421,7 @@ impl IndexCache {
 
         let cached: CachedGraph = match serde_json::from_slice(&blob) {
             Ok(c) => c,
-            Err(_) => return Ok(None), // corrupt cache — caller rebuilds
+            Err(_) => return Ok(None),
         };
 
         Ok(Some(ConceptGraph {
@@ -395,6 +435,184 @@ impl IndexCache {
             entities: cached.entities,
             cluster_centroids: HashMap::new(),
         }))
+    }
+
+    /// Check which languages have stale file manifests. Returns the list
+    /// of language names that need re-parsing.
+    pub fn stale_languages(
+        &self,
+        languages: &[&str],
+    ) -> Result<Vec<String>> {
+        if !self.db_path.exists() {
+            return Ok(languages.iter().map(|s| s.to_string()).collect());
+        }
+        let conn = Connection::open(&self.db_path)?;
+
+        // Version mismatch → all stale
+        let stored_version: Option<String> = conn
+            .query_row(
+                "SELECT value FROM cache WHERE key = ?1",
+                rusqlite::params!["cache_version"],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        if stored_version.as_deref() != Some(CACHE_VERSION) {
+            return Ok(languages.iter().map(|s| s.to_string()).collect());
+        }
+
+        let mut stale = Vec::new();
+        let repo_root = self.repo_root().to_path_buf();
+        for &lang in languages {
+            let mf_key = format!("manifest:{lang}");
+            let manifest_blob: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM cache WHERE key = ?1",
+                    rusqlite::params![mf_key],
+                    |row| row.get(0),
+                )
+                .ok();
+            match manifest_blob {
+                None => {
+                    stale.push(lang.to_string());
+                }
+                Some(blob) => {
+                    if let Ok(manifest) = serde_json::from_slice::<
+                        HashMap<PathBuf, u64>,
+                    >(&blob)
+                    {
+                        if !Self::is_manifest_fresh(&repo_root, &manifest) {
+                            stale.push(lang.to_string());
+                        }
+                    } else {
+                        stale.push(lang.to_string());
+                    }
+                }
+            }
+        }
+        Ok(stale)
+    }
+
+    /// Load cached parse results for a single language. Returns None if
+    /// not present or corrupt.
+    pub fn load_parse_results(
+        &self,
+        language: &str,
+    ) -> Result<Option<Vec<ParseResult>>> {
+        if !self.db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(&self.db_path)?;
+        let pr_key = format!("parse:{language}");
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM cache WHERE key = ?1",
+                rusqlite::params![pr_key],
+                |row| row.get(0),
+            )
+            .ok();
+        match blob {
+            None => Ok(None),
+            Some(b) => match serde_json::from_slice(&b) {
+                Ok(results) => Ok(Some(results)),
+                Err(_) => Ok(None),
+            },
+        }
+    }
+
+    /// Check per-language manifests. If per-language manifests exist, use
+    /// them. Otherwise fall back to the combined `file_manifest` key
+    /// (backward compatibility with single-language caches).
+    fn check_manifests(
+        &self,
+        conn: &Connection,
+        languages: &[&str],
+    ) -> Result<bool> {
+        let repo_root = self.repo_root().to_path_buf();
+
+        // Try per-language manifests first
+        let mut found_any = false;
+        for &lang in languages {
+            let mf_key = format!("manifest:{lang}");
+            let manifest_blob: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM cache WHERE key = ?1",
+                    rusqlite::params![mf_key],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(blob) = manifest_blob {
+                found_any = true;
+                if let Ok(manifest) = serde_json::from_slice::<
+                    HashMap<PathBuf, u64>,
+                >(&blob)
+                {
+                    if !Self::is_manifest_fresh(&repo_root, &manifest) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        // Fall back to combined manifest (single-language cache compat)
+        if !found_any {
+            let manifest_blob: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM cache WHERE key = ?1",
+                    rusqlite::params!["file_manifest"],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(blob) = manifest_blob {
+                if let Ok(manifest) = serde_json::from_slice::<
+                    HashMap<PathBuf, u64>,
+                >(&blob)
+                {
+                    if !Self::is_manifest_fresh(&repo_root, &manifest) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Check whether all files in a manifest still exist with same mtime.
+    fn is_manifest_fresh(
+        repo_root: &Path,
+        manifest: &HashMap<PathBuf, u64>,
+    ) -> bool {
+        for (file, cached_mtime) in manifest {
+            let abs = if file.is_relative() {
+                repo_root.join(file)
+            } else {
+                file.clone()
+            };
+            let current_mtime = fs::metadata(&abs)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            match current_mtime {
+                None => {
+                    eprintln!(
+                        "Cached file deleted: {} — re-indexing",
+                        file.display(),
+                    );
+                    return false;
+                }
+                Some(mtime) if mtime != *cached_mtime => {
+                    eprintln!(
+                        "Cached file modified: {} — re-indexing",
+                        file.display(),
+                    );
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
     }
 }
 

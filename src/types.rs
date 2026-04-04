@@ -88,7 +88,7 @@ pub enum PatternKind {
 
 // --- Parser output types ---
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawIdentifier {
     pub name: String,
     pub entity_type: EntityType,
@@ -98,7 +98,7 @@ pub struct RawIdentifier {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseResult {
     pub identifiers: Vec<RawIdentifier>,
     #[allow(dead_code)]
