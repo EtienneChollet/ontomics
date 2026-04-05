@@ -1,6 +1,6 @@
 // L4: Logic embedding index and behavioral clustering.
 
-use crate::embeddings::BgeModel;
+use crate::embeddings::{self, EmbeddingModel};
 use crate::types::{LogicCluster, Pseudocode, PseudocodeStep};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -9,20 +9,27 @@ use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct LogicIndex {
-    model: Option<BgeModel>,
+    model: Option<Box<dyn EmbeddingModel>>,
     vectors: HashMap<u64, Vec<f32>>,
     cache_dir: Option<PathBuf>,
+    model_id: String,
 }
 
 impl LogicIndex {
-    /// Initialize logic index with the BGE-small model.
-    pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        let model = BgeModel::load(cache_dir.as_ref())?;
+    /// Initialize logic index with a specific model.
+    pub fn new_with_model(model_id: &str, cache_dir: Option<PathBuf>) -> Result<Self> {
+        let model = embeddings::load_model(model_id, cache_dir.as_ref())?;
         Ok(Self {
             model: Some(model),
             vectors: HashMap::new(),
             cache_dir,
+            model_id: model_id.to_string(),
         })
+    }
+
+    /// Initialize logic index with the default BGE-small model.
+    pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
+        Self::new_with_model(embeddings::BGE_SMALL_ID, cache_dir)
     }
 
     /// Create an empty logic index (no model, empty vectors).
@@ -122,7 +129,12 @@ impl LogicIndex {
         if self.model.is_some() {
             return Ok(());
         }
-        let model = BgeModel::load(self.cache_dir.as_ref())?;
+        let id = if self.model_id.is_empty() {
+            embeddings::BGE_SMALL_ID
+        } else {
+            &self.model_id
+        };
+        let model = embeddings::load_model(id, self.cache_dir.as_ref())?;
         self.model = Some(model);
         Ok(())
     }
@@ -158,6 +170,7 @@ impl<'de> Deserialize<'de> for LogicIndex {
             model: None,
             vectors,
             cache_dir: None,
+            model_id: String::new(),
         })
     }
 }

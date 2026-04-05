@@ -1,129 +1,425 @@
 use crate::types::Concept;
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use candle_transformers::models::jina_bert::{
+    BertModel as JinaBertModel, Config as JinaConfig,
+};
+use candle_transformers::models::modernbert::{Config as ModernConfig, ModernBert};
+use candle_transformers::models::nomic_bert::{
+    Config as NomicConfig, NomicBertModel,
+};
 use hf_hub::api::sync::ApiBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-const MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
+// ---------------------------------------------------------------------------
+// Trait: pluggable embedding backend
+// ---------------------------------------------------------------------------
 
-pub(crate) struct BgeModel {
-    model: BertModel,
-    tokenizer: Tokenizer,
+pub trait EmbeddingModel: Send + Sync {
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>>;
+    fn dim(&self) -> usize;
+    fn model_id(&self) -> &str;
 }
 
-impl BgeModel {
-    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
-        #[cfg(feature = "cuda")]
-        let device = Device::cuda_if_available(0)?;
-        #[cfg(feature = "metal")]
-        let device = Device::new_metal(0)?;
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
-        let device = Device::Cpu;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-        let mut builder = ApiBuilder::from_env();
-        if let Some(dir) = cache_dir {
-            builder = builder.with_cache_dir(dir.clone());
-        }
-        let api = builder.with_progress(true).build()?;
-        let repo = api.model(MODEL_ID.to_string());
+fn detect_device() -> Result<Device> {
+    #[cfg(feature = "cuda")]
+    {
+        return Device::cuda_if_available(0).map_err(Into::into);
+    }
+    #[cfg(feature = "metal")]
+    {
+        return Device::new_metal(0).map_err(Into::into);
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        Ok(Device::Cpu)
+    }
+}
 
-        let config_path = repo.get("config.json")?;
-        let tokenizer_path = repo.get("tokenizer.json")?;
-        let weights_path = repo.get("model.safetensors")?;
+fn fetch_model_files(
+    model_id: &str,
+    cache_dir: Option<&PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let mut builder = ApiBuilder::from_env();
+    if let Some(dir) = cache_dir {
+        builder = builder.with_cache_dir(dir.clone());
+    }
+    let api = builder.with_progress(true).build()?;
+    let repo = api.model(model_id.to_string());
+    let config_path = repo.get("config.json")?;
+    let tokenizer_path = repo.get("tokenizer.json")?;
+    let weights_path = repo.get("model.safetensors")?;
+    Ok((config_path, tokenizer_path, weights_path))
+}
 
-        let config: BertConfig =
-            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
-
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+fn load_tokenizer(path: &PathBuf, max_length: usize, use_padding: bool) -> Result<Tokenizer> {
+    let mut tokenizer = Tokenizer::from_file(path)
+        .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+    if use_padding {
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: 512,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow!("failed to set truncation: {e}"))?;
+    }
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow!("failed to set truncation: {e}"))?;
+    Ok(tokenizer)
+}
 
+fn encode_batch(
+    tokenizer: &Tokenizer,
+    texts: &[String],
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor, usize, usize)> {
+    let encodings = tokenizer
+        .encode_batch(texts.to_vec(), true)
+        .map_err(|e| anyhow!("tokenization failed: {e}"))?;
+    let batch_size = encodings.len();
+    let seq_len = encodings[0].get_ids().len();
+    let token_ids: Vec<u32> = encodings
+        .iter()
+        .flat_map(|e| e.get_ids().iter().copied())
+        .collect();
+    let type_ids: Vec<u32> = encodings
+        .iter()
+        .flat_map(|e| e.get_type_ids().iter().copied())
+        .collect();
+    let mask: Vec<u32> = encodings
+        .iter()
+        .flat_map(|e| e.get_attention_mask().iter().copied())
+        .collect();
+    let token_ids = Tensor::from_vec(token_ids, (batch_size, seq_len), device)?;
+    let type_ids = Tensor::from_vec(type_ids, (batch_size, seq_len), device)?;
+    let mask = Tensor::from_vec(mask, (batch_size, seq_len), device)?;
+    Ok((token_ids, type_ids, mask, batch_size, seq_len))
+}
+
+fn cls_pool_and_normalize(hidden: &Tensor, batch_size: usize) -> Result<Vec<Vec<f32>>> {
+    let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?;
+    let norms = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
+    let normalized = cls.broadcast_div(&norms)?;
+    let mut results = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        results.push(normalized.get(i)?.to_vec1::<f32>()?);
+    }
+    Ok(results)
+}
+
+fn mean_pool_and_normalize(
+    hidden: &Tensor,
+    mask: &Tensor,
+    batch_size: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let hidden_dim = hidden.dim(2)?;
+    let seq_len = hidden.dim(1)?;
+    let mask_f = mask.to_dtype(DType::F32)?;
+    let mask_expanded = mask_f
+        .unsqueeze(2)?
+        .broadcast_as((batch_size, seq_len, hidden_dim))?;
+    let sum_hidden = (hidden * &mask_expanded)?.sum(1)?;
+    let sum_mask = mask_f
+        .sum(1)?
+        .unsqueeze(1)?
+        .broadcast_as((batch_size, hidden_dim))?
+        .clamp(1e-9, f64::MAX)?;
+    let pooled = (&sum_hidden / &sum_mask)?;
+    let norms = pooled.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+    let normalized = pooled.broadcast_div(&norms)?;
+    let mut results = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        results.push(normalized.get(i)?.to_vec1::<f32>()?);
+    }
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// 1. BGE-small-en-v1.5 (current default)
+// ---------------------------------------------------------------------------
+
+pub const BGE_SMALL_ID: &str = "BAAI/bge-small-en-v1.5";
+
+pub(crate) struct BgeSmallModel {
+    model: BertModel,
+    tokenizer: Tokenizer,
+}
+
+impl BgeSmallModel {
+    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+        let device = detect_device()?;
+        let (config_path, tokenizer_path, weights_path) =
+            fetch_model_files(BGE_SMALL_ID, cache_dir)?;
+        let config: BertConfig =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        let tokenizer = load_tokenizer(&tokenizer_path, 512, true)?;
         let weights = std::fs::read(&weights_path)?;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
         let model = BertModel::load(vb, &config)?;
-
-        Ok(BgeModel { model, tokenizer })
+        Ok(Self { model, tokenizer })
     }
+}
 
-    pub(crate) fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+impl EmbeddingModel for BgeSmallModel {
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-
         let device = &self.model.device;
-        let encodings = self
-            .tokenizer
-            .encode_batch(texts, true)
-            .map_err(|e| anyhow!("tokenization failed: {e}"))?;
-
-        let batch_size = encodings.len();
-        let seq_len = encodings[0].get_ids().len();
-
-        let token_ids: Vec<u32> = encodings
-            .iter()
-            .flat_map(|e| e.get_ids().iter().copied())
-            .collect();
-        let type_ids: Vec<u32> = encodings
-            .iter()
-            .flat_map(|e| e.get_type_ids().iter().copied())
-            .collect();
-        let mask: Vec<u32> = encodings
-            .iter()
-            .flat_map(|e| e.get_attention_mask().iter().copied())
-            .collect();
-
-        let token_ids = Tensor::from_vec(token_ids, (batch_size, seq_len), device)?;
-        let type_ids = Tensor::from_vec(type_ids, (batch_size, seq_len), device)?;
-        let mask = Tensor::from_vec(mask, (batch_size, seq_len), device)?;
-
-        // Forward pass -> [batch, seq_len, hidden_size]
+        let (token_ids, type_ids, mask, batch_size, _) =
+            encode_batch(&self.tokenizer, &texts, device)?;
         let output = self.model.forward(&token_ids, &type_ids, Some(&mask))?;
+        cls_pool_and_normalize(&output, batch_size)
+    }
 
-        // CLS pooling: first token -> [batch, hidden_size]
-        let cls = output.narrow(1, 0, 1)?.squeeze(1)?;
+    fn dim(&self) -> usize {
+        384
+    }
 
-        // L2 normalize
-        let norms = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
-        let normalized = cls.broadcast_div(&norms)?;
-
-        let mut results = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            results.push(normalized.get(i)?.to_vec1::<f32>()?);
-        }
-        Ok(results)
+    fn model_id(&self) -> &str {
+        BGE_SMALL_ID
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2. Jina Code v2 (code-trained, 30 languages incl. Python/TS/JS/Rust)
+// ---------------------------------------------------------------------------
+
+const JINA_CODE_ID: &str = "jinaai/jina-embeddings-v2-base-code";
+
+pub(crate) struct JinaCodeModel {
+    model: JinaBertModel,
+    tokenizer: Tokenizer,
+    device: Device,
+}
+
+impl JinaCodeModel {
+    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+        let device = detect_device()?;
+        let (config_path, tokenizer_path, weights_path) =
+            fetch_model_files(JINA_CODE_ID, cache_dir)?;
+        let config: JinaConfig =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        // No padding — jina_bert Module::forward takes no attention mask,
+        // so we embed one text at a time to avoid padding corruption.
+        let tokenizer = load_tokenizer(&tokenizer_path, 8192, false)?;
+        let weights = std::fs::read(&weights_path)?;
+        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
+        let model = JinaBertModel::new(vb, &config)?;
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
+    }
+}
+
+impl EmbeddingModel for JinaCodeModel {
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        // Embed one at a time — jina_bert Module::forward has no mask param,
+        // so batched inference with padding would attend to pad tokens.
+        let mut results = Vec::with_capacity(texts.len());
+        for text in &texts {
+            let encoding = self
+                .tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|e| anyhow!("tokenization failed: {e}"))?;
+            let ids = encoding.get_ids();
+            let seq_len = ids.len();
+            let token_ids =
+                Tensor::from_vec(ids.to_vec(), (1, seq_len), &self.device)?;
+            // Forward pass -> [1, seq_len, 768]
+            let output = self.model.forward(&token_ids)?;
+            // Mean pool over all tokens (no mask needed — no padding)
+            let pooled = output.mean(1)?;
+            // L2 normalize
+            let norms = pooled.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+            let normalized = pooled.broadcast_div(&norms)?;
+            results.push(normalized.squeeze(0)?.to_vec1::<f32>()?);
+        }
+        Ok(results)
+    }
+
+    fn dim(&self) -> usize {
+        768
+    }
+
+    fn model_id(&self) -> &str {
+        JINA_CODE_ID
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. CodeRankEmbed (contrastive code retrieval, CoRNStack)
+// ---------------------------------------------------------------------------
+
+const CODE_RANK_ID: &str = "nomic-ai/CodeRankEmbed";
+
+pub(crate) struct CodeRankModel {
+    model: NomicBertModel,
+    tokenizer: Tokenizer,
+    device: Device,
+}
+
+impl CodeRankModel {
+    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+        let device = detect_device()?;
+        let (config_path, tokenizer_path, weights_path) =
+            fetch_model_files(CODE_RANK_ID, cache_dir)?;
+        let config: NomicConfig =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        let tokenizer = load_tokenizer(&tokenizer_path, 8192, true)?;
+        let weights = std::fs::read(&weights_path)?;
+        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
+        let model = NomicBertModel::load(vb, &config)?;
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
+    }
+}
+
+impl EmbeddingModel for CodeRankModel {
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let (token_ids, type_ids, mask, batch_size, _) =
+            encode_batch(&self.tokenizer, &texts, &self.device)?;
+        let output = self.model.forward(&token_ids, Some(&type_ids), Some(&mask))?;
+        mean_pool_and_normalize(&output, &mask, batch_size)
+    }
+
+    fn dim(&self) -> usize {
+        768
+    }
+
+    fn model_id(&self) -> &str {
+        CODE_RANK_ID
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. GTE-ModernBERT-Base (code-aware, CoIR 79.3)
+// ---------------------------------------------------------------------------
+
+const GTE_MODERN_ID: &str = "Alibaba-NLP/gte-modernbert-base";
+
+pub(crate) struct GteModernBertModel {
+    model: ModernBert,
+    tokenizer: Tokenizer,
+    device: Device,
+}
+
+impl GteModernBertModel {
+    pub(crate) fn load(cache_dir: Option<&PathBuf>) -> Result<Self> {
+        let device = detect_device()?;
+        let (config_path, tokenizer_path, weights_path) =
+            fetch_model_files(GTE_MODERN_ID, cache_dir)?;
+        let config: ModernConfig =
+            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        let tokenizer = load_tokenizer(&tokenizer_path, 8192, true)?;
+        let weights = std::fs::read(&weights_path)?;
+        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
+        let model = ModernBert::load(vb, &config)?;
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
+    }
+}
+
+impl EmbeddingModel for GteModernBertModel {
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let (token_ids, _, mask, batch_size, _) =
+            encode_batch(&self.tokenizer, &texts, &self.device)?;
+        let output = self.model.forward(&token_ids, &mask)?;
+        mean_pool_and_normalize(&output, &mask, batch_size)
+    }
+
+    fn dim(&self) -> usize {
+        768
+    }
+
+    fn model_id(&self) -> &str {
+        GTE_MODERN_ID
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory: load model by HuggingFace ID
+// ---------------------------------------------------------------------------
+
+pub fn load_model(
+    model_id: &str,
+    cache_dir: Option<&PathBuf>,
+) -> Result<Box<dyn EmbeddingModel>> {
+    match model_id {
+        BGE_SMALL_ID => Ok(Box::new(BgeSmallModel::load(cache_dir)?)),
+        JINA_CODE_ID => Ok(Box::new(JinaCodeModel::load(cache_dir)?)),
+        CODE_RANK_ID => Ok(Box::new(CodeRankModel::load(cache_dir)?)),
+        GTE_MODERN_ID => Ok(Box::new(GteModernBertModel::load(cache_dir)?)),
+        other => Err(anyhow!(
+            "unknown embedding model: {other}. Supported: {BGE_SMALL_ID}, \
+             {JINA_CODE_ID}, {CODE_RANK_ID}, {GTE_MODERN_ID}"
+        )),
+    }
+}
+
+/// All supported embedding model IDs.
+pub const SUPPORTED_MODELS: &[&str] = &[
+    BGE_SMALL_ID,
+    JINA_CODE_ID,
+    CODE_RANK_ID,
+    GTE_MODERN_ID,
+];
+
+// ---------------------------------------------------------------------------
+// EmbeddingIndex (uses trait object)
+// ---------------------------------------------------------------------------
+
 #[derive(Default)]
 pub struct EmbeddingIndex {
-    model: Option<BgeModel>,
+    model: Option<Box<dyn EmbeddingModel>>,
     vectors: HashMap<u64, Vec<f32>>,
     cache_dir: Option<PathBuf>,
+    model_id: String,
 }
 
 impl EmbeddingIndex {
-    /// Initialize embedding index with the BGE-small model.
-    pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        let model = BgeModel::load(cache_dir.as_ref())?;
+    /// Initialize embedding index with a specific model.
+    pub fn new_with_model(model_id: &str, cache_dir: Option<PathBuf>) -> Result<Self> {
+        let model = load_model(model_id, cache_dir.as_ref())?;
         Ok(Self {
             model: Some(model),
             vectors: HashMap::new(),
             cache_dir,
+            model_id: model_id.to_string(),
         })
+    }
+
+    /// Initialize embedding index with the default BGE-small model.
+    pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
+        Self::new_with_model(BGE_SMALL_ID, cache_dir)
     }
 
     /// Create an empty embedding index (no model, for when embeddings are disabled).
@@ -140,7 +436,12 @@ impl EmbeddingIndex {
         if self.model.is_some() {
             return Ok(());
         }
-        let model = BgeModel::load(self.cache_dir.as_ref())?;
+        let id = if self.model_id.is_empty() {
+            BGE_SMALL_ID
+        } else {
+            &self.model_id
+        };
+        let model = load_model(id, self.cache_dir.as_ref())?;
         self.model = Some(model);
         Ok(())
     }
@@ -276,11 +577,12 @@ impl<'de> Deserialize<'de> for EmbeddingIndex {
             model: None,
             vectors,
             cache_dir: None,
+            model_id: String::new(),
         })
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -472,5 +774,14 @@ mod tests {
         assert_eq!(index.nb_vectors(), 2);
         assert_eq!(index.get_vector(1).unwrap().len(), 384);
         assert_eq!(index.get_vector(2).unwrap().len(), 384);
+    }
+
+    #[test]
+    fn test_supported_models_list() {
+        assert_eq!(SUPPORTED_MODELS.len(), 4);
+        assert!(SUPPORTED_MODELS.contains(&BGE_SMALL_ID));
+        assert!(SUPPORTED_MODELS.contains(&JINA_CODE_ID));
+        assert!(SUPPORTED_MODELS.contains(&CODE_RANK_ID));
+        assert!(SUPPORTED_MODELS.contains(&GTE_MODERN_ID));
     }
 }

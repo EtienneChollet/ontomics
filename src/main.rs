@@ -156,6 +156,19 @@ enum Command {
         #[arg(long, default_value = "20")]
         top_k: usize,
     },
+    /// Benchmark embedding models on raw function body clustering
+    #[command(name = "benchmark-embeddings")]
+    BenchmarkEmbeddings {
+        /// Embedding model HuggingFace ID
+        #[arg(long)]
+        model: String,
+        /// Clustering distance threshold (default: 0.30)
+        #[arg(long, default_value = "0.30")]
+        threshold: f32,
+        /// Output JSON file (stdout if omitted)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Result of building the initial graph. If embeddings were deferred,
@@ -1170,6 +1183,14 @@ async fn main() -> anyhow::Result<()> {
                 } => cmd_entities(
                     &result.graph, concept.as_deref(), role.as_deref(), top_k,
                 ),
+                Command::BenchmarkEmbeddings {
+                    model,
+                    threshold,
+                    output,
+                } => cmd_benchmark_embeddings(
+                    &repo, &config, &lang_parsers, &model, threshold,
+                    output.as_deref(),
+                ),
             }
         }
     }
@@ -1435,6 +1456,225 @@ fn print_json(value: &impl serde::Serialize) {
         serde_json::to_string_pretty(value)
             .expect("serialization failed")
     );
+}
+
+// --- Embedding benchmark ---
+
+fn cmd_benchmark_embeddings(
+    repo: &Path,
+    config: &config::Config,
+    lang_parsers: &[LangParser],
+    model_id: &str,
+    distance_threshold: f32,
+    output_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    eprintln!("Benchmark: model={model_id}, threshold={distance_threshold}");
+
+    // 1. Parse repo — extract function bodies from signatures
+    let parse_opts_for = |lang: &config::Language| parser::ParseOptions {
+        include: lang.default_include(),
+        exclude: lang.default_exclude(),
+        respect_gitignore: config.index.respect_gitignore,
+    };
+
+    let mut all_bodies: Vec<(String, String, String)> = Vec::new(); // (name, file, body_text)
+    for (p, lang_name) in lang_parsers {
+        let lang_enum = match lang_name.as_str() {
+            "python" => config::Language::Python,
+            "typescript" => config::Language::TypeScript,
+            "javascript" => config::Language::JavaScript,
+            "rust" => config::Language::Rust,
+            _ => config::Language::Python,
+        };
+        let results = parser::parse_directory_with(
+            repo,
+            &parse_opts_for(&lang_enum),
+            &**p,
+        )?;
+        for pr in &results {
+            for sig in &pr.signatures {
+                if let Some(ref body) = sig.body {
+                    let display_name = match &body.scope {
+                        Some(cls) => format!("{cls}.{}", body.entity_name),
+                        None => body.entity_name.clone(),
+                    };
+                    let file = body
+                        .file
+                        .strip_prefix(repo)
+                        .unwrap_or(&body.file)
+                        .display()
+                        .to_string();
+                    let text = body.body_text.clone();
+                    if !text.trim().is_empty() {
+                        all_bodies.push((display_name, file, text));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("Extracted {} function/method bodies", all_bodies.len());
+
+    if all_bodies.is_empty() {
+        anyhow::bail!("No function bodies found in {}", repo.display());
+    }
+
+    // 2. Load model and embed all bodies
+    let model_cache = resolve_cache_dir(&config.embeddings.model_cache_dir);
+    let t_load = Instant::now();
+    let model = embeddings::load_model(model_id, model_cache.as_ref())?;
+    let load_ms = t_load.elapsed().as_millis();
+    eprintln!("Model loaded in {load_ms}ms (dim={})", model.dim());
+
+    let texts: Vec<String> = all_bodies.iter().map(|(_, _, t)| t.clone()).collect();
+    let t_embed = Instant::now();
+    let vectors = model.embed(texts)?;
+    let embed_ms = t_embed.elapsed().as_millis();
+    eprintln!("Embedded {} texts in {embed_ms}ms", vectors.len());
+
+    // 3. Build a temporary EmbeddingIndex for clustering
+    let mut emb_index = embeddings::EmbeddingIndex::empty();
+    let ids: Vec<u64> = (0..vectors.len() as u64).collect();
+    for (i, v) in vectors.iter().enumerate() {
+        emb_index.insert_vector(i as u64, v.clone());
+    }
+
+    // 4. Cluster using the same agglomerative clustering code path
+    let t_cluster = Instant::now();
+    let cluster_result = ontomics::cluster::agglomerative_cluster(
+        &ids,
+        &emb_index,
+        distance_threshold,
+    );
+    let cluster_ms = t_cluster.elapsed().as_millis();
+    eprintln!(
+        "Clustered into {} clusters in {cluster_ms}ms",
+        cluster_result.nb_clusters
+    );
+
+    // 5. Compute metrics
+    let dim = model.dim();
+
+    // Build cluster -> member indices
+    let mut cluster_members: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (&id, &cluster_id) in &cluster_result.assignments {
+        cluster_members
+            .entry(cluster_id)
+            .or_default()
+            .push(id as usize);
+    }
+
+    // Intra-cluster and inter-cluster similarity
+    let mut intra_sims: Vec<f32> = Vec::new();
+    let mut inter_sims: Vec<f32> = Vec::new();
+
+    let cluster_ids: Vec<usize> = cluster_members.keys().copied().collect();
+    for &cid in &cluster_ids {
+        let members = &cluster_members[&cid];
+        // Intra-cluster: pairwise similarity within cluster
+        for i in 0..members.len() {
+            for j in (i + 1)..members.len() {
+                intra_sims.push(embeddings::cosine_similarity(
+                    &vectors[members[i]],
+                    &vectors[members[j]],
+                ));
+            }
+        }
+        // Inter-cluster: sample similarity to other cluster centroids
+        for &other_cid in &cluster_ids {
+            if other_cid == cid {
+                continue;
+            }
+            let other_members = &cluster_members[&other_cid];
+            // Use first member of each as representative
+            if !members.is_empty() && !other_members.is_empty() {
+                inter_sims.push(embeddings::cosine_similarity(
+                    &vectors[members[0]],
+                    &vectors[other_members[0]],
+                ));
+            }
+        }
+    }
+
+    let mean = |v: &[f32]| -> f32 {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f32>() / v.len() as f32
+        }
+    };
+
+    let mean_intra = mean(&intra_sims);
+    let mean_inter = mean(&inter_sims);
+    let cluster_sizes: Vec<usize> =
+        cluster_members.values().map(|m| m.len()).collect();
+    let max_cluster_size = cluster_sizes.iter().max().copied().unwrap_or(0);
+    let singletons = cluster_sizes.iter().filter(|&&s| s == 1).count();
+
+    // Silhouette score (simplified: use cluster centroid distances)
+    let silhouette = if mean_intra + mean_inter > 0.0 {
+        (mean_intra - mean_inter) / mean_intra.max(mean_inter)
+    } else {
+        0.0
+    };
+
+    // 6. Build output
+    let mut clusters_json: Vec<serde_json::Value> = cluster_members
+        .iter()
+        .map(|(&cid, members)| {
+            let funcs: Vec<serde_json::Value> = members
+                .iter()
+                .map(|&idx| {
+                    serde_json::json!({
+                        "name": all_bodies[idx].0,
+                        "file": all_bodies[idx].1,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "cluster_id": cid,
+                "size": members.len(),
+                "functions": funcs,
+            })
+        })
+        .collect();
+    clusters_json.sort_by(|a, b| {
+        b["size"].as_u64().cmp(&a["size"].as_u64())
+    });
+
+    let output = serde_json::json!({
+        "model": model_id,
+        "embedding_dim": dim,
+        "repo": repo.display().to_string(),
+        "nb_functions": all_bodies.len(),
+        "distance_threshold": distance_threshold,
+        "timing": {
+            "model_load_ms": load_ms,
+            "embed_ms": embed_ms,
+            "cluster_ms": cluster_ms,
+        },
+        "metrics": {
+            "nb_clusters": cluster_result.nb_clusters,
+            "mean_intra_similarity": format!("{mean_intra:.4}"),
+            "mean_inter_similarity": format!("{mean_inter:.4}"),
+            "silhouette_approx": format!("{silhouette:.4}"),
+            "max_cluster_size": max_cluster_size,
+            "singletons": singletons,
+        },
+        "clusters": clusters_json,
+    });
+
+    match output_path {
+        Some(path) => {
+            std::fs::write(path, serde_json::to_string_pretty(&output)?)?;
+            eprintln!("Results written to {}", path.display());
+        }
+        None => print_json(&output),
+    }
+
+    Ok(())
 }
 
 // --- MCP server ---
