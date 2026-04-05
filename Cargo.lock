@@ -292,9 +292,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b338dbd3c5e538fbfc6cd25547f159c47071b7af55779a9a7d9166257136338"
 dependencies = [
  "candle-core",
+ "candle-metal-kernels",
  "half",
  "libc",
  "num-traits",
+ "objc2-metal",
  "rayon",
  "safetensors 0.7.0",
  "serde",

@@ -306,7 +306,7 @@ impl EmbeddingModel for CodeRankModel {
             return Ok(vec![]);
         }
         let mut all_results = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(8) {
+        for chunk in texts.chunks(1) {
             let (token_ids, type_ids, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
             let output = self.model.forward(
@@ -365,7 +365,7 @@ impl EmbeddingModel for GteModernBertModel {
             return Ok(vec![]);
         }
         let mut all_results = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(8) {
+        for chunk in texts.chunks(2) {
             let (token_ids, _, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
             let output = self.model.forward(&token_ids, &mask)?;
