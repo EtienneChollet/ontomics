@@ -177,10 +177,16 @@ impl EmbeddingModel for BgeSmallModel {
             return Ok(vec![]);
         }
         let device = &self.model.device;
-        let (token_ids, type_ids, mask, batch_size, _) =
-            encode_batch(&self.tokenizer, &texts, device)?;
-        let output = self.model.forward(&token_ids, &type_ids, Some(&mask))?;
-        cls_pool_and_normalize(&output, batch_size)
+        let mut all_results = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(32) {
+            let (token_ids, type_ids, mask, batch_size, _) =
+                encode_batch(&self.tokenizer, chunk, device)?;
+            let output = self.model.forward(
+                &token_ids, &type_ids, Some(&mask),
+            )?;
+            all_results.extend(cls_pool_and_normalize(&output, batch_size)?);
+        }
+        Ok(all_results)
     }
 
     fn dim(&self) -> usize {
@@ -299,10 +305,18 @@ impl EmbeddingModel for CodeRankModel {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let (token_ids, type_ids, mask, batch_size, _) =
-            encode_batch(&self.tokenizer, &texts, &self.device)?;
-        let output = self.model.forward(&token_ids, Some(&type_ids), Some(&mask))?;
-        mean_pool_and_normalize(&output, &mask, batch_size)
+        let mut all_results = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(8) {
+            let (token_ids, type_ids, mask, batch_size, _) =
+                encode_batch(&self.tokenizer, chunk, &self.device)?;
+            let output = self.model.forward(
+                &token_ids, Some(&type_ids), Some(&mask),
+            )?;
+            all_results.extend(mean_pool_and_normalize(
+                &output, &mask, batch_size,
+            )?);
+        }
+        Ok(all_results)
     }
 
     fn dim(&self) -> usize {
@@ -350,10 +364,16 @@ impl EmbeddingModel for GteModernBertModel {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let (token_ids, _, mask, batch_size, _) =
-            encode_batch(&self.tokenizer, &texts, &self.device)?;
-        let output = self.model.forward(&token_ids, &mask)?;
-        mean_pool_and_normalize(&output, &mask, batch_size)
+        let mut all_results = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(8) {
+            let (token_ids, _, mask, batch_size, _) =
+                encode_batch(&self.tokenizer, chunk, &self.device)?;
+            let output = self.model.forward(&token_ids, &mask)?;
+            all_results.extend(mean_pool_and_normalize(
+                &output, &mask, batch_size,
+            )?);
+        }
+        Ok(all_results)
     }
 
     fn dim(&self) -> usize {

@@ -306,7 +306,7 @@ fn run_benchmark(
     model_id: &str,
     threshold: f32,
     expectations: &[ExpectedCluster],
-) -> BenchmarkResult {
+) -> Option<BenchmarkResult> {
     // 1. Parse and extract function bodies
     let parser = parser::python_parser();
     let opts = ParseOptions {
@@ -335,12 +335,23 @@ fn run_benchmark(
     let nb_functions = all_bodies.len();
 
     // 2. Load model and embed
-    let model = embeddings::load_model(model_id, None)
-        .unwrap_or_else(|e| panic!("Failed to load {model_id}: {e}"));
+    let model = match embeddings::load_model(model_id, None) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP {model_id}: {e}");
+            return None;
+        }
+    };
 
     let texts: Vec<String> = all_bodies.iter().map(|(_, t)| t.clone()).collect();
     let t_embed = std::time::Instant::now();
-    let vectors = model.embed(texts).unwrap();
+    let vectors = match model.embed(texts) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SKIP {model_id}: embed failed: {e}");
+            return None;
+        }
+    };
     let embed_ms = t_embed.elapsed().as_millis();
 
     // 3. Cluster
@@ -492,7 +503,7 @@ fn run_benchmark(
         0.0
     };
 
-    BenchmarkResult {
+    Some(BenchmarkResult {
         model_id: model_id.to_string(),
         nb_functions,
         nb_clusters: result.nb_clusters,
@@ -504,7 +515,7 @@ fn run_benchmark(
         embed_ms,
         cluster_ms,
         per_cluster_results,
-    }
+    })
 }
 
 fn print_benchmark_result(r: &BenchmarkResult) {
@@ -554,9 +565,13 @@ fn run_comparison(
     let mut results = Vec::new();
     for &model_id in SUPPORTED_MODELS {
         eprintln!("\n--- Running {model_id} on {} ---", repo.display());
-        let r = run_benchmark(repo, lang, model_id, threshold, &expectations);
-        print_benchmark_result(&r);
-        results.push(r);
+        match run_benchmark(repo, lang, model_id, threshold, &expectations) {
+            Some(r) => {
+                print_benchmark_result(&r);
+                results.push(r);
+            }
+            None => eprintln!("  (model skipped due to load error)"),
+        }
     }
 
     // Print summary table
