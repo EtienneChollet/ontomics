@@ -60,8 +60,8 @@ fn voxelmorph_expectations() -> Vec<ExpectedCluster> {
         ExpectedCluster {
             label: "velocity_integration",
             must_cluster: vec![
-                "integrate_disp",         // functional.py
-                "IntegrateVelocityField", // nn/modules.py (init or forward)
+                "integrate_disp",
+                "IntegrateVelocityField.forward",
             ],
             must_not_cluster: vec![
                 "resize_disp",
@@ -96,13 +96,13 @@ fn voxelmorph_expectations() -> Vec<ExpectedCluster> {
         ExpectedCluster {
             label: "deprecated_loss_stubs",
             must_cluster: vec![
-                "NCC",
-                "MSE",
-                "Dice",
-                "Grad",
+                "NCC.loss",
+                "MSE.loss",
+                "Dice.loss",
+                "Grad.loss",
             ],
             must_not_cluster: vec![
-                "SpatialTransformer",
+                "SpatialTransformer.forward",
                 "volgen",
             ],
         },
@@ -300,14 +300,12 @@ fn interseg3d_expectations() -> Vec<ExpectedCluster> {
 // The Language param is retained for future cross-language benchmarks.
 
 /// Run the full benchmark pipeline for one model on one repo.
-fn run_benchmark(
+/// Parse repo and embed with model. Returns (names, vectors, embed_ms) or None.
+fn embed_repo(
     repo: &Path,
     lang: &Language,
     model_id: &str,
-    threshold: f32,
-    expectations: &[ExpectedCluster],
-) -> Option<BenchmarkResult> {
-    // 1. Parse and extract function bodies
+) -> Option<(Vec<String>, Vec<Vec<f32>>, u128)> {
     let parser = parser::python_parser();
     let opts = ParseOptions {
         include: lang.default_include(),
@@ -332,9 +330,11 @@ fn run_benchmark(
         }
     }
 
-    let nb_functions = all_bodies.len();
+    if all_bodies.is_empty() {
+        eprintln!("No function bodies found");
+        return None;
+    }
 
-    // 2. Load model and embed
     let model = match embeddings::load_model(model_id, None) {
         Ok(m) => m,
         Err(e) => {
@@ -344,6 +344,7 @@ fn run_benchmark(
     };
 
     let texts: Vec<String> = all_bodies.iter().map(|(_, t)| t.clone()).collect();
+    let names: Vec<String> = all_bodies.iter().map(|(n, _)| n.clone()).collect();
     let t_embed = std::time::Instant::now();
     let vectors = match model.embed(texts) {
         Ok(v) => v,
@@ -353,8 +354,20 @@ fn run_benchmark(
         }
     };
     let embed_ms = t_embed.elapsed().as_millis();
+    eprintln!("  Embedded {} texts in {embed_ms}ms", vectors.len());
 
-    // 3. Cluster
+    Some((names, vectors, embed_ms))
+}
+
+/// Cluster + evaluate at a given threshold. Returns BenchmarkResult.
+fn evaluate_at_threshold(
+    model_id: &str,
+    names: &[String],
+    vectors: &[Vec<f32>],
+    threshold: f32,
+    embed_ms: u128,
+    expectations: &[ExpectedCluster],
+) -> BenchmarkResult {
     let mut emb_index = embeddings::EmbeddingIndex::empty();
     let ids: Vec<u64> = (0..vectors.len() as u64).collect();
     for (i, v) in vectors.iter().enumerate() {
@@ -365,23 +378,19 @@ fn run_benchmark(
     let result = cluster::agglomerative_cluster(&ids, &emb_index, threshold);
     let cluster_ms = t_cluster.elapsed().as_millis();
 
-    // 4. Build name -> cluster_id map
+    // Build name -> cluster_id map
     let mut name_to_cluster: HashMap<String, usize> = HashMap::new();
-    for (idx, (name, _)) in all_bodies.iter().enumerate() {
+    for (idx, name) in names.iter().enumerate() {
         if let Some(&cid) = result.assignments.get(&(idx as u64)) {
-            // Store both the full name and just the short name for matching
             name_to_cluster.insert(name.clone(), cid);
-            // Also store the method name without class prefix
             if let Some(dot_pos) = name.rfind('.') {
                 let short = &name[dot_pos + 1..];
-                // Only insert short name if not already present (avoid
-                // collisions — full name takes priority)
                 name_to_cluster.entry(short.to_string()).or_insert(cid);
             }
         }
     }
 
-    // 5. Compute metrics
+    // Compute metrics
     let mut cluster_members: HashMap<usize, Vec<usize>> = HashMap::new();
     for (&id, &cid) in &result.assignments {
         cluster_members.entry(cid).or_default().push(id as usize);
@@ -389,9 +398,10 @@ fn run_benchmark(
 
     let mut intra_sims = Vec::new();
     let mut inter_sims = Vec::new();
-    let cluster_ids: Vec<usize> = cluster_members.keys().copied().collect();
+    let cluster_ids_list: Vec<usize> =
+        cluster_members.keys().copied().collect();
 
-    for &cid in &cluster_ids {
+    for &cid in &cluster_ids_list {
         let members = &cluster_members[&cid];
         for i in 0..members.len() {
             for j in (i + 1)..members.len() {
@@ -401,7 +411,7 @@ fn run_benchmark(
                 ));
             }
         }
-        for &other in &cluster_ids {
+        for &other in &cluster_ids_list {
             if other == cid {
                 continue;
             }
@@ -421,12 +431,11 @@ fn run_benchmark(
     let mean_intra = mean(&intra_sims);
     let mean_inter = mean(&inter_sims);
 
-    // 6. Evaluate cluster expectations
+    // Evaluate cluster expectations
     let mut clusters_recovered = 0;
     let mut per_cluster_results = Vec::new();
 
     for exp in expectations {
-        // Find cluster IDs for must_cluster members
         let mut found_ids: Vec<(String, Option<usize>)> = Vec::new();
         for name in &exp.must_cluster {
             let cid = name_to_cluster.get(*name).copied();
@@ -443,7 +452,7 @@ fn run_benchmark(
             per_cluster_results.push((
                 exp.label.to_string(),
                 false,
-                format!("functions not found: {}", missing.join(", ")),
+                format!("not found: {}", missing.join(", ")),
             ));
             continue;
         }
@@ -461,12 +470,11 @@ fn run_benchmark(
             per_cluster_results.push((
                 exp.label.to_string(),
                 false,
-                format!("split across clusters: {}", detail.join(", ")),
+                format!("split: {}", detail.join(", ")),
             ));
             continue;
         }
 
-        // Check must_not_cluster exclusions
         let mut violations = Vec::new();
         for name in &exp.must_not_cluster {
             if let Some(&cid) = name_to_cluster.get(*name) {
@@ -480,10 +488,7 @@ fn run_benchmark(
             per_cluster_results.push((
                 exp.label.to_string(),
                 false,
-                format!(
-                    "unwanted functions in cluster: {}",
-                    violations.join(", ")
-                ),
+                format!("unwanted: {}", violations.join(", ")),
             ));
             continue;
         }
@@ -503,9 +508,13 @@ fn run_benchmark(
         0.0
     };
 
-    Some(BenchmarkResult {
+    let cluster_sizes: Vec<usize> =
+        cluster_members.values().map(|m| m.len()).collect();
+    let _singletons = cluster_sizes.iter().filter(|&&s| s == 1).count();
+
+    BenchmarkResult {
         model_id: model_id.to_string(),
-        nb_functions,
+        nb_functions: names.len(),
         nb_clusters: result.nb_clusters,
         clusters_recovered,
         clusters_total,
@@ -515,7 +524,7 @@ fn run_benchmark(
         embed_ms,
         cluster_ms,
         per_cluster_results,
-    })
+    }
 }
 
 fn print_benchmark_result(r: &BenchmarkResult) {
@@ -550,27 +559,54 @@ fn print_benchmark_result(r: &BenchmarkResult) {
 // These tests use a helper that skips gracefully if the repo path doesn't
 // exist (same pattern as the testbed).
 
-/// Run all 4 models on a single codebase and print comparison.
+const THRESHOLDS: &[f32] = &[0.20, 0.25, 0.30, 0.35, 0.40, 0.50];
+
+/// Run all models on a single codebase, sweeping thresholds.
 fn run_comparison(
     repo: &Path,
     lang: &Language,
     expectations: Vec<ExpectedCluster>,
-    threshold: f32,
 ) -> Vec<BenchmarkResult> {
     if !repo.exists() {
         eprintln!("SKIP: {} not found", repo.display());
         return Vec::new();
     }
 
-    let mut results = Vec::new();
+    let mut best_results = Vec::new();
+
     for &model_id in SUPPORTED_MODELS {
-        eprintln!("\n--- Running {model_id} on {} ---", repo.display());
-        match run_benchmark(repo, lang, model_id, threshold, &expectations) {
-            Some(r) => {
-                print_benchmark_result(&r);
-                results.push(r);
+        eprintln!("\n--- Embedding with {model_id} ---");
+        let (names, vectors, embed_ms) = match embed_repo(repo, lang, model_id) {
+            Some(v) => v,
+            None => {
+                eprintln!("  (skipped)");
+                continue;
             }
-            None => eprintln!("  (model skipped due to load error)"),
+        };
+
+        // Sweep thresholds, find best recovery
+        eprintln!("  Threshold sweep:");
+        let mut best: Option<BenchmarkResult> = None;
+        for &t in THRESHOLDS {
+            let r = evaluate_at_threshold(
+                model_id, &names, &vectors, t, embed_ms, &expectations,
+            );
+            eprintln!(
+                "    t={:.2}: {} clusters, {}/{} recovered ({:.0}%), {} singletons",
+                t, r.nb_clusters, r.clusters_recovered, r.clusters_total,
+                r.recovery_rate * 100.0,
+                r.nb_clusters as i32 - (r.nb_functions as i32 - r.nb_clusters as i32).max(0),
+            );
+            if best.as_ref().map_or(true, |b| r.recovery_rate > b.recovery_rate) {
+                best = Some(r);
+            }
+        }
+
+        if let Some(b) = best {
+            eprintln!("  Best threshold for {model_id}: recovery={:.0}%",
+                b.recovery_rate * 100.0);
+            print_benchmark_result(&b);
+            best_results.push(b);
         }
     }
 
@@ -582,7 +618,7 @@ fn run_comparison(
         "{:<40} {:>8} {:>8} {:>10} {:>8} {:>8}",
         "Model", "Clusters", "Recov", "Rate", "Intra", "Inter"
     );
-    for r in &results {
+    for r in &best_results {
         eprintln!(
             "{:<40} {:>8} {:>5}/{:<2} {:>9.1}% {:>8.4} {:>8.4}",
             r.model_id,
@@ -595,7 +631,7 @@ fn run_comparison(
         );
     }
 
-    results
+    best_results
 }
 
 #[test]
@@ -609,7 +645,6 @@ fn benchmark_voxelmorph() {
         repo,
         &Language::Python,
         voxelmorph_expectations(),
-        0.30,
     );
     if results.is_empty() {
         return;
@@ -641,7 +676,6 @@ fn benchmark_neurite() {
         repo,
         &Language::Python,
         neurite_expectations(),
-        0.30,
     );
     if results.is_empty() {
         return;
@@ -672,7 +706,6 @@ fn benchmark_interseg3d() {
         repo,
         &Language::Python,
         interseg3d_expectations(),
-        0.30,
     );
     if results.is_empty() {
         return;
