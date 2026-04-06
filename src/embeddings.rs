@@ -13,7 +13,7 @@ use candle_transformers::models::nomic_bert::{
 use hf_hub::api::sync::ApiBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 // ---------------------------------------------------------------------------
@@ -105,6 +105,75 @@ fn encode_batch(
     let type_ids = Tensor::from_vec(type_ids, (batch_size, seq_len), device)?;
     let mask = Tensor::from_vec(mask, (batch_size, seq_len), device)?;
     Ok((token_ids, type_ids, mask, batch_size, seq_len))
+}
+
+// ---------------------------------------------------------------------------
+// Weight remapping for models whose safetensors keys don't match candle's
+// ---------------------------------------------------------------------------
+
+/// Load safetensors into a HashMap and remap keys for Jina Code v2.
+///
+/// Candle's `jina_bert` module expects:
+///   encoder.layer.N.mlp.gated_layers.weight
+///   encoder.layer.N.mlp.wo.{weight,bias}
+///   encoder.layer.N.mlp.layernorm.{weight,bias}
+///
+/// The model ships:
+///   encoder.layer.N.mlp.up_gated_layer.weight
+///   encoder.layer.N.mlp.down_layer.{weight,bias}
+///   encoder.layer.N.layer_norm_2.{weight,bias}
+///
+/// Shapes are identical — pure name translation, no tensor ops.
+fn load_jina_code_remapped(
+    weights_path: &Path,
+    device: &Device,
+) -> Result<HashMap<String, Tensor>> {
+    let tensors = candle_core::safetensors::load(weights_path, device)?;
+    let mut remapped = HashMap::with_capacity(tensors.len());
+    for (key, tensor) in tensors {
+        let new_key = remap_jina_code_key(&key);
+        remapped.insert(new_key, tensor);
+    }
+    Ok(remapped)
+}
+
+fn remap_jina_code_key(key: &str) -> String {
+    // up_gated_layer -> gated_layers
+    if key.contains(".mlp.up_gated_layer.") {
+        return key.replace(".mlp.up_gated_layer.", ".mlp.gated_layers.");
+    }
+    // down_layer -> wo
+    if key.contains(".mlp.down_layer.") {
+        return key.replace(".mlp.down_layer.", ".mlp.wo.");
+    }
+    // encoder.layer.N.layer_norm_2.X -> encoder.layer.N.mlp.layernorm.X
+    if key.starts_with("encoder.layer.") && key.contains(".layer_norm_2.") {
+        return key.replace(".layer_norm_2.", ".mlp.layernorm.");
+    }
+    key.to_string()
+}
+
+/// Load safetensors into a HashMap and add `model.` prefix for GTE-ModernBERT.
+///
+/// Candle's `ModernBert::load` hardcodes `vb.pp("model.embeddings.tok_embeddings")`
+/// etc., but the checkpoint ships keys without the `model.` prefix.
+fn load_gte_modern_remapped(
+    weights_path: &Path,
+    device: &Device,
+) -> Result<HashMap<String, Tensor>> {
+    let tensors = candle_core::safetensors::load(weights_path, device)?;
+    let mut remapped = HashMap::with_capacity(tensors.len());
+    for (key, tensor) in tensors {
+        if key.starts_with("embeddings.")
+            || key.starts_with("layers.")
+            || key.starts_with("final_norm.")
+        {
+            remapped.insert(format!("model.{key}"), tensor);
+        } else {
+            remapped.insert(key, tensor);
+        }
+    }
+    Ok(remapped)
 }
 
 fn cls_pool_and_normalize(hidden: &Tensor, batch_size: usize) -> Result<Vec<Vec<f32>>> {
@@ -220,8 +289,8 @@ impl JinaCodeModel {
         // No padding — jina_bert Module::forward takes no attention mask,
         // so we embed one text at a time to avoid padding corruption.
         let tokenizer = load_tokenizer(&tokenizer_path, 8192, false)?;
-        let weights = std::fs::read(&weights_path)?;
-        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
+        let remapped = load_jina_code_remapped(&weights_path, &device)?;
+        let vb = VarBuilder::from_tensors(remapped, DType::F32, &device);
         let model = JinaBertModel::new(vb, &config)?;
         Ok(Self {
             model,
@@ -348,8 +417,8 @@ impl GteModernBertModel {
         let config: ModernConfig =
             serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
         let tokenizer = load_tokenizer(&tokenizer_path, 8192, true)?;
-        let weights = std::fs::read(&weights_path)?;
-        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
+        let remapped = load_gte_modern_remapped(&weights_path, &device)?;
+        let vb = VarBuilder::from_tensors(remapped, DType::F32, &device);
         let model = ModernBert::load(vb, &config)?;
         Ok(Self {
             model,
