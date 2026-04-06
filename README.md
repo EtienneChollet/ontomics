@@ -11,7 +11,7 @@
 ![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
 ![pi](https://img.shields.io/badge/pi--coding--agent-blue)
 
-ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code — and groups functions by behavioral similarity — making all of it queryable via [MCP](https://modelcontextprotocol.io/).
+ontomics gives Claude Code instant knowledge of your codebase. One tool call instead of 19. ~20x fewer tokens.
 
 ## Benchmark
 
