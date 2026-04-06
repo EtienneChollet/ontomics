@@ -49,14 +49,14 @@ Direct commits to main are only acceptable for version bumps and release automat
 
 ## What this is
 
-ontomics is a Rust MCP server that extracts domain ontologies from codebases (Python, TypeScript, JavaScript, Rust). It parses source files with tree-sitter, clusters related identifiers by embedding similarity, detects naming conventions, and exposes the results as MCP tools. Runs locally with no API keys.
+ontomics is a Rust MCP server that extracts domain ontologies from codebases (Python, TypeScript, JavaScript, Rust). It parses source files with tree-sitter, clusters related identifiers by embedding similarity, detects naming conventions, clusters functions by behavioral similarity using code embeddings, and exposes the results as MCP tools. Runs locally with no API keys.
 
 ## Build and test
 
 ```bash
 cargo build --release          # production binary
 cargo build                    # debug build
-cargo test                     # all tests (~200, inline in each module)
+cargo test                     # all tests (inline in each module)
 cargo test --lib config        # tests in a single module
 cargo clippy                   # lint (must pass with zero warnings)
 ```
@@ -92,35 +92,40 @@ The pipeline runs in this order. Each module is a single file under `src/`.
 
 3. **`analyzer.rs`** — TF-IDF scoring on subtokens to find domain-specific concepts. Builds `Concept` nodes, `Convention` patterns, and `Relationship` edges (co-occurrence, abbreviation). Takes `AnalysisParams` (min_frequency, tfidf_threshold, convention_threshold).
 
-4. **`embeddings.rs`** — `EmbeddingIndex` using candle (`BAAI/bge-small-en-v1.5`, safetensors). Stores concept ID → vector mapping. Used for similarity queries and clustering.
+4. **`embeddings.rs`** — `EmbeddingModel` trait with pluggable backends (BGE-small, CodeRankEmbed, Jina Code, GTE-ModernBERT). `EmbeddingIndex` stores concept ID → vector mapping using BGE-small (`BAAI/bge-small-en-v1.5`, 384-dim). Candle + safetensors inference.
 
 5. **`cluster.rs`** — Agglomerative clustering with average linkage (priority queue, O(N² log N)). Groups concepts by embedding similarity. Assigns `cluster_id` on each `Concept`.
 
 6. **`entity.rs`** — Promotes functions/classes into `Entity` nodes with concept tags and semantic roles. Builds entity-level relationships (Instantiates, InheritsFrom, Uses).
 
-7. **`graph.rs`** — `ConceptGraph` is the central data structure. Holds concepts, relationships, conventions, embeddings, entities, signatures, classes, call_sites. All query methods (query_concept, check_naming, suggest_name, locate_concept, describe_symbol, etc.) live here.
+7. **`logic.rs`** — L4 behavioral layer. `LogicIndex` embeds raw function body text via CodeRankEmbed (`nomic-ai/CodeRankEmbed`, 768-dim) and clusters functions by behavioral similarity. Produces `LogicCluster` groups with behavioral labels. Also contains `cross_reference()` for Jaccard overlap between logic and concept clusters (called from `main.rs`).
 
-8. **`tools.rs`** — `OntomicsServer` implements `rmcp::ServerHandler`. Maps MCP tool calls to `ConceptGraph` query methods. Supports deferred startup (graph populated in background).
+8. **`centrality.rs`** — PageRank centrality scoring for entities using structural edges (`InheritsFrom`, `Uses`).
 
-9. **`cache.rs`** — SQLite persistence at `<repo>/.ontomics/index.db`. Auto-invalidation via `ONTOMICS_CACHE_VERSION` (hash of indexing source files, computed in `build.rs`). File watcher (notify) for incremental re-indexing.
+9. **`graph.rs`** — `ConceptGraph` is the central data structure. Holds concepts, relationships, conventions, embeddings, entities, signatures, classes, call_sites, logic_clusters, centrality scores. All query methods (query_concept, check_naming, suggest_name, locate_concept, describe_symbol, describe_logic, etc.) live here.
 
-10. **`diff.rs`** — `ontology_diff`: parses a base git ref's source tree via git2, re-runs analysis, and diffs concept sets against HEAD.
+10. **`tools.rs`** — `OntomicsServer` implements `rmcp::ServerHandler`. Maps MCP tool calls to `ConceptGraph` query methods. Supports deferred startup (graph populated in background).
 
-11. **`domain_pack.rs`** — Export/import of portable YAML domain knowledge (abbreviations, conventions, terms, associations).
+11. **`cache.rs`** — SQLite persistence at `<repo>/.ontomics/index.db`. Auto-invalidation via `ONTOMICS_CACHE_VERSION` (hash of indexing source files, computed in `build.rs`). File watcher (notify) for incremental re-indexing.
 
-12. **`enrichment.rs`** — Background embedding completion. Computes embedding plan (which concepts still need vectors), merges vectors into graph, checks generation staleness.
+12. **`diff.rs`** — `ontology_diff`: parses a base git ref's source tree via git2, re-runs analysis, and diffs concept sets against HEAD.
 
-13. **`config.rs`** — `Config` loaded from `.ontomics/config.toml`. Sections: language, index, analysis, embeddings, cache, resources, conventions, domain_packs.
+13. **`domain_pack.rs`** — Export/import of portable YAML domain knowledge (abbreviations, conventions, terms, associations).
 
-14. **`types.rs`** — All shared types: `Concept`, `Entity`, `Relationship`, `Convention`, `Occurrence`, `Signature`, `ClassInfo`, `CallSite`, `DomainPack`, query param/result structs.
+14. **`enrichment.rs`** — Background embedding planning and merging. Computes embedding plans (which concepts and function bodies still need vectors), merges computed vectors into the graph, checks generation staleness. Model loading and inference happen in `main.rs`.
 
-15. **`lsp.rs`** — Behind `lsp` feature flag. Shells out to pyright for cross-file inheritance resolution.
+15. **`config.rs`** — `Config` loaded from `.ontomics/config.toml`. Sections: language, index, analysis, embeddings, cache, resources, conventions, domain_packs.
 
-16. **`main.rs`** — CLI (clap) with subcommands (serve, query, check, suggest, diff, concepts, conventions, describe, locate, briefing, export, entities). Default is `serve` (MCP stdio). Orchestrates the full pipeline: config → parse → analyze → embed → cluster → entity build → graph. Supports deferred embedding (background thread) for fast MCP startup. Parent process watchdog for clean exit.
+16. **`types.rs`** — All shared types: `Concept`, `Entity`, `Relationship`, `Convention`, `Occurrence`, `Signature`, `ClassInfo`, `CallSite`, `FunctionBody`, `LogicCluster`, `CentralityScore`, `DomainPack`, query param/result structs.
+
+17. **`lsp.rs`** — Behind `lsp` feature flag. Shells out to pyright for cross-file inheritance resolution.
+
+18. **`main.rs`** — CLI (clap) with subcommands (serve, query, check, suggest, diff, concepts, conventions, describe, file, locate, trace, briefing, export, update, health, map, type-flows, trace-type, entities, benchmark-embeddings). Default is `serve` (MCP stdio). Orchestrates the full pipeline: config → parse → analyze → embed → cluster → entity build → logic embed → logic cluster → centrality → graph. Supports deferred embedding (background thread) for fast MCP startup. Parent process watchdog for clean exit.
 
 ## Key design decisions
 
-- **`build.rs`** hashes `INDEX_FILES` (entity, analyzer, parser, cache, tokenizer, types) into `ONTOMICS_CACHE_VERSION`. Any change to these files auto-invalidates all caches.
+- **`build.rs`** hashes `INDEX_FILES` (entity, analyzer, parser, cache, tokenizer, types, logic, centrality) into `ONTOMICS_CACHE_VERSION`. Any change to these files auto-invalidates all caches.
+- **Dual embedding models**: Concept embeddings use BGE-small (384-dim); behavioral embeddings use CodeRankEmbed (768-dim). Both loaded via the `EmbeddingModel` trait.
 - **Deferred startup**: In serve mode, graph is built without embeddings first, MCP is available immediately, embeddings complete in background thread.
 - **No `unwrap()` outside tests, no `panic!` in library code.** Error handling uses `anyhow::Result` throughout.
 - **Modules map 1:1 to files** — no `mod.rs` nesting.
