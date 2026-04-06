@@ -47,6 +47,10 @@ Direct commits to main are only acceptable for version bumps and release automat
 - Any change to analysis logic (TF-IDF, stop words, convention detection) that breaks testbed expectations must be fixed in the analysis code until the tests pass, not by weakening the tests.
 - When in doubt: the test is right, the implementation is wrong.
 
+## Terminology
+
+- **"pi"** — Refers to the [pi agent harness](https://github.com/badlogic/pi-mono), NOT Raspberry Pi or the number. When the user mentions "pi", they are talking about this agent harness UI.
+
 ## What this is
 
 ontomics is a Rust MCP server that extracts domain ontologies from codebases (Python, TypeScript, JavaScript, Rust). It parses source files with tree-sitter, clusters related identifiers by embedding similarity, detects naming conventions, and exposes the results as MCP tools. Runs locally with no API keys.
