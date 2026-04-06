@@ -189,11 +189,30 @@ struct EmbeddingWork {
     domain_packs: Vec<types::DomainPack>,
     logic_enabled: bool,
     logic_similarity_threshold: f32,
-    logic_min_pseudocode_steps: usize,
 }
 
 /// Paths that must never be indexed, regardless of `--force`.
 const BLACKLISTED_PATHS: &[&str] = &["/", "/tmp"];
+
+/// Build a map of entity_id → call_sites for cluster labeling.
+///
+/// Matches call sites to entities by `caller_scope` name and file path.
+fn build_entity_call_sites(
+    graph: &ontomics::graph::ConceptGraph,
+) -> std::collections::HashMap<u64, Vec<&types::CallSite>> {
+    let mut map: std::collections::HashMap<u64, Vec<&types::CallSite>> =
+        std::collections::HashMap::new();
+    for cs in &graph.call_sites {
+        if let Some(scope) = &cs.caller_scope {
+            if let Some(entity) = graph.entities.values().find(|e| {
+                e.name == *scope && e.file == cs.file
+            }) {
+                map.entry(entity.id).or_default().push(cs);
+            }
+        }
+    }
+    map
+}
 
 /// Reject blacklisted directories and require a git repo (unless `--force`).
 fn validate_repo_path(repo: &Path, force: bool) -> anyhow::Result<()> {
@@ -292,7 +311,6 @@ fn build_graph(
                         domain_packs: loaded_packs.clone(),
                         logic_enabled: config.logic.enabled,
                         logic_similarity_threshold: config.logic.similarity_threshold,
-                        logic_min_pseudocode_steps: config.logic.min_pseudocode_steps,
                     }),
                 });
             }
@@ -497,20 +515,6 @@ fn build_graph(
             graph.entities.insert(ent.id, ent);
         }
 
-        // L4: pseudocode generation (no model needed)
-        if config.logic.enabled {
-            let parser_refs: Vec<(&dyn parser::LanguageParser, &str)> =
-                lang_parsers.iter().map(|(p, n)| (&**p as &dyn parser::LanguageParser, n.as_str())).collect();
-            let pseudocode = ontomics::pseudocode::generate_all_pseudocode(
-                &graph.entities,
-                &graph.signatures,
-                &parser_refs,
-                config.logic.max_pseudocode_lines,
-            );
-            eprintln!("Generated pseudocode for {} entities", pseudocode.len());
-            graph.pseudocode = pseudocode;
-        }
-
         // L4: centrality (no model needed)
         if config.centrality.enabled {
             let centrality = ontomics::centrality::compute_centrality(
@@ -547,7 +551,6 @@ fn build_graph(
                 domain_packs: loaded_packs.clone(),
                 logic_enabled: config.logic.enabled,
                 logic_similarity_threshold: config.logic.similarity_threshold,
-                logic_min_pseudocode_steps: config.logic.min_pseudocode_steps,
             }),
         });
     }
@@ -637,54 +640,41 @@ fn build_graph(
         }
     }
 
-    // L4: pseudocode
-    if config.logic.enabled {
-        let parser_refs: Vec<(&dyn parser::LanguageParser, &str)> =
-            lang_parsers.iter().map(|(p, n)| (&**p as &dyn parser::LanguageParser, n.as_str())).collect();
-        let pseudocode = ontomics::pseudocode::generate_all_pseudocode(
-            &graph.entities,
-            &graph.signatures,
-            &parser_refs,
-            config.logic.max_pseudocode_lines,
-        );
-        eprintln!("Generated pseudocode for {} entities", pseudocode.len());
-        graph.pseudocode = pseudocode;
-
-        // Logic embeddings (only if concept embeddings are also enabled)
-        if config.embeddings.enabled {
-            match ontomics::logic::LogicIndex::new(logic_cache_dir) {
-                Ok(mut logic_idx) => {
-                    let items: Vec<(u64, String)> = graph.pseudocode.iter()
-                        .filter(|(_, pc)| {
-                            pc.steps.len() >= config.logic.min_pseudocode_steps
-                        })
-                        .map(|(id, pc)| {
-                            (*id, ontomics::pseudocode::format_pseudocode(pc))
-                        })
-                        .collect();
-                    if let Err(e) = logic_idx.embed_batch(items) {
-                        eprintln!("Warning: logic embedding failed: {e}");
-                    }
-                    let entity_ids: Vec<u64> =
-                        graph.entities.keys().copied().collect();
-                    graph.logic_clusters = ontomics::logic::cluster_logic(
-                        &logic_idx,
-                        &entity_ids,
-                        1.0 - config.logic.similarity_threshold,
-                    );
-                    ontomics::logic::label_clusters(
-                        &mut graph.logic_clusters,
-                        &graph.pseudocode,
-                    );
-                    eprintln!(
-                        "Logic: {} embeddings, {} clusters",
-                        logic_idx.nb_vectors(),
-                        graph.logic_clusters.len()
-                    );
-                    graph.logic_index = logic_idx;
+    // L4: logic embeddings (raw body text via CodeRankEmbed)
+    if config.logic.enabled && config.embeddings.enabled {
+        match ontomics::logic::LogicIndex::new(logic_cache_dir) {
+            Ok(mut logic_idx) => {
+                let items: Vec<(u64, String)> = graph.signatures.iter()
+                    .filter_map(|sig| {
+                        let body = sig.body.as_ref()?;
+                        let entity = graph.entities.values().find(|e| {
+                            e.name == sig.name && e.file == sig.file
+                        })?;
+                        Some((entity.id, body.body_text.clone()))
+                    })
+                    .collect();
+                if let Err(e) = logic_idx.embed_batch(items) {
+                    eprintln!("Warning: logic embedding failed: {e}");
                 }
-                Err(e) => eprintln!("Warning: logic model unavailable: {e}"),
+                let entity_ids: Vec<u64> =
+                    graph.entities.keys().copied().collect();
+                graph.logic_clusters = ontomics::logic::cluster_logic(
+                    &logic_idx,
+                    &entity_ids,
+                    1.0 - config.logic.similarity_threshold,
+                );
+                let mut clusters = std::mem::take(&mut graph.logic_clusters);
+                let entity_cs = build_entity_call_sites(&graph);
+                ontomics::logic::label_clusters(&mut clusters, &entity_cs);
+                graph.logic_clusters = clusters;
+                eprintln!(
+                    "Logic: {} embeddings, {} clusters",
+                    logic_idx.nb_vectors(),
+                    graph.logic_clusters.len()
+                );
+                graph.logic_index = logic_idx;
             }
+            Err(e) => eprintln!("Warning: logic model unavailable: {e}"),
         }
     }
 
@@ -931,7 +921,7 @@ fn enrich_graph_with_embeddings_inner(
     if work.logic_enabled
         && !enrichment::is_generation_stale(&generation, my_gen)
     {
-        let (plan, entity_ids, pseudocode_snapshot) = {
+        let (plan, entity_ids) = {
             let g = match graph_handle.read() {
                 Ok(g) => g,
                 Err(e) => {
@@ -942,11 +932,10 @@ fn enrich_graph_with_embeddings_inner(
             let already: std::collections::HashSet<u64> =
                 g.logic_index.vector_ids().into_iter().collect();
             let plan = enrichment::compute_logic_plan(
-                &g.pseudocode, &already, work.logic_min_pseudocode_steps,
+                &g.signatures, &g.entities, &already,
             );
             let entity_ids: Vec<u64> = g.entities.keys().copied().collect();
-            let pseudocode_snapshot = g.pseudocode.clone();
-            (plan, entity_ids, pseudocode_snapshot)
+            (plan, entity_ids)
         };
 
         if !plan.is_empty() {
@@ -963,16 +952,18 @@ fn enrich_graph_with_embeddings_inner(
                         &entity_ids,
                         1.0 - work.logic_similarity_threshold,
                     );
-                    ontomics::logic::label_clusters(
-                        &mut new_clusters,
-                        &pseudocode_snapshot,
-                    );
 
-                    // Brief write lock only for the merge.
+                    // Brief write lock only for the merge + labeling.
                     if !enrichment::is_generation_stale(&generation, my_gen) {
                         if let Ok(mut g) = graph_handle.write() {
                             let ids: Vec<u64> = logic_idx.vector_ids();
                             enrichment::merge_logic_vectors(&mut g, &logic_idx, &ids);
+
+                            let entity_cs = build_entity_call_sites(&g);
+                            ontomics::logic::label_clusters(
+                                &mut new_clusters,
+                                &entity_cs,
+                            );
                             g.logic_clusters = new_clusters;
 
                             // Cross-reference logic and concept clusters
@@ -1979,21 +1970,7 @@ async fn run_server(
                         new_graph.entities.insert(ent.id, ent);
                     }
 
-                    // L4: pseudocode + centrality (no model needed)
-                    if watcher_config.logic.enabled {
-                        let wp_refs: Vec<(&dyn parser::LanguageParser, &str)> =
-                            watcher_parsers.iter()
-                                .map(|(p, n)| (&**p as &dyn parser::LanguageParser, n.as_str()))
-                                .collect();
-                        let pseudocode =
-                            ontomics::pseudocode::generate_all_pseudocode(
-                                &new_graph.entities,
-                                &new_graph.signatures,
-                                &wp_refs,
-                                watcher_config.logic.max_pseudocode_lines,
-                            );
-                        new_graph.pseudocode = pseudocode;
-                    }
+                    // L4: centrality (no model needed)
                     if watcher_config.centrality.enabled {
                         new_graph.centrality =
                             ontomics::centrality::compute_centrality(
@@ -2050,9 +2027,6 @@ async fn run_server(
                             logic_similarity_threshold: watcher_config
                                 .logic
                                 .similarity_threshold,
-                            logic_min_pseudocode_steps: watcher_config
-                                .logic
-                                .min_pseudocode_steps,
                         };
                         let bg_handle = Arc::clone(&graph_handle);
                         let bg_gen = Arc::clone(&generation);

@@ -342,7 +342,7 @@ impl EmbeddingModel for JinaCodeModel {
 // 3. CodeRankEmbed (contrastive code retrieval, CoRNStack)
 // ---------------------------------------------------------------------------
 
-const CODE_RANK_ID: &str = "nomic-ai/CodeRankEmbed";
+pub const CODE_RANK_ID: &str = "nomic-ai/CodeRankEmbed";
 
 pub(crate) struct CodeRankModel {
     model: NomicBertModel,

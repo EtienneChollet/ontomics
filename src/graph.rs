@@ -1,6 +1,5 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::logic::LogicIndex;
-use crate::pseudocode::format_pseudocode;
 use crate::tokenizer::{find_abbreviation, split_identifier};
 use crate::config::HealthConfig;
 use crate::types::{
@@ -10,7 +9,7 @@ use crate::types::{
     FileSymbol, FileNestingTree, InconsistencyPair, LocateConceptResult,
     LogicCluster, LogicClusterSummary, LogicDescription, MethodSummary,
     ModuleMapEntry, NameSuggestion, NamingCheckResult, PatternKind,
-    Pseudocode, QueryConceptParams, RelatedConcept, Relationship,
+    QueryConceptParams, RelatedConcept, Relationship,
     RelationshipKind, SessionBriefing, Signature, SimilarLogicResult,
     Subconcept, SymbolKind, TraceEdge, TraceNode, TraceRole, TypeFlow,
     TypeFlowResult, TypeFrequency, Verdict, VocabularyHealth,
@@ -119,8 +118,6 @@ pub struct ConceptGraph {
     pub entities: HashMap<u64, Entity>,
     /// Mean embedding per cluster label, computed after clustering.
     pub cluster_centroids: HashMap<usize, Vec<f32>>,
-    /// L4: Pseudocode for entities, keyed by entity ID.
-    pub pseudocode: HashMap<u64, Pseudocode>,
     /// L4: Logic embedding index for behavioral similarity search.
     pub logic_index: LogicIndex,
     /// L4: Clusters of entities with similar behavioral patterns.
@@ -159,7 +156,7 @@ impl ConceptGraph {
             call_sites: Vec::new(),
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -215,7 +212,7 @@ impl ConceptGraph {
             call_sites: analysis.call_sites,
             entities: entity_map,
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -3537,8 +3534,10 @@ impl ConceptGraph {
             e.name.to_lowercase() == name_lower
         })?;
 
-        let pc_text = self.pseudocode.get(&entity.id)
-            .map(format_pseudocode)
+        let body_text = self.signatures.iter()
+            .find(|sig| sig.name == entity.name && sig.file == entity.file)
+            .and_then(|sig| sig.body.as_ref())
+            .map(|b| b.body_text.clone())
             .unwrap_or_default();
 
         let cluster_summary = self.logic_clusters.iter()
@@ -3567,7 +3566,7 @@ impl ConceptGraph {
 
         Some(LogicDescription {
             entity: Self::entity_summary(entity),
-            pseudocode_text: pc_text,
+            body_text,
             logic_cluster: cluster_summary,
             centrality,
         })
@@ -3752,13 +3751,15 @@ impl ConceptGraph {
             }
             tiered.push(Section { priority: 2, text: structure });
 
-            // Priority 3: Behavior (pseudocode)
-            if let Some(pc) = self.pseudocode.get(&ent.id) {
-                let pc_text = format_pseudocode(pc);
-                if !pc_text.is_empty() {
+            // Priority 3: Behavior (raw body text)
+            if let Some(body) = self.signatures.iter()
+                .find(|sig| sig.name == ent.name && sig.file == ent.file)
+                .and_then(|sig| sig.body.as_ref())
+            {
+                if !body.body_text.is_empty() {
                     tiered.push(Section {
                         priority: 3,
-                        text: format!("## Behavior\n{}", pc_text),
+                        text: format!("## Behavior\n{}", body.body_text),
                     });
                 }
             }
@@ -3893,10 +3894,8 @@ impl ConceptGraph {
             total_chars / 4
         };
 
-        // Stage 1: Trim pseudocode (Behavior, priority 3) to first 2
+        // Stage 1: Trim body text (Behavior, priority 3) to first 2
         // + last 2 lines if >4 lines.
-        // Strip any existing omission banner from format_pseudocode to
-        // avoid double banners.
         if estimate(&tiered) > max_tokens {
             for s in &mut tiered {
                 if s.priority != 3 {
@@ -5664,16 +5663,39 @@ mod tests {
 
     fn make_graph_with_l4(
         entities: Vec<Entity>,
-        pseudocode: HashMap<u64, Pseudocode>,
+        signatures: Vec<Signature>,
         centrality: HashMap<u64, CentralityScore>,
     ) -> ConceptGraph {
         let mut graph = ConceptGraph::empty();
         for entity in entities {
             graph.entities.insert(entity.id, entity);
         }
-        graph.pseudocode = pseudocode;
+        graph.signatures = signatures;
         graph.centrality = centrality;
         graph
+    }
+
+    fn make_sig_with_body(name: &str, body_text: &str) -> Signature {
+        Signature {
+            name: name.to_string(),
+            params: vec![],
+            return_type: None,
+            decorators: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("test.py"),
+            line: 1,
+            scope: None,
+            body: Some(FunctionBody {
+                entity_name: name.to_string(),
+                scope: None,
+                body_text: body_text.to_string(),
+                language: "python".to_string(),
+                file: PathBuf::from("test.py"),
+                start_line: 2,
+                end_line: 5,
+                was_truncated: false,
+            }),
+        }
     }
 
     // --- describe_logic tests ---
@@ -5681,47 +5703,37 @@ mod tests {
     #[test]
     fn test_describe_logic_basic_flow() {
         let entity = make_entity(42, "process_data");
-        let pc = Pseudocode {
-            entity_id: 42,
-            steps: vec![PseudocodeStep::Call {
-                callee: "validate".into(),
-                args: vec![],
-            }],
-            body_hash: 0,
-            omitted_count: 0,
-        };
+        let sig = make_sig_with_body("process_data", "result = validate(data)\nreturn result");
         let centrality_score = CentralityScore {
             entity_id: 42,
             in_degree: 3,
             out_degree: 1,
             pagerank: 0.42,
         };
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(42, pc);
         let mut centrality = HashMap::new();
         centrality.insert(42, centrality_score);
 
-        let graph = make_graph_with_l4(vec![entity], pseudocode, centrality);
+        let graph = make_graph_with_l4(vec![entity], vec![sig], centrality);
         let result = graph.describe_logic("process_data");
 
         assert!(result.is_some());
         let desc = result.unwrap();
         assert_eq!(desc.entity.name, "process_data");
-        assert!(!desc.pseudocode_text.is_empty());
+        assert!(!desc.body_text.is_empty());
         assert!((desc.centrality.pagerank - 0.42).abs() < 1e-6);
         assert_eq!(desc.centrality.in_degree, 3);
         assert_eq!(desc.centrality.out_degree, 1);
     }
 
     #[test]
-    fn test_describe_logic_missing_pseudocode_returns_empty_text() {
+    fn test_describe_logic_missing_body_returns_empty_text() {
         let entity = make_entity(10, "my_func");
-        let graph = make_graph_with_l4(vec![entity], HashMap::new(), HashMap::new());
+        let graph = make_graph_with_l4(vec![entity], vec![], HashMap::new());
 
         let result = graph.describe_logic("my_func");
         assert!(result.is_some());
         let desc = result.unwrap();
-        assert_eq!(desc.pseudocode_text, "");
+        assert_eq!(desc.body_text, "");
         // Centrality defaults to zero when absent
         assert_eq!(desc.centrality.in_degree, 0);
         assert_eq!(desc.centrality.pagerank, 0.0);
@@ -5742,7 +5754,7 @@ mod tests {
             make_entity(2, "entity_b"),
             make_entity(3, "entity_c"),
         ];
-        let mut graph = make_graph_with_l4(entities, HashMap::new(), HashMap::new());
+        let mut graph = make_graph_with_l4(entities, vec![], HashMap::new());
         graph.logic_index.insert_vector(1, vec![1.0, 0.0, 0.0]);
         graph.logic_index.insert_vector(2, vec![0.9, 0.1, 0.0]);
         graph.logic_index.insert_vector(3, vec![0.0, 1.0, 0.0]);
@@ -5760,7 +5772,7 @@ mod tests {
     #[test]
     fn test_find_similar_logic_no_vector_returns_empty_similar() {
         let entity = make_entity(5, "bare_entity");
-        let graph = make_graph_with_l4(vec![entity], HashMap::new(), HashMap::new());
+        let graph = make_graph_with_l4(vec![entity], vec![], HashMap::new());
         // No vectors inserted into logic_index
 
         let result = graph.find_similar_logic("bare_entity", 5);
@@ -5779,26 +5791,17 @@ mod tests {
     #[test]
     fn test_compact_context_entity_scope_has_structure_and_behavior() {
         let entity = make_entity(7, "transform_vol");
-        let pc = Pseudocode {
-            entity_id: 7,
-            steps: vec![PseudocodeStep::Return {
-                value: Some("result".into()),
-            }],
-            body_hash: 0,
-            omitted_count: 0,
-        };
+        let sig = make_sig_with_body("transform_vol", "return apply(vol, trf)");
         let cs = CentralityScore {
             entity_id: 7,
             in_degree: 1,
             out_degree: 2,
             pagerank: 0.1,
         };
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(7, pc);
         let mut centrality = HashMap::new();
         centrality.insert(7, cs);
 
-        let graph = make_graph_with_l4(vec![entity], pseudocode, centrality);
+        let graph = make_graph_with_l4(vec![entity], vec![sig], centrality);
         let result = graph.compact_context("transform_vol", 500);
 
         assert!(result.is_some());
@@ -5848,22 +5851,15 @@ mod tests {
 
     #[test]
     fn test_compact_context_tiered_truncation_drops_low_priority_sections() {
-        // Entity with pseudocode (many steps), concept tags, logic cluster,
-        // centrality, and logic embeddings for "similar" entities — build a
-        // graph whose full context exceeds a tiny token budget so every
-        // truncation stage fires.
-        let steps: Vec<PseudocodeStep> = (0..10)
-            .map(|i| PseudocodeStep::Call {
-                callee: format!("step_{}", i),
-                args: vec![],
-            })
-            .collect();
-        let pc = Pseudocode {
-            entity_id: 1,
-            steps,
-            body_hash: 0,
-            omitted_count: 0,
-        };
+        // Entity with a long body, concept tags, logic cluster, centrality,
+        // and logic embeddings for "similar" entities — build a graph whose
+        // full context exceeds a tiny token budget so every truncation stage
+        // fires.
+        let long_body = (0..10)
+            .map(|i| format!("result_{i} = step_{i}(data)"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sig = make_sig_with_body("fn_a", &long_body);
         let cs = CentralityScore {
             entity_id: 1,
             in_degree: 5,
@@ -5883,15 +5879,13 @@ mod tests {
             behavioral_label: Some("transform".into()),
         };
 
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(1, pc);
         let mut centrality = HashMap::new();
         centrality.insert(1, cs);
 
         let peer = make_entity(2, "fn_b");
         let mut graph = make_graph_with_l4(
             vec![entity, peer],
-            pseudocode,
+            vec![sig],
             centrality,
         );
         graph.concepts.insert(10, concept);
@@ -5941,7 +5935,7 @@ mod tests {
         let entity = make_entity(20, "my_func");
         let graph = make_graph_with_l4(
             vec![entity],
-            HashMap::new(),
+            vec![],
             HashMap::new(),
         );
 
@@ -5967,7 +5961,7 @@ mod tests {
 
         let mut graph = make_graph_with_l4(
             vec![entity_a, entity_b],
-            HashMap::new(),
+            vec![],
             HashMap::new(),
         );
         graph.relationships.push(rel);

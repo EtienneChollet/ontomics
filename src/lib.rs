@@ -13,6 +13,5 @@ pub mod logic;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod parser;
-pub mod pseudocode;
 pub mod tokenizer;
 pub mod types;

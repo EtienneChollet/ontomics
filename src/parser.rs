@@ -349,6 +349,32 @@ pub fn rust_parser() -> RustParser {
 // Shared helpers used across language parsers
 // ---------------------------------------------------------------------------
 
+/// Normalize indentation by stripping the common leading whitespace from all
+/// non-empty lines. Equivalent to Python's `textwrap.dedent`.
+fn dedent(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let min_indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    if min_indent == 0 {
+        return text.to_string();
+    }
+    lines
+        .iter()
+        .map(|line| {
+            if line.len() >= min_indent {
+                &line[min_indent..]
+            } else {
+                line.trim()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Extract a `FunctionBody` from a body/block child node.
 fn extract_function_body(
     body_node: tree_sitter::Node,
@@ -356,15 +382,19 @@ fn extract_function_body(
     name: &str,
     scope: &Option<String>,
     path: &Path,
+    language: &str,
 ) -> Option<FunctionBody> {
-    let body_text = body_node.utf8_text(source).ok()?.to_string();
+    let raw = body_node.utf8_text(source).ok()?.to_string();
+    let body_text = dedent(&raw);
     Some(FunctionBody {
         entity_name: name.to_string(),
         scope: scope.clone(),
         body_text,
+        language: language.to_string(),
         file: path.to_path_buf(),
         start_line: body_node.start_position().row + 1,
         end_line: body_node.end_position().row + 1,
+        was_truncated: false,
     })
 }
 
@@ -945,7 +975,7 @@ fn py_extract_signature(
     let body = node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, &name, scope, path)
+            extract_function_body(b, source, &name, scope, path, "python")
         });
 
     Some(Signature {
@@ -1776,7 +1806,7 @@ fn rs_extract_function(
 
     let body = find_named_child_by_kind(node, "block")
         .and_then(|b| {
-            extract_function_body(b, source, name, scope, path)
+            extract_function_body(b, source, name, scope, path, "rust")
         });
 
     signatures.push(Signature {
@@ -2946,7 +2976,7 @@ fn ts_extract_function_signature(
     let body = node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, &name, scope, path)
+            extract_function_body(b, source, &name, scope, path, "typescript")
         });
 
     Some(Signature {
@@ -3011,7 +3041,7 @@ fn ts_extract_method_signature(
     let body = node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, &name, scope, path)
+            extract_function_body(b, source, &name, scope, path, "typescript")
         });
 
     Some(Signature {
@@ -3056,7 +3086,7 @@ fn ts_extract_arrow_signature(
     let body = arrow_node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, name, scope, path)
+            extract_function_body(b, source, name, scope, path, "typescript")
         });
 
     Some(Signature {
@@ -3348,7 +3378,7 @@ fn js_extract_function_signature(
     let body = node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, &name, scope, path)
+            extract_function_body(b, source, &name, scope, path, "javascript")
         });
 
     Some(Signature {
@@ -3396,7 +3426,7 @@ fn js_extract_method_signature(
     let body = node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, &name, scope, path)
+            extract_function_body(b, source, &name, scope, path, "javascript")
         });
 
     Some(Signature {
@@ -3435,7 +3465,7 @@ fn js_extract_arrow_signature(
     let body = arrow_node
         .child_by_field_name("body")
         .and_then(|b| {
-            extract_function_body(b, source, name, scope, path)
+            extract_function_body(b, source, name, scope, path, "javascript")
         });
 
     Some(Signature {

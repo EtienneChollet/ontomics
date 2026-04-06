@@ -13,7 +13,6 @@
 
 mod body_extraction {
     use ontomics::parser::{self, parse_content_with};
-    use ontomics::types::FunctionBody;
     use std::path::Path;
 
     fn parse_py(source: &str) -> ontomics::types::ParseResult {
@@ -196,322 +195,9 @@ class Loss:
 }
 
 // ============================================================================
-// 2. Pseudocode generation
-// ============================================================================
-
-mod pseudocode {
-    use ontomics::pseudocode::{format_pseudocode, generate_pseudocode};
-    use ontomics::parser;
-    use ontomics::types::{FunctionBody, LoopKind, PseudocodeStep};
-    use std::path::PathBuf;
-
-    fn make_body(text: &str) -> FunctionBody {
-        FunctionBody {
-            entity_name: "test_func".to_string(),
-            scope: None,
-            body_text: text.to_string(),
-            file: PathBuf::from("test.py"),
-            start_line: 2,
-            end_line: 2 + text.lines().count(),
-        }
-    }
-
-    #[test]
-    fn if_elif_else_produces_conditional() {
-        let body = make_body(
-            "\
-    if x > 0:
-        return x
-    elif x == 0:
-        return 0
-    else:
-        return -x
-",
-        );
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        // Should produce one Conditional step with 3 branches
-        let conditionals: Vec<_> = pseudo
-            .steps
-            .iter()
-            .filter(|s| matches!(s, PseudocodeStep::Conditional { .. }))
-            .collect();
-        assert_eq!(
-            conditionals.len(),
-            1,
-            "expected one Conditional step, got {}",
-            conditionals.len(),
-        );
-        if let PseudocodeStep::Conditional { branches } = &conditionals[0] {
-            assert_eq!(branches.len(), 3, "expected 3 branches (if/elif/else)");
-            // First branch has a condition
-            assert!(
-                branches[0].condition.is_some(),
-                "if-branch must have a condition",
-            );
-            // Second branch (elif) has a condition
-            assert!(
-                branches[1].condition.is_some(),
-                "elif-branch must have a condition",
-            );
-            // Third branch (else) has no condition
-            assert!(
-                branches[2].condition.is_none(),
-                "else-branch must have condition=None",
-            );
-        }
-    }
-
-    #[test]
-    fn for_loop_with_nested_call() {
-        let body = make_body(
-            "\
-    for item in items:
-        process(item)
-",
-        );
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        let loops: Vec<_> = pseudo
-            .steps
-            .iter()
-            .filter(|s| matches!(s, PseudocodeStep::Loop { .. }))
-            .collect();
-        assert_eq!(loops.len(), 1, "expected one Loop step");
-        if let PseudocodeStep::Loop { kind, body } = &loops[0] {
-            assert!(
-                matches!(kind, LoopKind::For { .. }),
-                "expected For loop kind",
-            );
-            if let LoopKind::For { variable, iterable } = kind {
-                assert_eq!(variable, "item");
-                assert_eq!(iterable, "items");
-            }
-            // Body should contain a Call to process
-            let has_call = body.iter().any(|s| {
-                matches!(s, PseudocodeStep::Call { callee, .. } if callee == "process")
-            });
-            assert!(has_call, "for-loop body should contain Call to 'process'");
-        }
-    }
-
-    #[test]
-    fn while_loop() {
-        let body = make_body(
-            "\
-    while not converged:
-        step()
-",
-        );
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        let loops: Vec<_> = pseudo
-            .steps
-            .iter()
-            .filter(|s| matches!(s, PseudocodeStep::Loop { .. }))
-            .collect();
-        assert_eq!(loops.len(), 1);
-        if let PseudocodeStep::Loop { kind, .. } = &loops[0] {
-            assert!(
-                matches!(kind, LoopKind::While { .. }),
-                "expected While loop kind",
-            );
-        }
-    }
-
-    #[test]
-    fn return_statement() {
-        let body = make_body("    return result\n");
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        let returns: Vec<_> = pseudo
-            .steps
-            .iter()
-            .filter(|s| matches!(s, PseudocodeStep::Return { .. }))
-            .collect();
-        assert_eq!(returns.len(), 1);
-        if let PseudocodeStep::Return { value } = &returns[0] {
-            assert_eq!(value.as_deref(), Some("result"));
-        }
-    }
-
-    #[test]
-    fn assignment_from_function_call() {
-        let body = make_body("    x = compute(a, b)\n");
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        let assigns: Vec<_> = pseudo
-            .steps
-            .iter()
-            .filter(|s| matches!(s, PseudocodeStep::Assignment { .. }))
-            .collect();
-        assert_eq!(assigns.len(), 1);
-        if let PseudocodeStep::Assignment { target, source } = &assigns[0] {
-            assert_eq!(target, "x");
-            assert!(
-                source.contains("compute"),
-                "assignment source should reference 'compute': {:?}",
-                source,
-            );
-        }
-    }
-
-    #[test]
-    fn nested_control_flow() {
-        let body = make_body(
-            "\
-    for i in range(n):
-        if i % 2 == 0:
-            process(i)
-",
-        );
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        // Top level: one Loop
-        assert_eq!(pseudo.steps.len(), 1);
-        if let PseudocodeStep::Loop { body, .. } = &pseudo.steps[0] {
-            // Inside the loop: one Conditional
-            let has_conditional = body
-                .iter()
-                .any(|s| matches!(s, PseudocodeStep::Conditional { .. }));
-            assert!(
-                has_conditional,
-                "loop body should contain a Conditional step",
-            );
-        } else {
-            panic!("expected top-level Loop step");
-        }
-    }
-
-    #[test]
-    fn trivial_function_minimal_steps() {
-        let body = make_body("    return self.x\n");
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        assert_eq!(
-            pseudo.steps.len(),
-            1,
-            "trivial function should produce exactly 1 step",
-        );
-        assert!(matches!(&pseudo.steps[0], PseudocodeStep::Return { .. }));
-    }
-
-    #[test]
-    fn format_pseudocode_readable() {
-        let body = make_body(
-            "\
-    if x > 0:
-        y = compute(x)
-        return y
-    else:
-        return 0
-",
-        );
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-        let text = format_pseudocode(&pseudo);
-
-        assert!(!text.is_empty(), "formatted pseudocode should not be empty");
-        // Should be human-readable with indentation
-        assert!(
-            text.contains("  "),
-            "formatted pseudocode should use indentation",
-        );
-        // Should reference the key operations
-        assert!(
-            text.to_lowercase().contains("if") || text.to_lowercase().contains("conditional"),
-            "formatted text should mention conditional: {:?}",
-            text,
-        );
-    }
-
-    #[test]
-    fn truncation_at_max_lines() {
-        // Build a body with many statements to trigger truncation
-        let mut lines = Vec::new();
-        for i in 0..50 {
-            lines.push(format!("    x_{i} = compute_{i}()"));
-        }
-        let body_text = lines.join("\n") + "\n";
-        let body = make_body(&body_text);
-        let py = parser::python_parser();
-        // max_lines = 10 should trigger truncation
-        let pseudo = generate_pseudocode(&body, &py, 10).expect("generation failed");
-
-        assert!(
-            pseudo.steps.len() <= 10,
-            "truncation should limit steps to max_lines={}: got {}",
-            10,
-            pseudo.steps.len(),
-        );
-    }
-
-    #[test]
-    fn expression_simplification_literals_replaced() {
-        let body = make_body(
-            "\
-    x = 'hello world'
-    y = 42
-    z = compute(x, y)
-",
-        );
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        // String/number literals in assignments should be simplified
-        let text = format_pseudocode(&pseudo);
-        assert!(
-            !text.contains("hello world"),
-            "literal strings should be simplified away: {:?}",
-            text,
-        );
-        // But function names should be kept
-        assert!(
-            text.contains("compute"),
-            "function names should be preserved: {:?}",
-            text,
-        );
-    }
-
-    #[test]
-    fn empty_function_body_produces_empty_steps() {
-        // Python pass-only function
-        let body = make_body("    pass\n");
-        let py = parser::python_parser();
-        let pseudo = generate_pseudocode(&body, &py, 30).expect("generation failed");
-
-        assert!(
-            pseudo.steps.is_empty(),
-            "pass-only function should produce 0 steps: got {}",
-            pseudo.steps.len(),
-        );
-    }
-
-    #[test]
-    fn body_hash_changes_with_content() {
-        let body_a = make_body("    return 1\n");
-        let body_b = make_body("    return 2\n");
-        let py = parser::python_parser();
-        let pseudo_a = generate_pseudocode(&body_a, &py, 30).expect("gen a failed");
-        let pseudo_b = generate_pseudocode(&body_b, &py, 30).expect("gen b failed");
-
-        assert_ne!(
-            pseudo_a.body_hash, pseudo_b.body_hash,
-            "different bodies should produce different hashes",
-        );
-    }
-}
-
-// ============================================================================
 // 3. Logic embeddings
 // ============================================================================
+// (section 2 — pseudocode tests — deleted: pipeline removed in v0.3.0)
 
 mod logic_embeddings {
     use ontomics::logic::LogicIndex;
@@ -535,73 +221,73 @@ mod logic_embeddings {
 
     #[test]
     #[ignore] // requires model download
-    fn embed_pseudocode_correct_dimensionality() {
+    fn embed_body_correct_dimensionality() {
         let mut index = LogicIndex::new(None).expect("failed to load model");
         let text = "\
-IF condition:
-  CALL compute_loss(pred, target)
-  RETURN loss
-ELSE:
-  RETURN 0
+if condition:
+    loss = compute_loss(pred, target)
+    return loss
+else:
+    return 0
 ";
         let vector = index
-            .embed_pseudocode(1, text)
+            .embed_body(1, text)
             .expect("embedding failed");
         assert_eq!(
             vector.len(),
-            384,
-            "bge-small-en-v1.5 produces 384-dimensional vectors",
+            768,
+            "CodeRankEmbed produces 768-dimensional vectors",
         );
     }
 
     #[test]
     #[ignore] // requires model download
-    fn similar_pseudocode_high_similarity() {
+    fn similar_bodies_high_similarity() {
         let mut index = LogicIndex::new(None).expect("failed to load model");
 
         let loss_a = "\
-ASSIGN diff = CALL subtract(pred, target)
-ASSIGN squared = CALL pow(diff, 2)
-RETURN CALL mean(squared)
+diff = pred - target
+squared = diff ** 2
+return squared.mean()
 ";
         let loss_b = "\
-ASSIGN error = CALL subtract(prediction, ground_truth)
-ASSIGN sq_error = CALL square(error)
-RETURN CALL reduce_mean(sq_error)
+error = prediction - ground_truth
+sq_error = error ** 2
+return sq_error.mean()
 ";
-        let vec_a = index.embed_pseudocode(1, loss_a).expect("embed a failed");
-        let vec_b = index.embed_pseudocode(2, loss_b).expect("embed b failed");
+        let vec_a = index.embed_body(1, loss_a).expect("embed a failed");
+        let vec_b = index.embed_body(2, loss_b).expect("embed b failed");
 
         let sim = cosine_similarity(&vec_a, &vec_b);
         assert!(
             sim > 0.5,
-            "similar loss pseudocode should have similarity > 0.5, got {sim}",
+            "similar loss bodies should have similarity > 0.5, got {sim}",
         );
     }
 
     #[test]
     #[ignore] // requires model download
-    fn unrelated_pseudocode_low_similarity() {
+    fn unrelated_bodies_low_similarity() {
         let mut index = LogicIndex::new(None).expect("failed to load model");
 
         let loss_code = "\
-ASSIGN diff = CALL subtract(pred, target)
-RETURN CALL mean(CALL pow(diff, 2))
+diff = pred - target
+return (diff ** 2).mean()
 ";
         let loader_code = "\
-CALL open_file(path)
-FOR line IN CALL read_lines(file):
-  CALL parse(line)
-  CALL append(data, parsed)
-RETURN data
+with open(path) as f:
+    for line in f:
+        parsed = parse(line)
+        data.append(parsed)
+return data
 ";
-        let vec_a = index.embed_pseudocode(1, loss_code).expect("embed a");
-        let vec_b = index.embed_pseudocode(2, loader_code).expect("embed b");
+        let vec_a = index.embed_body(1, loss_code).expect("embed a");
+        let vec_b = index.embed_body(2, loader_code).expect("embed b");
 
         let sim = cosine_similarity(&vec_a, &vec_b);
         assert!(
             sim < 0.3,
-            "unrelated pseudocode should have similarity < 0.3, got {sim}",
+            "unrelated bodies should have similarity < 0.3, got {sim}",
         );
     }
 
@@ -610,14 +296,14 @@ RETURN data
     fn find_similar_ranked_by_descending_similarity() {
         let mut index = LogicIndex::new(None).expect("failed to load model");
 
-        // Embed 3 pseudocode snippets with varying relatedness
-        let loss_mse = "ASSIGN diff = CALL subtract(pred, target)\nRETURN CALL mean(CALL pow(diff, 2))";
-        let loss_dice = "ASSIGN inter = CALL sum(CALL multiply(pred, target))\nRETURN CALL subtract(1, CALL divide(inter, union))";
-        let loader = "CALL open(path)\nFOR item IN data:\n  CALL process(item)\nRETURN results";
+        // Embed 3 code snippets with varying relatedness
+        let loss_mse = "diff = pred - target\nreturn (diff ** 2).mean()";
+        let loss_dice = "inter = (pred * target).sum()\nreturn 1 - inter / union";
+        let loader = "with open(path) as f:\n    for item in data:\n        process(item)\nreturn results";
 
-        index.embed_pseudocode(10, loss_mse).expect("embed mse");
-        index.embed_pseudocode(20, loss_dice).expect("embed dice");
-        index.embed_pseudocode(30, loader).expect("embed loader");
+        index.embed_body(10, loss_mse).expect("embed mse");
+        index.embed_body(20, loss_dice).expect("embed dice");
+        index.embed_body(30, loader).expect("embed loader");
 
         // Query with the MSE loss vector
         let query = index
@@ -658,10 +344,10 @@ RETURN data
     fn find_similar_to_entity_excludes_self() {
         let mut index = LogicIndex::new(None).expect("failed to load model");
         index
-            .embed_pseudocode(1, "RETURN CALL compute(x)")
+            .embed_body(1, "return compute(x)")
             .expect("embed");
         index
-            .embed_pseudocode(2, "RETURN CALL transform(y)")
+            .embed_body(2, "return transform(y)")
             .expect("embed");
 
         let results = index
@@ -679,8 +365,9 @@ RETURN data
 
 mod logic_clustering {
     use ontomics::logic::{cluster_logic, label_clusters, LogicIndex};
-    use ontomics::types::{LogicCluster, Pseudocode, PseudocodeStep};
+    use ontomics::types::{CallSite, LogicCluster};
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn empty_input_no_clusters() {
@@ -692,7 +379,6 @@ mod logic_clustering {
     #[test]
     fn single_entity_singleton_cluster() {
         let mut index = LogicIndex::empty();
-        // Insert a synthetic vector directly
         index.insert_vector(1, vec![1.0, 0.0, 0.0]);
         let clusters = cluster_logic(&index, &[1], 0.30);
         assert_eq!(clusters.len(), 1, "single entity should produce 1 cluster");
@@ -703,12 +389,10 @@ mod logic_clustering {
     #[test]
     fn identical_vectors_same_cluster() {
         let mut index = LogicIndex::empty();
-        // Two entities with identical vectors should cluster together
         index.insert_vector(1, vec![1.0, 0.0, 0.0]);
         index.insert_vector(2, vec![1.0, 0.0, 0.0]);
         let clusters = cluster_logic(&index, &[1, 2], 0.30);
 
-        // Both should be in the same cluster
         assert_eq!(clusters.len(), 1, "identical vectors should form 1 cluster");
         assert_eq!(clusters[0].entity_ids.len(), 2);
     }
@@ -716,7 +400,6 @@ mod logic_clustering {
     #[test]
     fn unrelated_vectors_different_clusters() {
         let mut index = LogicIndex::empty();
-        // Orthogonal vectors should not cluster
         index.insert_vector(1, vec![1.0, 0.0, 0.0]);
         index.insert_vector(2, vec![0.0, 1.0, 0.0]);
         index.insert_vector(3, vec![0.0, 0.0, 1.0]);
@@ -739,43 +422,26 @@ mod logic_clustering {
         }];
 
         // Both entities call mse_loss
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(
-            1,
-            Pseudocode {
-                entity_id: 1,
-                steps: vec![
-                    PseudocodeStep::Call {
-                        callee: "mse_loss".to_string(),
-                        args: vec!["pred".to_string(), "target".to_string()],
-                    },
-                    PseudocodeStep::Return {
-                        value: Some("loss".to_string()),
-                    },
-                ],
-                body_hash: 111,
-                omitted_count: 0,
+        let call_sites = [
+            CallSite {
+                caller_scope: Some("fn_a".into()),
+                callee: "mse_loss".into(),
+                file: PathBuf::from("a.py"),
+                line: 10,
             },
-        );
-        pseudocode.insert(
-            2,
-            Pseudocode {
-                entity_id: 2,
-                steps: vec![
-                    PseudocodeStep::Call {
-                        callee: "mse_loss".to_string(),
-                        args: vec!["output".to_string(), "label".to_string()],
-                    },
-                    PseudocodeStep::Return {
-                        value: Some("result".to_string()),
-                    },
-                ],
-                body_hash: 222,
-                omitted_count: 0,
+            CallSite {
+                caller_scope: Some("fn_b".into()),
+                callee: "mse_loss".into(),
+                file: PathBuf::from("b.py"),
+                line: 20,
             },
-        );
+        ];
 
-        label_clusters(&mut clusters, &pseudocode);
+        let mut entity_cs: HashMap<u64, Vec<&CallSite>> = HashMap::new();
+        entity_cs.entry(1).or_default().push(&call_sites[0]);
+        entity_cs.entry(2).or_default().push(&call_sites[1]);
+
+        label_clusters(&mut clusters, &entity_cs);
 
         let label = clusters[0]
             .behavioral_label
@@ -994,8 +660,7 @@ mod integration {
 
     /// Build a full L4 graph for a codebase. This reuses the testbed
     /// infrastructure for parsing + L1-L3, then runs the L4 pipeline
-    /// (body extraction, pseudocode, logic embeddings, clustering,
-    /// centrality) on top.
+    /// (body extraction, logic embeddings, clustering, centrality) on top.
     ///
     /// Returns None if the codebase is not available locally.
     fn build_l4_graph(
@@ -1008,7 +673,6 @@ mod integration {
         use ontomics::graph::ConceptGraph;
         use ontomics::logic::LogicIndex;
         use ontomics::parser::{self, ParseOptions};
-        use ontomics::pseudocode;
         use ontomics::centrality;
         use ontomics::types;
         use std::collections::HashMap;
@@ -1112,25 +776,17 @@ mod integration {
 
         // --- L4 pipeline ---
 
-        // Generate pseudocode for all entities with bodies
-        let parser_refs: Vec<(&dyn parser::LanguageParser, &str)> =
-            vec![(&*lang as &dyn parser::LanguageParser, language_name)];
-        let all_pseudocode = pseudocode::generate_all_pseudocode(
-            &graph.entities,
-            &graph.signatures,
-            &parser_refs,
-            30, // max_pseudocode_lines
-        );
-        graph.pseudocode = all_pseudocode;
-
-        // Logic embeddings
+        // Logic embeddings: embed raw function bodies
         let mut logic_index = LogicIndex::new(None)
             .unwrap_or_else(|_| LogicIndex::empty());
-        let embed_items: Vec<(u64, String)> = graph
-            .pseudocode
-            .iter()
-            .filter(|(_, p)| p.steps.len() >= 3)
-            .map(|(&id, p)| (id, pseudocode::format_pseudocode(p)))
+        let embed_items: Vec<(u64, String)> = graph.signatures.iter()
+            .filter_map(|sig| {
+                let body = sig.body.as_ref()?;
+                let entity = graph.entities.values().find(|e| {
+                    e.name == sig.name && e.file == sig.file
+                })?;
+                Some((entity.id, body.body_text.clone()))
+            })
             .collect();
         if !embed_items.is_empty() {
             let _ = logic_index.embed_batch(embed_items);
@@ -1145,7 +801,19 @@ mod integration {
             .collect();
         let mut logic_clusters =
             ontomics::logic::cluster_logic(&graph.logic_index, &entity_ids, 0.30);
-        ontomics::logic::label_clusters(&mut logic_clusters, &graph.pseudocode);
+
+        // Build entity → call_sites map for label_clusters
+        let mut entity_call_sites: HashMap<u64, Vec<&types::CallSite>> = HashMap::new();
+        for cs in &graph.call_sites {
+            if let Some(scope) = &cs.caller_scope {
+                if let Some(entity) = graph.entities.values().find(|e| {
+                    e.name == *scope && e.file == cs.file
+                }) {
+                    entity_call_sites.entry(entity.id).or_default().push(cs);
+                }
+            }
+        }
+        ontomics::logic::label_clusters(&mut logic_clusters, &entity_call_sites);
         graph.logic_clusters = logic_clusters;
 
         // Centrality
@@ -1164,7 +832,7 @@ mod integration {
 
     #[test]
     #[ignore] // requires voxelmorph codebase + model download
-    fn voxelmorph_pseudocode_for_spatial_transformer() {
+    fn voxelmorph_body_for_spatial_transformer() {
         let graph = match build_l4_graph("/home/eti/projects/voxelmorph") {
             Some(g) => g,
             None => return,
@@ -1175,16 +843,16 @@ mod integration {
             .expect("describe_logic should find SpatialTransformer");
 
         assert!(
-            !desc.pseudocode_text.is_empty(),
-            "SpatialTransformer should have non-empty pseudocode",
+            !desc.body_text.is_empty(),
+            "SpatialTransformer should have non-empty body text",
         );
         // SpatialTransformer.forward() fundamentally does grid generation
-        // and grid sampling. The pseudocode should reference these operations.
-        let text_lower = desc.pseudocode_text.to_lowercase();
+        // and grid sampling. The body should reference these operations.
+        let text_lower = desc.body_text.to_lowercase();
         assert!(
             text_lower.contains("grid") || text_lower.contains("sample"),
-            "SpatialTransformer pseudocode should contain grid/sample operations: {:?}",
-            desc.pseudocode_text,
+            "SpatialTransformer body should contain grid/sample operations: {:?}",
+            desc.body_text,
         );
     }
 
@@ -1206,7 +874,7 @@ mod integration {
                 "MSE and Dice should be in the same logic cluster (both compute loss metrics)",
             );
         }
-        // If one of them doesn't have pseudocode (e.g., trivial body), that's
+        // If one of them doesn't have a body (e.g., trivial), that's
         // acceptable -- the test verifies the clustering when both are present.
     }
 
@@ -1289,7 +957,7 @@ mod integration {
             "compact_context should produce non-empty text",
         );
         // Should contain structural info (entity names, kind)
-        // and behavioral info (pseudocode or logic cluster)
+        // and behavioral info (body text or logic cluster)
         let text_lower = ctx.text.to_lowercase();
         assert!(
             text_lower.contains("transform") || text_lower.contains("spatial"),
@@ -1430,29 +1098,46 @@ mod integration {
 // ============================================================================
 
 mod mcp_tools {
-    use ontomics::centrality;
     use ontomics::graph::ConceptGraph;
-    use ontomics::logic::LogicIndex;
-    use ontomics::pseudocode;
     use ontomics::types::{
-        CentralityScore, Entity, EntityKind, LogicCluster, Pseudocode,
-        PseudocodeStep, Relationship, RelationshipKind,
+        CentralityScore, Entity, EntityKind, FunctionBody, LogicCluster,
+        Relationship, RelationshipKind, Signature,
     };
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     /// Build a minimal graph with L4 data for tool testing.
     fn build_test_graph() -> ConceptGraph {
-        use ontomics::types::{AnalysisResult, Concept, Convention, Signature};
+        use ontomics::types::AnalysisResult;
 
-        // Minimal L1-L3 data
+        let sig_loss = Signature {
+            name: "compute_loss".to_string(),
+            params: vec![],
+            return_type: None,
+            decorators: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("losses.py"),
+            line: 10,
+            scope: None,
+            body: Some(FunctionBody {
+                entity_name: "compute_loss".to_string(),
+                scope: None,
+                body_text: "diff = subtract(pred, target)\nsquared = pow(diff, 2)\nreturn mean(squared)".to_string(),
+                language: "python".to_string(),
+                file: PathBuf::from("losses.py"),
+                start_line: 11,
+                end_line: 13,
+                was_truncated: false,
+            }),
+        };
+
         let analysis = AnalysisResult {
             concepts: vec![],
             conventions: vec![],
             co_occurrence_matrix: vec![],
-            signatures: vec![],
+            signatures: vec![sig_loss],
             classes: vec![],
             call_sites: vec![],
+            nesting_trees: vec![],
         };
         let embeddings = ontomics::embeddings::EmbeddingIndex::empty();
 
@@ -1494,29 +1179,6 @@ mod mcp_tools {
         )
         .expect("graph build failed");
 
-        // Populate L4 data manually
-        graph.pseudocode.insert(
-            100,
-            Pseudocode {
-                entity_id: 100,
-                steps: vec![
-                    PseudocodeStep::Assignment {
-                        target: "diff".to_string(),
-                        source: "subtract(pred, target)".to_string(),
-                    },
-                    PseudocodeStep::Assignment {
-                        target: "squared".to_string(),
-                        source: "pow(diff, 2)".to_string(),
-                    },
-                    PseudocodeStep::Return {
-                        value: Some("mean(squared)".to_string()),
-                    },
-                ],
-                body_hash: 12345,
-                omitted_count: 0,
-            },
-        );
-
         graph.centrality.insert(
             100,
             CentralityScore {
@@ -1547,21 +1209,21 @@ mod mcp_tools {
     }
 
     #[test]
-    fn describe_logic_returns_pseudocode_and_centrality() {
+    fn describe_logic_returns_body_and_centrality() {
         let graph = build_test_graph();
         let desc = graph
             .describe_logic("compute_loss")
             .expect("describe_logic should find compute_loss");
 
         assert!(
-            !desc.pseudocode_text.is_empty(),
-            "pseudocode_text should not be empty",
+            !desc.body_text.is_empty(),
+            "body_text should not be empty",
         );
         assert!(
-            desc.pseudocode_text.contains("subtract")
-                || desc.pseudocode_text.contains("diff"),
-            "pseudocode should reference loss operations: {:?}",
-            desc.pseudocode_text,
+            desc.body_text.contains("subtract")
+                || desc.body_text.contains("diff"),
+            "body should reference loss operations: {:?}",
+            desc.body_text,
         );
         assert_eq!(desc.centrality.entity_id, 100);
         assert_eq!(desc.centrality.out_degree, 1);
@@ -1600,14 +1262,14 @@ mod mcp_tools {
     }
 
     #[test]
-    fn describe_logic_entity_without_pseudocode() {
+    fn describe_logic_entity_without_body() {
         let graph = build_test_graph();
-        // SpatialTransformer has centrality but no pseudocode in our test graph
+        // SpatialTransformer has centrality but no signature/body in our test graph
         let desc = graph.describe_logic("SpatialTransformer");
         if let Some(d) = desc {
             assert!(
-                d.pseudocode_text.is_empty(),
-                "entity without pseudocode should have empty pseudocode_text",
+                d.body_text.is_empty(),
+                "entity without body should have empty body_text",
             );
             // But centrality should still be populated
             assert_eq!(d.centrality.entity_id, 200);
@@ -1655,13 +1317,12 @@ mod mcp_tools {
             .expect("compact_context should resolve");
 
         let text_lower = ctx.text.to_lowercase();
-        // Should contain the entity name
         assert!(
             text_lower.contains("compute_loss"),
             "compact context should mention entity name: {:?}",
             ctx.text,
         );
-        // Should contain behavioral info (pseudocode or description)
+        // Should contain behavioral info (body text or description)
         assert!(
             text_lower.contains("subtract")
                 || text_lower.contains("diff")
@@ -1692,8 +1353,8 @@ mod graph_l4_fields {
     #[test]
     fn empty_graph_has_l4_fields() {
         let graph = ConceptGraph::empty();
-        assert!(graph.pseudocode.is_empty());
         assert!(graph.logic_clusters.is_empty());
         assert!(graph.centrality.is_empty());
+        assert_eq!(graph.logic_index.nb_vectors(), 0);
     }
 }
