@@ -470,17 +470,13 @@ impl Default for HealthConfig {
 pub struct LogicConfig {
     pub enabled: bool,
     pub similarity_threshold: f32,
-    pub max_pseudocode_lines: usize,
-    pub min_pseudocode_steps: usize,
 }
 
 impl Default for LogicConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            similarity_threshold: 0.70,
-            max_pseudocode_lines: 30,
-            min_pseudocode_steps: 3,
+            similarity_threshold: 0.50,
         }
     }
 }

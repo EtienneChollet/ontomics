@@ -831,11 +831,11 @@ fn tool_definitions() -> Vec<Tool> {
         Tool::new(
             "describe_logic",
             "Describe the behavioral logic of a function or class — returns \
-             pseudocode (structured control flow summary), logic cluster \
-             membership (which other entities behave similarly), and structural \
-             centrality (PageRank importance in the dependency graph). Use when \
-             asked 'what does this function do internally', 'how does X work at \
-             a high level', or 'what is the logic of X'.",
+             the raw function body, logic cluster membership (which other \
+             entities behave similarly), and structural centrality (PageRank \
+             importance in the dependency graph). Use when asked 'what does \
+             this function do internally', 'how does X work at a high level', \
+             or 'what is the logic of X'.",
             tool_schema(
                 json!({
                     "name": {
@@ -871,9 +871,9 @@ fn tool_definitions() -> Vec<Tool> {
         Tool::new(
             "compact_context",
             "Assemble minimal, token-efficient context for a concept, entity, \
-             or file — combines pseudocode + structural summary + domain \
+             or file — combines function body + structural summary + domain \
              concepts + logic cluster into a compact text block suitable for \
-             LLM prompt injection. Much smaller than raw source while \
+             LLM prompt injection. Much smaller than full source while \
              preserving behavioral and structural information. Use when \
              assembling context for another LLM, when asked to 'summarize X \
              compactly', or when building prompts about codebase entities.",

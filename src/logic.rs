@@ -1,7 +1,7 @@
 // L4: Logic embedding index and behavioral clustering.
 
 use crate::embeddings::{self, EmbeddingModel};
-use crate::types::{LogicCluster, Pseudocode, PseudocodeStep};
+use crate::types::{CallSite, LogicCluster};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,9 +27,9 @@ impl LogicIndex {
         })
     }
 
-    /// Initialize logic index with the default BGE-small model.
+    /// Initialize logic index with the default CodeRankEmbed model.
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        Self::new_with_model(embeddings::BGE_SMALL_ID, cache_dir)
+        Self::new_with_model(embeddings::CODE_RANK_ID, cache_dir)
     }
 
     /// Create an empty logic index (no model, empty vectors).
@@ -37,8 +37,8 @@ impl LogicIndex {
         Self::default()
     }
 
-    /// Embed pseudocode text for a single entity.
-    pub fn embed_pseudocode(
+    /// Embed raw function body text for a single entity.
+    pub fn embed_body(
         &mut self,
         entity_id: u64,
         text: &str,
@@ -56,7 +56,7 @@ impl LogicIndex {
         Ok(vector)
     }
 
-    /// Batch embed pseudocode for multiple entities.
+    /// Batch embed function body text for multiple entities.
     pub fn embed_batch(&mut self, items: Vec<(u64, String)>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -335,45 +335,27 @@ fn compute_centroid(vectors: &[&[f32]], dim: usize) -> Vec<f32> {
     centroid
 }
 
-/// Label logic clusters by the most common callee across member pseudocode.
+/// Label logic clusters by the most common callee across member call sites.
+///
+/// `entity_call_sites` maps entity IDs to their call sites (built from
+/// the graph's call_sites + entity scopes).
 pub fn label_clusters(
     clusters: &mut [LogicCluster],
-    pseudocode: &HashMap<u64, Pseudocode>,
+    entity_call_sites: &HashMap<u64, Vec<&CallSite>>,
 ) {
     for cluster in clusters.iter_mut() {
         let mut callee_counts: HashMap<&str, usize> = HashMap::new();
         for entity_id in &cluster.entity_ids {
-            if let Some(pc) = pseudocode.get(entity_id) {
-                collect_callees(&pc.steps, &mut callee_counts);
+            if let Some(sites) = entity_call_sites.get(entity_id) {
+                for cs in sites {
+                    *callee_counts.entry(cs.callee.as_str()).or_insert(0) += 1;
+                }
             }
         }
-        // Find the most common callee
         cluster.behavioral_label = callee_counts
             .into_iter()
             .max_by_key(|(_, count)| *count)
             .map(|(callee, _)| callee.to_string());
-    }
-}
-
-fn collect_callees<'a>(
-    steps: &'a [PseudocodeStep],
-    counts: &mut HashMap<&'a str, usize>,
-) {
-    for step in steps {
-        match step {
-            PseudocodeStep::Call { callee, .. } => {
-                *counts.entry(callee.as_str()).or_insert(0) += 1;
-            }
-            PseudocodeStep::Conditional { branches } => {
-                for branch in branches {
-                    collect_callees(&branch.body, counts);
-                }
-            }
-            PseudocodeStep::Loop { body, .. } => {
-                collect_callees(body, counts);
-            }
-            _ => {}
-        }
     }
 }
 
@@ -419,7 +401,6 @@ pub fn cross_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ConditionalBranch;
 
     #[test]
     fn test_empty_index_has_zero_vectors() {
@@ -589,41 +570,16 @@ mod tests {
 
     #[test]
     fn test_label_clusters_extracts_most_common_callee() {
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(
-            1,
-            Pseudocode {
-                entity_id: 1,
-                steps: vec![
-                    PseudocodeStep::Call {
-                        callee: "process".to_string(),
-                        args: vec![],
-                    },
-                    PseudocodeStep::Call {
-                        callee: "validate".to_string(),
-                        args: vec![],
-                    },
-                    PseudocodeStep::Call {
-                        callee: "process".to_string(),
-                        args: vec![],
-                    },
-                ],
-                body_hash: 0,
-                omitted_count: 0,
-            },
-        );
-        pseudocode.insert(
-            2,
-            Pseudocode {
-                entity_id: 2,
-                steps: vec![PseudocodeStep::Call {
-                    callee: "process".to_string(),
-                    args: vec![],
-                }],
-                body_hash: 0,
-                omitted_count: 0,
-            },
-        );
+        use std::path::PathBuf;
+        let sites = vec![
+            CallSite { caller_scope: Some("f1".into()), callee: "process".into(), file: PathBuf::from("a.py"), line: 1 },
+            CallSite { caller_scope: Some("f1".into()), callee: "validate".into(), file: PathBuf::from("a.py"), line: 2 },
+            CallSite { caller_scope: Some("f1".into()), callee: "process".into(), file: PathBuf::from("a.py"), line: 3 },
+            CallSite { caller_scope: Some("f2".into()), callee: "process".into(), file: PathBuf::from("a.py"), line: 4 },
+        ];
+        let mut entity_cs: HashMap<u64, Vec<&CallSite>> = HashMap::new();
+        entity_cs.insert(1, sites.iter().filter(|cs| cs.caller_scope.as_deref() == Some("f1")).collect());
+        entity_cs.insert(2, sites.iter().filter(|cs| cs.caller_scope.as_deref() == Some("f2")).collect());
 
         let mut clusters = vec![LogicCluster {
             id: 0,
@@ -632,75 +588,13 @@ mod tests {
             behavioral_label: None,
         }];
 
-        label_clusters(&mut clusters, &pseudocode);
-        assert_eq!(
-            clusters[0].behavioral_label.as_deref(),
-            Some("process")
-        );
-    }
-
-    #[test]
-    fn test_label_clusters_with_nested_calls() {
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(
-            1,
-            Pseudocode {
-                entity_id: 1,
-                steps: vec![
-                    PseudocodeStep::Conditional {
-                        branches: vec![ConditionalBranch {
-                            condition: Some("x > 0".to_string()),
-                            body: vec![
-                                PseudocodeStep::Call {
-                                    callee: "inner".to_string(),
-                                    args: vec![],
-                                },
-                                PseudocodeStep::Call {
-                                    callee: "inner".to_string(),
-                                    args: vec![],
-                                },
-                            ],
-                        }],
-                    },
-                    PseudocodeStep::Call {
-                        callee: "outer".to_string(),
-                        args: vec![],
-                    },
-                ],
-                body_hash: 0,
-                omitted_count: 0,
-            },
-        );
-
-        let mut clusters = vec![LogicCluster {
-            id: 0,
-            entity_ids: vec![1],
-            centroid: vec![],
-            behavioral_label: None,
-        }];
-
-        label_clusters(&mut clusters, &pseudocode);
-        // "inner" appears twice, "outer" once
-        assert_eq!(
-            clusters[0].behavioral_label.as_deref(),
-            Some("inner")
-        );
+        label_clusters(&mut clusters, &entity_cs);
+        assert_eq!(clusters[0].behavioral_label.as_deref(), Some("process"));
     }
 
     #[test]
     fn test_label_clusters_no_calls_means_no_label() {
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(
-            1,
-            Pseudocode {
-                entity_id: 1,
-                steps: vec![PseudocodeStep::Return {
-                    value: Some("42".to_string()),
-                }],
-                body_hash: 0,
-                omitted_count: 0,
-            },
-        );
+        let entity_cs: HashMap<u64, Vec<&CallSite>> = HashMap::new();
 
         let mut clusters = vec![LogicCluster {
             id: 0,
@@ -709,7 +603,7 @@ mod tests {
             behavioral_label: None,
         }];
 
-        label_clusters(&mut clusters, &pseudocode);
+        label_clusters(&mut clusters, &entity_cs);
         assert!(clusters[0].behavioral_label.is_none());
     }
 
@@ -820,12 +714,12 @@ mod tests {
 
     #[test]
     #[ignore] // requires model download
-    fn test_embed_pseudocode_produces_vector() {
+    fn test_embed_body_produces_vector() {
         let mut idx = LogicIndex::new(None).unwrap();
         let vec = idx
-            .embed_pseudocode(1, "CALL process(item)\nRETURN result")
+            .embed_body(1, "result = process(item)\nreturn result")
             .unwrap();
-        assert_eq!(vec.len(), 384); // BGE-Small dimension
+        assert_eq!(vec.len(), 768); // CodeRankEmbed dimension
         let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01);
     }
@@ -835,26 +729,26 @@ mod tests {
     fn test_embed_batch_stores_vectors() {
         let mut idx = LogicIndex::new(None).unwrap();
         let items = vec![
-            (1, "CALL process(item)\nRETURN result".to_string()),
-            (2, "FOR x IN items:\n  CALL validate(x)".to_string()),
+            (1, "result = process(item)\nreturn result".to_string()),
+            (2, "for x in items:\n    validate(x)".to_string()),
         ];
         idx.embed_batch(items).unwrap();
         assert_eq!(idx.nb_vectors(), 2);
-        assert_eq!(idx.get_vector(1).unwrap().len(), 384);
-        assert_eq!(idx.get_vector(2).unwrap().len(), 384);
+        assert_eq!(idx.get_vector(1).unwrap().len(), 768);
+        assert_eq!(idx.get_vector(2).unwrap().len(), 768);
     }
 
     #[test]
-    fn test_embed_pseudocode_no_model() {
+    fn test_embed_body_no_model() {
         let mut idx = LogicIndex::empty();
-        let result = idx.embed_pseudocode(1, "CALL foo()");
+        let result = idx.embed_body(1, "return foo()");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_embed_batch_no_model() {
         let mut idx = LogicIndex::empty();
-        let result = idx.embed_batch(vec![(1, "CALL foo()".to_string())]);
+        let result = idx.embed_batch(vec![(1, "return foo()".to_string())]);
         assert!(result.is_err());
     }
 

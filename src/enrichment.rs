@@ -1,8 +1,8 @@
 use crate::embeddings::EmbeddingIndex;
 use crate::graph::ConceptGraph;
 use crate::logic::LogicIndex;
-use crate::types::{Concept, Pseudocode};
-use std::collections::{HashMap, HashSet};
+use crate::types::{Concept, Signature};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Determine which concepts still need embedding vectors.
@@ -44,18 +44,25 @@ pub fn is_generation_stale(
 }
 
 /// Determine which entities still need logic embedding vectors.
+///
+/// Collects (entity_id, body_text) pairs from signatures that have
+/// function bodies and are not yet embedded.
 pub fn compute_logic_plan(
-    pseudocode: &HashMap<u64, Pseudocode>,
+    signatures: &[Signature],
+    entities: &std::collections::HashMap<u64, crate::types::Entity>,
     already_embedded: &HashSet<u64>,
-    min_steps: usize,
 ) -> Vec<(u64, String)> {
-    pseudocode
+    signatures
         .iter()
-        .filter(|(id, pc)| {
-            !already_embedded.contains(id) && pc.steps.len() >= min_steps
-        })
-        .map(|(id, pc)| {
-            (*id, crate::pseudocode::format_pseudocode(pc))
+        .filter_map(|sig| {
+            let body = sig.body.as_ref()?;
+            let entity = entities.values().find(|e| {
+                e.name == sig.name && e.file == sig.file
+            })?;
+            if already_embedded.contains(&entity.id) {
+                return None;
+            }
+            Some((entity.id, body.body_text.clone()))
         })
         .collect()
 }
@@ -115,7 +122,6 @@ mod tests {
             call_sites: Vec::new(),
             entities: std::collections::HashMap::new(),
             cluster_centroids: std::collections::HashMap::new(),
-            pseudocode: std::collections::HashMap::new(),
             logic_index: crate::logic::LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: std::collections::HashMap::new(),
@@ -317,36 +323,68 @@ mod tests {
 
     // --- L4: compute_logic_plan and merge_logic_vectors tests ---
 
-    fn make_pseudocode(entity_id: u64, nb_steps: usize) -> Pseudocode {
-        Pseudocode {
-            entity_id,
-            steps: (0..nb_steps)
-                .map(|i| crate::types::PseudocodeStep::Call {
-                    callee: format!("callee_{i}"),
-                    args: vec![],
-                })
-                .collect(),
-            body_hash: 0,
-            omitted_count: 0,
+    use crate::types::{Entity, EntityKind, FunctionBody};
+
+    fn make_entity(id: u64, name: &str) -> Entity {
+        Entity {
+            id,
+            name: name.to_string(),
+            kind: EntityKind::Function,
+            file: PathBuf::from("test.py"),
+            line: 1,
+            concept_tags: vec![],
+            semantic_role: String::new(),
+            signature_idx: None,
+            class_info_idx: None,
         }
     }
 
     #[test]
-    fn test_compute_logic_plan_filters_by_min_steps() {
-        let mut pseudocode = HashMap::new();
-        pseudocode.insert(1, make_pseudocode(1, 1));
-        pseudocode.insert(2, make_pseudocode(2, 3));
-        pseudocode.insert(3, make_pseudocode(3, 5));
+    fn test_compute_logic_plan_collects_bodies() {
+        let sigs = vec![
+            Signature {
+                name: "foo".to_string(),
+                params: vec![],
+                return_type: None,
+                decorators: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 1,
+                scope: None,
+                body: Some(FunctionBody {
+                    entity_name: "foo".to_string(),
+                    scope: None,
+                    body_text: "return 1".to_string(),
+                    language: "python".to_string(),
+                    file: PathBuf::from("test.py"),
+                    start_line: 2,
+                    end_line: 2,
+                    was_truncated: false,
+                }),
+            },
+            Signature {
+                name: "bar".to_string(),
+                params: vec![],
+                return_type: None,
+                decorators: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("test.py"),
+                line: 5,
+                scope: None,
+                body: None,
+            },
+        ];
+        let mut entities = std::collections::HashMap::new();
+        entities.insert(1, make_entity(1, "foo"));
+        entities.insert(2, make_entity(2, "bar"));
 
         let already: HashSet<u64> = HashSet::new();
-        let plan = super::compute_logic_plan(&pseudocode, &already, 3);
+        let plan = super::compute_logic_plan(&sigs, &entities, &already);
 
-        // Only entity_ids 2 and 3 have >= 3 steps
-        assert_eq!(plan.len(), 2);
-        let ids: HashSet<u64> = plan.iter().map(|(id, _)| *id).collect();
-        assert!(ids.contains(&2));
-        assert!(ids.contains(&3));
-        assert!(!ids.contains(&1));
+        // Only "foo" has a body
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, 1);
+        assert_eq!(plan[0].1, "return 1");
     }
 
     #[test]

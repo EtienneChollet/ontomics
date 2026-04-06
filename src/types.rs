@@ -550,41 +550,14 @@ pub struct FunctionBody {
     pub entity_name: String,
     pub scope: Option<String>,
     pub body_text: String,
+    pub language: String,
     pub file: PathBuf,
     pub start_line: usize,
     pub end_line: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pseudocode {
-    pub entity_id: u64,
-    pub steps: Vec<PseudocodeStep>,
-    pub body_hash: u64,
     #[serde(default)]
-    pub omitted_count: usize,
+    pub was_truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PseudocodeStep {
-    Call { callee: String, args: Vec<String> },
-    Conditional { branches: Vec<ConditionalBranch> },
-    Loop { kind: LoopKind, body: Vec<PseudocodeStep> },
-    Return { value: Option<String> },
-    Assignment { target: String, source: String },
-    Yield { value: Option<String> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConditionalBranch {
-    pub condition: Option<String>,
-    pub body: Vec<PseudocodeStep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LoopKind {
-    For { variable: String, iterable: String },
-    While { condition: String },
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogicCluster {
@@ -606,7 +579,7 @@ pub struct CentralityScore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogicDescription {
     pub entity: EntitySummary,
-    pub pseudocode_text: String,
+    pub body_text: String,
     pub logic_cluster: Option<LogicClusterSummary>,
     pub centrality: CentralityScore,
 }

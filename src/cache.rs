@@ -3,7 +3,7 @@ use crate::graph::ConceptGraph;
 use crate::logic::LogicIndex;
 use crate::types::{
     CallSite, CentralityScore, ClassInfo, Concept, Convention, Entity,
-    LogicCluster, ParseResult, Pseudocode, Relationship, Signature,
+    LogicCluster, ParseResult, Relationship, Signature,
 };
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -38,8 +38,6 @@ struct CachedGraph {
     classes: Vec<ClassInfo>,
     call_sites: Vec<CallSite>,
     entities: HashMap<u64, Entity>,
-    #[serde(default)]
-    pseudocode: HashMap<u64, Pseudocode>,
     #[serde(default)]
     logic_index: LogicIndex,
     #[serde(default)]
@@ -249,7 +247,6 @@ impl IndexCache {
             classes: graph.classes.clone(),
             call_sites: graph.call_sites.clone(),
             entities: graph.entities.clone(),
-            pseudocode: graph.pseudocode.clone(),
             logic_index: serde_json::from_value(serde_json::to_value(&graph.logic_index)?)?,
             logic_clusters: graph.logic_clusters.clone(),
             centrality: graph.centrality.clone(),
@@ -469,7 +466,6 @@ impl IndexCache {
             call_sites: cached.call_sites,
             entities: cached.entities,
             cluster_centroids: HashMap::new(),
-            pseudocode: cached.pseudocode,
             logic_index: cached.logic_index,
             logic_clusters: cached.logic_clusters,
             centrality: cached.centrality,
@@ -690,7 +686,7 @@ mod tests {
             call_sites: Vec::new(),
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: crate::logic::LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -971,7 +967,7 @@ mod tests {
             call_sites,
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: crate::logic::LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -1089,7 +1085,7 @@ mod tests {
             entities: HashMap::new(),
             call_sites: Vec::new(),
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: crate::logic::LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -1163,7 +1159,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: crate::logic::LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -1292,7 +1288,7 @@ mod tests {
             call_sites: Vec::new(),
             entities: HashMap::new(),
             cluster_centroids: HashMap::new(),
-            pseudocode: HashMap::new(),
+
             logic_index: crate::logic::LogicIndex::empty(),
             logic_clusters: Vec::new(),
             centrality: HashMap::new(),
@@ -1374,50 +1370,17 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// L4 fields (pseudocode, logic_clusters, centrality) survive a cache
+    /// L4 fields (logic_clusters, centrality, logic_index) survive a cache
     /// save/load round-trip without data loss.
     #[test]
     fn test_cache_roundtrip_l4_fields() {
-        use crate::types::{
-            CentralityScore, LogicCluster, Pseudocode, PseudocodeStep,
-        };
+        use crate::types::{CentralityScore, LogicCluster};
 
         let dir = Path::new("/tmp/ontomics_test_cache_l4_roundtrip");
         let _ = fs::remove_dir_all(dir);
         fs::create_dir_all(dir).unwrap();
 
         let mut graph = make_test_graph();
-
-        // Populate pseudocode
-        graph.pseudocode.insert(
-            10,
-            Pseudocode {
-                entity_id: 10,
-                steps: vec![
-                    PseudocodeStep::Call {
-                        callee: "validate".to_string(),
-                        args: vec![],
-                    },
-                    PseudocodeStep::Return {
-                        value: Some("result".to_string()),
-                    },
-                ],
-                body_hash: 0xdeadbeef,
-                omitted_count: 0,
-            },
-        );
-        graph.pseudocode.insert(
-            20,
-            Pseudocode {
-                entity_id: 20,
-                steps: vec![PseudocodeStep::Call {
-                    callee: "compute".to_string(),
-                    args: vec![],
-                }],
-                body_hash: 0xcafe,
-                omitted_count: 0,
-            },
-        );
 
         // Populate logic_clusters
         graph.logic_clusters = vec![
@@ -1455,20 +1418,13 @@ mod tests {
             },
         );
 
-        // Also inject a logic vector
+        // Inject logic vectors
         graph.logic_index.insert_vector(10, vec![0.9, 0.1, 0.0]);
         graph.logic_index.insert_vector(20, vec![0.1, 0.9, 0.0]);
 
         let cache = IndexCache::open(dir).unwrap();
         cache.save(&graph, "python").unwrap();
         let loaded = cache.load("python").unwrap().expect("cache must load");
-
-        // Pseudocode keys preserved
-        assert_eq!(loaded.pseudocode.len(), 2);
-        assert!(loaded.pseudocode.contains_key(&10));
-        assert!(loaded.pseudocode.contains_key(&20));
-        assert_eq!(loaded.pseudocode[&10].body_hash, 0xdeadbeef);
-        assert_eq!(loaded.pseudocode[&10].steps.len(), 2);
 
         // Logic clusters preserved
         assert_eq!(loaded.logic_clusters.len(), 2);
