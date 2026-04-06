@@ -11,7 +11,7 @@
 ![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
 ![pi](https://img.shields.io/badge/pi--coding--agent-blue)
 
-ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code and makes them queryable via [MCP](https://modelcontextprotocol.io/).
+ontomics extracts domain knowledge from codebases to reduce LLM token consumption by 20x and time in agentic search by 10x. It gathers the concepts, naming conventions, and vocabulary embedded in your code — and groups functions by behavioral similarity — making all of it queryable via [MCP](https://modelcontextprotocol.io/).
 
 ## Benchmark
 
@@ -39,9 +39,27 @@ Both conditions produced complete, correct answers. ontomics got there in one ca
 
 ## What it does that search can't
 
-Search tells you where a string appears. An LSP tells you where a symbol is defined and referenced. Neither answers: what are the domain concepts in this codebase? How do they relate? What naming conventions emerged? What changed in the domain vocabulary since last release?
+Search tells you where a string appears. An LSP tells you where a symbol is defined and referenced. Neither answers: what are the domain concepts in this codebase? How do they relate? What naming conventions emerged? What changed in the domain vocabulary since last release? Which functions behave similarly, regardless of what they're named?
 
-ontomics builds a semantic index of your project's domain — clustering related symbols into concepts, detecting naming conventions from usage frequency, resolving abbreviations, and tracking how the vocabulary evolves over time. That index can be exported as a portable artifact to bootstrap conventions in other repos.
+ontomics builds a semantic index of your project's domain — clustering related symbols into concepts, detecting naming conventions from usage frequency, resolving abbreviations, grouping functions by behavioral similarity, and tracking how the vocabulary evolves over time. That index can be exported as a portable artifact to bootstrap conventions in other repos.
+
+### Behavioral similarity
+
+Beyond naming and concepts, ontomics embeds raw function bodies using [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed) (768-dim, contrastive code retrieval) and clusters them by behavioral similarity. This surfaces relationships that neither naming nor call graphs expose:
+
+```
+❯ What functions behave like spatial_transform()?
+
+  random_transform()   nn/functional.py:352   0.80
+  spatial_transform()  functional.py:596      0.69
+  random_transform()   functional.py:1399     0.67
+  random_disp()        nn/functional.py:275   0.65
+  integrate_disp()     functional.py:764      0.65
+  compose()            nn/functional.py:216   0.63
+  disp_to_trf()        functional.py:343      0.62
+```
+
+The result also reveals that `random_transform` appears at two locations with different similarity scores — a sign of implementation duplication that concept-level search would miss entirely.
 
 ## Install
 
@@ -113,6 +131,8 @@ Python, TypeScript, JavaScript, Rust. Auto-detected from file extensions.
 
 ## Tools
 
+### Concepts and vocabulary
+
 | Tool | What it does |
 |------|--------------|
 | `query_concept` | Find all variants, related concepts, and occurrences of a term |
@@ -128,6 +148,23 @@ Python, TypeScript, JavaScript, Rust. Auto-detected from file extensions.
 | `ontology_diff` | Show new, changed, or removed domain concepts since a git ref |
 | `export_domain_pack` | Export domain knowledge as portable YAML for use in other repos |
 
+### Behavioral similarity
+
+| Tool | What it does |
+|------|--------------|
+| `find_similar_logic` | Find functions with behaviorally similar implementations, ranked by embedding similarity |
+| `describe_logic` | Get the behavioral description, body text, and logic cluster membership for a function |
+| `compact_context` | Assemble tiered context (concepts + logic) for a symbol, optimized for LLM consumption |
+
+### Codebase structure
+
+| Tool | What it does |
+|------|--------------|
+| `describe_file` | Overview of a file's entities, concepts, and relationships |
+| `concept_map` | Show which modules contain which domain concepts |
+| `type_flows` | Show dominant types and how data flows through the codebase |
+| `trace_type` | Trace how a specific type propagates across files and call sites |
+
 ### Resources
 
 | Resource | What it does |
@@ -136,6 +173,14 @@ Python, TypeScript, JavaScript, Rust. Auto-detected from file extensions.
 
 ## How it works
 
-ontomics parses every file in your repo, extracts identifiers and docstrings, clusters related terms by embedding similarity, and detects naming conventions through frequency analysis. The index lives at `<repo>/.ontomics/index.db` — subsequent startups load from cache and watch for changes.
+ontomics runs a multi-stage pipeline entirely on your machine — no API keys required:
+
+1. **Parse** — tree-sitter extracts every identifier, signature, and call site from your source files
+2. **Analyze** — TF-IDF scoring identifies domain-specific concepts and detects naming conventions
+3. **Embed (concepts)** — BGE-small (384-dim) clusters related concepts by semantic similarity
+4. **Embed (logic)** — CodeRankEmbed (768-dim) embeds raw function bodies and clusters them by behavioral similarity
+5. **Centrality** — PageRank scores entities by structural importance
+
+Both embedding models are downloaded once on first run and cached locally. The index lives at `<repo>/.ontomics/index.db` — subsequent startups load from cache and watch for file changes.
 
 Configuration via `.ontomics/config.toml` in the repo root. All fields have sensible defaults. See `SPEC.md` for the full design contract.
