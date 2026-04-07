@@ -913,4 +913,61 @@ mod tests {
         // Last tag "loss" should be the primary tag
         assert!(entities[0].semantic_role.starts_with("loss"));
     }
+
+    // --- Regression test: focal_loss must not be dropped when called from a method ---
+
+    #[test]
+    fn test_top_level_function_called_from_method_is_promoted() {
+        // Replicates the interseg3d scenario where focal_loss is a top-level
+        // function called from FocalDiceLoss.forward.  Phase 2 must not skip
+        // it because its scope is None, not a class scope.
+        let classes = vec![ClassInfo {
+            name: "FocalDiceLoss".to_string(),
+            bases: vec!["nn.Module".to_string()],
+            methods: vec!["forward".to_string()],
+            attributes: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("losses.py"),
+            line: 100,
+        }];
+        let sigs = vec![
+            Signature {
+                name: "focal_loss".to_string(),
+                params: vec![],
+                return_type: None,
+                decorators: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("losses.py"),
+                line: 20,
+                scope: None,
+                body: None,
+            },
+            Signature {
+                name: "forward".to_string(),
+                params: vec![],
+                return_type: None,
+                decorators: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("losses.py"),
+                line: 140,
+                scope: Some("FocalDiceLoss".to_string()),
+                body: None,
+            },
+        ];
+        let call_sites = vec![CallSite {
+            caller_scope: Some("FocalDiceLoss.forward".to_string()),
+            callee: "focal_loss".to_string(),
+            file: PathBuf::from("losses.py"),
+            line: 164,
+        }];
+        let concepts = make_concepts(&[(1, "focal"), (2, "loss"), (3, "dice")]);
+        let (entities, _) = build_entities(&sigs, &classes, &call_sites, &concepts);
+        let focal_loss_entity = entities.iter().find(|e| e.name == "focal_loss");
+        assert!(
+            focal_loss_entity.is_some(),
+            "focal_loss must be promoted as an entity; got: {:?}",
+            entities.iter().map(|e| (&e.name, &e.kind)).collect::<Vec<_>>()
+        );
+        assert_eq!(focal_loss_entity.unwrap().kind, EntityKind::Function);
+    }
 }

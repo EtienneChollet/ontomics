@@ -1388,18 +1388,23 @@ impl ConceptGraph {
             }
         }
 
-        for entities in clustered.values_mut() {
-            entities.sort_by(|a, b| {
+        // Sort within each cluster: Functions and Classes before Methods (to
+        // ensure top-level domain entities are not crowded out by method
+        // entities when top_k is a binding constraint), then by domain density.
+        let rank_kind = |e: &Entity| {
+            if e.kind == crate::types::EntityKind::Method { 0u8 } else { 1u8 }
+        };
+        let entity_sort = |a: &&Entity, b: &&Entity| {
+            rank_kind(b).cmp(&rank_kind(a)).then_with(|| {
                 self.domain_density(b)
                     .partial_cmp(&self.domain_density(a))
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            })
+        };
+        for entities in clustered.values_mut() {
+            entities.sort_by(entity_sort);
         }
-        unclustered.sort_by(|a, b| {
-            self.domain_density(b)
-                .partial_cmp(&self.domain_density(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        unclustered.sort_by(entity_sort);
 
         let mut cluster_labels: Vec<usize> = clustered.keys().copied().collect();
         cluster_labels.sort_by(|a, b| {
