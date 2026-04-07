@@ -1586,7 +1586,8 @@ impl ConceptGraph {
                     .iter()
                     .filter(|r| {
                         (r.kind == RelationshipKind::InheritsFrom
-                            || r.kind == RelationshipKind::Uses)
+                            || r.kind == RelationshipKind::Uses
+                            || r.kind == RelationshipKind::MemberOf)
                             && (r.source == e.id || r.target == e.id)
                     })
                     .filter_map(|r| {

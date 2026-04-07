@@ -5,6 +5,23 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Build a lookup from (class_name, method_name) -> Signature index for methods.
+fn build_method_sig_index(
+    signatures: &[Signature],
+    class_names: &HashSet<&str>,
+) -> HashMap<(String, String), usize> {
+    let mut index = HashMap::new();
+    for (idx, sig) in signatures.iter().enumerate() {
+        if let Some(ref scope) = sig.scope {
+            let scope_root = scope.split('.').next().unwrap_or(scope);
+            if class_names.contains(scope_root) {
+                index.entry((scope_root.to_string(), sig.name.clone())).or_insert(idx);
+            }
+        }
+    }
+    index
+}
+
 const MIN_PREFIX_LEN: usize = 4;
 
 /// Match a subtoken to a concept canonical via prefix overlap.
@@ -101,6 +118,71 @@ pub fn build_entities(
                 kind: RelationshipKind::Instantiates,
                 weight: 1.0,
             });
+        }
+    }
+
+    // Phase 1.5: Create method entities for all methods of promoted classes.
+    // Promotion criterion: class entity was created in Phase 1.
+    let method_sig_index = build_method_sig_index(signatures, &class_names);
+
+    // Index promoted class entities by name so we can look up their IDs.
+    let promoted_class_ids: HashMap<String, u64> = entities
+        .iter()
+        .filter(|e| e.kind == EntityKind::Class)
+        .map(|e| (e.name.clone(), e.id))
+        .collect();
+
+    for class in classes {
+        let class_entity_id = match promoted_class_ids.get(&class.name) {
+            Some(&id) => id,
+            None => continue,
+        };
+
+        for method_name in &class.methods {
+            let sig_idx = method_sig_index.get(&(class.name.clone(), method_name.clone()));
+
+            let (file, line) = sig_idx
+                .map(|&i| (signatures[i].file.clone(), signatures[i].line))
+                .unwrap_or_else(|| (class.file.clone(), class.line));
+
+            let actual_sig_idx = sig_idx.copied();
+
+            let subtokens = split_identifier(method_name);
+            let concept_tags: Vec<u64> = subtokens
+                .iter()
+                .filter_map(|st| match_concept(st, &concept_by_canonical))
+                .collect();
+
+            let method_id = Entity::hash_id(method_name, &file, line);
+            entities.push(Entity {
+                id: method_id,
+                name: method_name.clone(),
+                kind: EntityKind::Method,
+                concept_tags: concept_tags.clone(),
+                semantic_role: String::new(),
+                file,
+                line,
+                signature_idx: actual_sig_idx,
+                class_info_idx: None,
+            });
+
+            // MemberOf edge: method -> owning class
+            relationships.push(Relationship {
+                source: method_id,
+                target: class_entity_id,
+                kind: RelationshipKind::MemberOf,
+                weight: 1.0,
+            });
+
+            // Instantiates edges: method -> concept
+            for &concept_id in &concept_tags {
+                relationships.push(Relationship {
+                    source: method_id,
+                    target: concept_id,
+                    kind: RelationshipKind::Instantiates,
+                    weight: 1.0,
+                });
+            }
         }
     }
 
@@ -354,9 +436,10 @@ mod tests {
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
         let (entities, _) = build_entities(&[], &classes, &[], &concepts);
-        assert_eq!(entities.len(), 1);
-        assert_eq!(entities[0].kind, EntityKind::Class);
-        assert_eq!(entities[0].concept_tags.len(), 3);
+        // Class entity + one method entity (forward)
+        assert_eq!(entities.len(), 2);
+        let class_entity = entities.iter().find(|e| e.kind == EntityKind::Class).unwrap();
+        assert_eq!(class_entity.concept_tags.len(), 3);
     }
 
     #[test]
@@ -517,7 +600,8 @@ mod tests {
             (4, "transformer"),
         ]);
         let (entities, rels) = build_entities(&[], &classes, &call_sites, &concepts);
-        assert_eq!(entities.len(), 2);
+        // VxmDense class + VxmDense.forward method + SpatialTransformer class
+        assert_eq!(entities.len(), 3);
         let uses = rels
             .iter()
             .filter(|r| r.kind == RelationshipKind::Uses)
@@ -596,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_methods_excluded_from_top_level_entities() {
+    fn test_methods_not_promoted_as_top_level_function_entities() {
         let classes = vec![ClassInfo {
             name: "FocalDiceLoss".to_string(),
             bases: vec![],
@@ -623,9 +707,104 @@ mod tests {
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
         let (entities, _) = build_entities(&sigs, &classes, &[], &concepts);
-        // Only the class should be an entity, not the method
-        assert_eq!(entities.len(), 1);
-        assert_eq!(entities[0].name, "FocalDiceLoss");
+        // Method is promoted as a Method entity, not a Function entity
+        assert!(entities.iter().all(|e| e.kind != EntityKind::Function || e.name != "forward"));
+        let method = entities.iter().find(|e| e.name == "forward");
+        assert!(method.is_some());
+        assert_eq!(method.unwrap().kind, EntityKind::Method);
+    }
+
+    // --- Method entity promotion tests ---
+
+    #[test]
+    fn test_method_entities_created_for_promoted_class() {
+        let classes = vec![ClassInfo {
+            name: "SpatialTransformer".to_string(),
+            bases: vec![],
+            methods: vec!["forward".to_string(), "build_grid".to_string()],
+            attributes: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("layers.py"),
+            line: 10,
+        }];
+        // Class is promoted via concept match on "spatial"
+        let concepts = make_concepts(&[(1, "spatial"), (2, "transformer")]);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let method_entities: Vec<_> =
+            entities.iter().filter(|e| e.kind == EntityKind::Method).collect();
+        assert_eq!(method_entities.len(), 2);
+        let names: Vec<&str> =
+            method_entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"forward"));
+        assert!(names.contains(&"build_grid"));
+    }
+
+    #[test]
+    fn test_method_entity_has_member_of_edge_to_class() {
+        let classes = vec![ClassInfo {
+            name: "LossModule".to_string(),
+            bases: vec![],
+            methods: vec!["forward".to_string()],
+            attributes: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("loss.py"),
+            line: 5,
+        }];
+        let concepts = make_concepts(&[(1, "loss"), (2, "module")]);
+        let (entities, rels) = build_entities(&[], &classes, &[], &concepts);
+        let class_entity = entities.iter().find(|e| e.kind == EntityKind::Class).unwrap();
+        let method_entity = entities.iter().find(|e| e.kind == EntityKind::Method).unwrap();
+        let member_of = rels.iter().find(|r| r.kind == RelationshipKind::MemberOf);
+        assert!(member_of.is_some());
+        assert_eq!(member_of.unwrap().source, method_entity.id);
+        assert_eq!(member_of.unwrap().target, class_entity.id);
+    }
+
+    #[test]
+    fn test_method_entity_concept_tags_from_name() {
+        let classes = vec![ClassInfo {
+            name: "VxmDense".to_string(),
+            bases: vec![],
+            methods: vec!["spatial_transform".to_string(), "init".to_string()],
+            attributes: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("models.py"),
+            line: 1,
+        }];
+        // "spatial" and "transform" are concepts; "vxm" and "dense" too
+        let concepts = make_concepts(&[
+            (1, "vxm"), (2, "dense"), (3, "spatial"), (4, "transform"),
+        ]);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let spatial_transform = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Method && e.name == "spatial_transform")
+            .unwrap();
+        // Should match "spatial" and "transform" concepts
+        assert_eq!(spatial_transform.concept_tags.len(), 2);
+        // "init" has no concept match — still promoted (class membership is enough)
+        let init = entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Method && e.name == "init")
+            .unwrap();
+        assert!(init.concept_tags.is_empty());
+    }
+
+    #[test]
+    fn test_methods_not_promoted_for_non_promoted_class() {
+        let classes = vec![ClassInfo {
+            name: "HelperUtil".to_string(),
+            bases: vec![],
+            methods: vec!["run".to_string()],
+            attributes: vec![],
+            docstring_first_line: None,
+            file: PathBuf::from("utils.py"),
+            line: 1,
+        }];
+        // No concepts match "HelperUtil", no references — class not promoted
+        let concepts = make_concepts(&[(1, "loss")]);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        assert!(entities.is_empty(), "no entities when class is not promoted");
     }
 
     // --- Semantic role inference tests ---

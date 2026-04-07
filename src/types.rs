@@ -67,6 +67,7 @@ pub enum RelationshipKind {
     Instantiates,
     InheritsFrom,
     Uses,
+    MemberOf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
