@@ -1,3 +1,4 @@
+use crate::ontology_md;
 use ontomics::diff;
 use ontomics::graph::ConceptGraph;
 use ontomics::parser::LanguageParser;
@@ -325,6 +326,14 @@ fn handle_describe_symbol(
             "message": format!("no symbol matching '{name}'"),
         })),
     }
+}
+
+fn handle_generate_ontology_md(
+    ctx: &ToolContext,
+    _args: &Value,
+) -> Result<Value, String> {
+    let md = ontology_md::generate_ontology_md(ctx.graph);
+    Ok(json!({"markdown": md}))
 }
 
 fn handle_locate_concept(
@@ -1142,6 +1151,20 @@ fn build_registry() -> ToolRegistry {
         ),
         handle_trace_type,
     );
+    r.register(
+        "generate_ontology_md",
+        Tool::new(
+            "generate_ontology_md",
+            "Generate a human-readable ONTOLOGY.md from the concept graph \
+             — returns a Markdown document covering domain concepts, naming \
+             conventions, abbreviations, key entities by PageRank, and \
+             top co-occurrence relationships. Use when asked to 'generate \
+             ONTOLOGY.md', 'export the ontology as markdown', or 'create \
+             a domain summary document'.",
+            tool_schema(json!({}), &[]),
+        ),
+        handle_generate_ontology_md,
+    );
     r
 }
 
@@ -1537,7 +1560,7 @@ mod tests {
     #[test]
     fn test_registry_definitions_count() {
         let registry = build_registry();
-        assert_eq!(registry.definitions().len(), 19);
+        assert_eq!(registry.definitions().len(), 20);
     }
 
     #[test]
