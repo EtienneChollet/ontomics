@@ -12,6 +12,7 @@ use ontomics::graph;
 #[cfg(feature = "lsp")]
 use ontomics::lsp;
 use ontomics::parser;
+use ontomics::resolve;
 use ontomics::types;
 
 use clap::{Parser as ClapParser, Subcommand};
@@ -386,6 +387,13 @@ fn build_graph(
 
     eprintln!("Total: {} parsed files", all_parse_results.len());
 
+    // Collect and resolve import statements from all parse results
+    let mut all_imports: Vec<types::ImportStatement> = all_parse_results
+        .iter()
+        .flat_map(|r| r.imports.iter().cloned())
+        .collect();
+    resolve::resolve_imports(&mut all_imports, repo);
+
     let analysis_params = analyzer::AnalysisParams {
         min_frequency: config.index.min_frequency,
         tfidf_threshold: config.analysis.domain_specificity_threshold,
@@ -482,6 +490,7 @@ fn build_graph(
         &analysis.classes,
         &analysis.call_sites,
         &concept_map,
+        &all_imports,
     );
     eprintln!("Built {} entities", built_entities.len());
 
@@ -495,6 +504,7 @@ fn build_graph(
             embeddings::EmbeddingIndex::empty(),
             built_entities,
             entity_rels,
+            all_imports.clone(),
         )?;
         graph.add_abbreviation_edges();
         graph.add_contrastive_edges();
@@ -588,6 +598,7 @@ fn build_graph(
         embedding_index,
         built_entities,
         entity_rels,
+        all_imports,
     )?;
 
     if config.embeddings.enabled {
@@ -1927,6 +1938,16 @@ async fn run_server(
                         );
                     }
 
+                    // Collect and resolve imports for watcher rebuild
+                    let mut watcher_imports: Vec<types::ImportStatement> =
+                        parse_results
+                            .iter()
+                            .flat_map(|r| r.imports.iter().cloned())
+                            .collect();
+                    resolve::resolve_imports(
+                        &mut watcher_imports, &repo_root,
+                    );
+
                     // Build entities
                     let watcher_concept_map: std::collections::HashMap<u64, types::Concept> =
                         analysis.concepts.iter().map(|c| (c.id, c.clone())).collect();
@@ -1935,6 +1956,7 @@ async fn run_server(
                         &analysis.classes,
                         &analysis.call_sites,
                         &watcher_concept_map,
+                        &watcher_imports,
                     );
 
                     let mut new_graph = match graph::ConceptGraph::build_with_entities(
@@ -1942,6 +1964,7 @@ async fn run_server(
                         embeddings::EmbeddingIndex::empty(),
                         watcher_entities.clone(),
                         watcher_entity_rels,
+                        watcher_imports,
                     ) {
                         Ok(g) => g,
                         Err(e) => {

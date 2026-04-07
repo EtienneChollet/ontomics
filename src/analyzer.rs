@@ -688,6 +688,7 @@ mod tests {
             signatures: Vec::new(),
             classes: Vec::new(),
             call_sites: Vec::new(),
+            imports: Vec::new(),
             nesting_trees: Vec::new(),
         }
     }

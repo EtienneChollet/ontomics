@@ -127,6 +127,7 @@ mod tests {
             centrality: std::collections::HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         }
     }
 

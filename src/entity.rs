@@ -1,7 +1,7 @@
 use crate::tokenizer::split_identifier;
 use crate::types::{
-    CallSite, ClassInfo, Concept, Convention, Entity, EntityKind, PatternKind,
-    Relationship, RelationshipKind, Signature,
+    CallSite, ClassInfo, Concept, Convention, Entity, EntityKind,
+    ImportStatement, PatternKind, Relationship, RelationshipKind, Signature,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -55,6 +55,7 @@ pub fn build_entities(
     classes: &[ClassInfo],
     call_sites: &[CallSite],
     concepts: &HashMap<u64, Concept>,
+    imports: &[ImportStatement],
 ) -> (Vec<Entity>, Vec<Relationship>) {
     let mut entities: Vec<Entity> = Vec::new();
     let mut relationships: Vec<Relationship> = Vec::new();
@@ -263,6 +264,18 @@ pub fn build_entities(
         }
     }
 
+    // Build file -> imported file set for Uses edge disambiguation
+    let mut file_imports: HashMap<std::path::PathBuf, HashSet<std::path::PathBuf>> =
+        HashMap::new();
+    for import in imports {
+        if let Some(resolved) = &import.resolved_file {
+            file_imports
+                .entry(import.file.clone())
+                .or_default()
+                .insert(resolved.clone());
+        }
+    }
+
     // Phase 3: Build Uses edges from call sites (deduplicated)
     let mut uses_edges: HashSet<(u64, u64)> = HashSet::new();
     for cs in call_sites {
@@ -277,9 +290,33 @@ pub fn build_entities(
         let callee_ids = entity_by_name.get(callee_name);
 
         if let (Some(c_ids), Some(e_ids)) = (caller_ids, callee_ids) {
+            // Prefer callee entities whose source file is explicitly imported
+            let imported_files = file_imports.get(&cs.file);
+            let preferred: Vec<u64> = e_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    entities
+                        .iter()
+                        .find(|e| e.id == *id)
+                        .map(|e| {
+                            imported_files
+                                .map_or(false, |set| set.contains(&e.file))
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            let resolved_ids: &[u64] = if preferred.is_empty() {
+                e_ids
+            } else {
+                &preferred
+            };
+
             for &caller_id in c_ids {
-                for &callee_id in e_ids {
-                    if caller_id != callee_id && uses_edges.insert((caller_id, callee_id)) {
+                for &callee_id in resolved_ids {
+                    if caller_id != callee_id
+                        && uses_edges.insert((caller_id, callee_id))
+                    {
                         relationships.push(Relationship {
                             source: caller_id,
                             target: callee_id,
@@ -435,7 +472,7 @@ mod tests {
             line: 10,
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
-        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         // Class entity + one method entity (forward)
         assert_eq!(entities.len(), 2);
         let class_entity = entities.iter().find(|e| e.kind == EntityKind::Class).unwrap();
@@ -456,7 +493,7 @@ mod tests {
             body: None,
         }];
         let concepts = make_concepts(&[(1, "spatial"), (2, "transform")]);
-        let (entities, _) = build_entities(&sigs, &[], &[], &concepts);
+        let (entities, _) = build_entities(&sigs, &[], &[], &concepts, &[]);
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].kind, EntityKind::Function);
         assert_eq!(entities[0].concept_tags.len(), 2);
@@ -475,7 +512,7 @@ mod tests {
         }];
         // No matching concepts, no references
         let concepts = make_concepts(&[(1, "loss")]);
-        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         assert!(entities.is_empty());
     }
 
@@ -497,7 +534,7 @@ mod tests {
             line: 10,
         }];
         let concepts = make_concepts(&[(1, "loss")]);
-        let (entities, _) = build_entities(&[], &classes, &call_sites, &concepts);
+        let (entities, _) = build_entities(&[], &classes, &call_sites, &concepts, &[]);
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "HelperUtil");
     }
@@ -525,7 +562,7 @@ mod tests {
             },
         ];
         let concepts = make_concepts(&[(1, "loss"), (2, "module")]);
-        let (entities, rels) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, rels) = build_entities(&[], &classes, &[], &concepts, &[]);
         assert_eq!(entities.len(), 2);
         let inherits = rels
             .iter()
@@ -557,7 +594,7 @@ mod tests {
             },
         ];
         let concepts = make_concepts(&[(1, "loss"), (2, "module")]);
-        let (_, rels) = build_entities(&[], &classes, &[], &concepts);
+        let (_, rels) = build_entities(&[], &classes, &[], &concepts, &[]);
         let inherits = rels
             .iter()
             .filter(|r| r.kind == RelationshipKind::InheritsFrom)
@@ -599,7 +636,7 @@ mod tests {
             (3, "spatial"),
             (4, "transformer"),
         ]);
-        let (entities, rels) = build_entities(&[], &classes, &call_sites, &concepts);
+        let (entities, rels) = build_entities(&[], &classes, &call_sites, &concepts, &[]);
         // VxmDense class + VxmDense.forward method + SpatialTransformer class
         assert_eq!(entities.len(), 3);
         let uses = rels
@@ -646,7 +683,7 @@ mod tests {
             },
         ];
         let concepts = make_concepts(&[(1, "model")]);
-        let (_, rels) = build_entities(&[], &classes, &call_sites, &concepts);
+        let (_, rels) = build_entities(&[], &classes, &call_sites, &concepts, &[]);
         let uses = rels
             .iter()
             .filter(|r| r.kind == RelationshipKind::Uses)
@@ -706,7 +743,7 @@ mod tests {
             body: None,
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
-        let (entities, _) = build_entities(&sigs, &classes, &[], &concepts);
+        let (entities, _) = build_entities(&sigs, &classes, &[], &concepts, &[]);
         // Method is promoted as a Method entity, not a Function entity
         assert!(entities.iter().all(|e| e.kind != EntityKind::Function || e.name != "forward"));
         let method = entities.iter().find(|e| e.name == "forward");
@@ -729,7 +766,7 @@ mod tests {
         }];
         // Class is promoted via concept match on "spatial"
         let concepts = make_concepts(&[(1, "spatial"), (2, "transformer")]);
-        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         let method_entities: Vec<_> =
             entities.iter().filter(|e| e.kind == EntityKind::Method).collect();
         assert_eq!(method_entities.len(), 2);
@@ -751,7 +788,7 @@ mod tests {
             line: 5,
         }];
         let concepts = make_concepts(&[(1, "loss"), (2, "module")]);
-        let (entities, rels) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, rels) = build_entities(&[], &classes, &[], &concepts, &[]);
         let class_entity = entities.iter().find(|e| e.kind == EntityKind::Class).unwrap();
         let method_entity = entities.iter().find(|e| e.kind == EntityKind::Method).unwrap();
         let member_of = rels.iter().find(|r| r.kind == RelationshipKind::MemberOf);
@@ -775,7 +812,7 @@ mod tests {
         let concepts = make_concepts(&[
             (1, "vxm"), (2, "dense"), (3, "spatial"), (4, "transform"),
         ]);
-        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         let spatial_transform = entities
             .iter()
             .find(|e| e.kind == EntityKind::Method && e.name == "spatial_transform")
@@ -803,7 +840,7 @@ mod tests {
         }];
         // No concepts match "HelperUtil", no references — class not promoted
         let concepts = make_concepts(&[(1, "loss")]);
-        let (entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         assert!(entities.is_empty(), "no entities when class is not promoted");
     }
 
@@ -821,7 +858,7 @@ mod tests {
             line: 1,
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
-        let (mut entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (mut entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         infer_semantic_roles(&mut entities, &classes, &[], &concepts);
         assert_eq!(entities[0].semantic_role, "loss module");
     }
@@ -847,7 +884,7 @@ mod tests {
             examples: vec!["disp_to_trf".to_string()],
             frequency: 3,
         }];
-        let (mut entities, _) = build_entities(&sigs, &[], &[], &concepts);
+        let (mut entities, _) = build_entities(&sigs, &[], &[], &concepts, &[]);
         infer_semantic_roles(&mut entities, &[], &conventions, &concepts);
         assert!(entities[0].semantic_role.contains("conversion"));
         assert!(entities[0].semantic_role.contains("disp"));
@@ -867,7 +904,7 @@ mod tests {
             body: None,
         }];
         let concepts = make_concepts(&[(1, "spatial"), (2, "transform")]);
-        let (mut entities, _) = build_entities(&sigs, &[], &[], &concepts);
+        let (mut entities, _) = build_entities(&sigs, &[], &[], &concepts, &[]);
         infer_semantic_roles(&mut entities, &[], &[], &concepts);
         assert_eq!(entities[0].semantic_role, "transform function");
     }
@@ -891,7 +928,7 @@ mod tests {
         }];
         // Promoted via reference, no matching concepts
         let concepts = make_concepts(&[(1, "loss")]);
-        let (mut entities, _) = build_entities(&[], &classes, &call_sites, &concepts);
+        let (mut entities, _) = build_entities(&[], &classes, &call_sites, &concepts, &[]);
         infer_semantic_roles(&mut entities, &classes, &[], &concepts);
         assert!(entities[0].semantic_role.is_empty());
     }
@@ -908,7 +945,7 @@ mod tests {
             line: 1,
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "dice"), (3, "loss")]);
-        let (mut entities, _) = build_entities(&[], &classes, &[], &concepts);
+        let (mut entities, _) = build_entities(&[], &classes, &[], &concepts, &[]);
         infer_semantic_roles(&mut entities, &classes, &[], &concepts);
         // Last tag "loss" should be the primary tag
         assert!(entities[0].semantic_role.starts_with("loss"));
@@ -961,7 +998,7 @@ mod tests {
             line: 164,
         }];
         let concepts = make_concepts(&[(1, "focal"), (2, "loss"), (3, "dice")]);
-        let (entities, _) = build_entities(&sigs, &classes, &call_sites, &concepts);
+        let (entities, _) = build_entities(&sigs, &classes, &call_sites, &concepts, &[]);
         let focal_loss_entity = entities.iter().find(|e| e.name == "focal_loss");
         assert!(
             focal_loss_entity.is_some(),
@@ -969,5 +1006,67 @@ mod tests {
             entities.iter().map(|e| (&e.name, &e.kind)).collect::<Vec<_>>()
         );
         assert_eq!(focal_loss_entity.unwrap().kind, EntityKind::Function);
+    }
+
+    #[test]
+    fn test_import_disambiguation_prefers_imported_file() {
+        // Two entities with the same name in different files.
+        // Only the one from the imported file should get a Uses edge.
+        let classes = vec![
+            ClassInfo {
+                name: "Caller".to_string(),
+                bases: vec![],
+                methods: vec![],
+                attributes: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("models.py"),
+                line: 1,
+            },
+            // "Helper" defined in helpers_a.py (imported)
+            ClassInfo {
+                name: "Helper".to_string(),
+                bases: vec![],
+                methods: vec![],
+                attributes: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("helpers_a.py"),
+                line: 1,
+            },
+            // "Helper" also defined in helpers_b.py (not imported)
+            ClassInfo {
+                name: "Helper".to_string(),
+                bases: vec![],
+                methods: vec![],
+                attributes: vec![],
+                docstring_first_line: None,
+                file: PathBuf::from("helpers_b.py"),
+                line: 1,
+            },
+        ];
+        let call_sites = vec![CallSite {
+            caller_scope: Some("Caller".to_string()),
+            callee: "Helper".to_string(),
+            file: PathBuf::from("models.py"),
+            line: 5,
+        }];
+        // models.py imports from helpers_a.py only
+        let imports = vec![crate::types::ImportStatement {
+            source_module: "helpers_a".to_string(),
+            imported_symbols: vec!["Helper".to_string()],
+            alias: None,
+            resolved_file: Some(PathBuf::from("helpers_a.py")),
+            file: PathBuf::from("models.py"),
+            line: 1,
+        }];
+        let concepts = make_concepts(&[(1, "caller"), (2, "helper")]);
+        let (_, rels) = build_entities(&[], &classes, &call_sites, &concepts, &imports);
+
+        let uses_edges: Vec<_> = rels
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Uses)
+            .collect();
+
+        // Should produce exactly one Uses edge (to the imported Helper)
+        assert_eq!(uses_edges.len(), 1, "Exactly one Uses edge expected with import disambiguation");
     }
 }

@@ -6,10 +6,10 @@ use crate::types::{
     AnalysisResult, CallSite, CentralityScore, ClassInfo, CompactContext,
     Concept, ConceptMap, ConceptQueryResult, ConceptTrace, Convention,
     DescribeFileResult, DescribeSymbolResult, Entity, EntitySummary,
-    FileSymbol, FileNestingTree, InconsistencyPair, LocateConceptResult,
-    LogicCluster, LogicClusterSummary, LogicDescription, MethodSummary,
-    ModuleMapEntry, NameSuggestion, NamingCheckResult, PatternKind,
-    QueryConceptParams, RelatedConcept, Relationship,
+    FileSymbol, FileNestingTree, ImportStatement, InconsistencyPair,
+    LocateConceptResult, LogicCluster, LogicClusterSummary, LogicDescription,
+    MethodSummary, ModuleMapEntry, NameSuggestion, NamingCheckResult,
+    PatternKind, QueryConceptParams, RelatedConcept, Relationship,
     RelationshipKind, SessionBriefing, Signature, SimilarLogicResult,
     Subconcept, SymbolKind, TraceEdge, TraceNode, TraceRole, TypeFlow,
     TypeFlowResult, TypeFrequency, Verdict, VocabularyHealth,
@@ -128,6 +128,7 @@ pub struct ConceptGraph {
     /// Each tuple is (logic_cluster_id, concept_cluster_id, jaccard_score).
     pub logic_concept_overlaps: Vec<(usize, usize, f32)>,
     pub nesting_trees: Vec<FileNestingTree>,
+    pub imports: Vec<ImportStatement>,
 }
 
 impl ConceptGraph {
@@ -162,6 +163,7 @@ impl ConceptGraph {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -170,15 +172,18 @@ impl ConceptGraph {
         analysis: AnalysisResult,
         embeddings: EmbeddingIndex,
     ) -> Result<Self> {
-        Self::build_with_entities(analysis, embeddings, Vec::new(), Vec::new())
+        Self::build_with_entities(
+            analysis, embeddings, Vec::new(), Vec::new(), Vec::new(),
+        )
     }
 
-    /// Build graph with pre-built entities and their relationships.
+    /// Build graph with pre-built entities, relationships, and import data.
     pub fn build_with_entities(
         analysis: AnalysisResult,
         embeddings: EmbeddingIndex,
         entities: Vec<Entity>,
         entity_relationships: Vec<Relationship>,
+        imports: Vec<ImportStatement>,
     ) -> Result<Self> {
         let concepts: HashMap<u64, Concept> = analysis
             .concepts
@@ -218,6 +223,7 @@ impl ConceptGraph {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: analysis.nesting_trees,
+            imports,
         })
     }
 
@@ -4519,6 +4525,7 @@ mod tests {
             embeddings,
             entities,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         graph.cluster_and_add_similarity_edges(0.75);
@@ -4583,6 +4590,7 @@ mod tests {
             analysis,
             EmbeddingIndex::empty(),
             entities,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -5136,6 +5144,7 @@ mod tests {
             EmbeddingIndex::empty(),
             entities,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -5274,6 +5283,7 @@ mod tests {
             EmbeddingIndex::empty(),
             entities,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -5356,6 +5366,7 @@ mod tests {
             analysis,
             EmbeddingIndex::empty(),
             entities,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -5480,6 +5491,7 @@ mod tests {
             analysis,
             EmbeddingIndex::empty(),
             entities,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -5618,6 +5630,7 @@ mod tests {
             analysis,
             EmbeddingIndex::empty(),
             entities,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -6132,6 +6145,7 @@ mod tests {
             EmbeddingIndex::empty(),
             entities,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -6302,6 +6316,7 @@ mod tests {
             analysis,
             EmbeddingIndex::empty(),
             entities,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap()

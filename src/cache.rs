@@ -471,6 +471,7 @@ impl IndexCache {
             centrality: cached.centrality,
             logic_concept_overlaps: cached.logic_concept_overlaps,
             nesting_trees,
+            imports: Vec::new(),
         }))
     }
 
@@ -692,6 +693,7 @@ mod tests {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -973,6 +975,7 @@ mod tests {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -1091,6 +1094,7 @@ mod tests {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -1165,6 +1169,7 @@ mod tests {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         };
 
         let cache = IndexCache::open(dir).unwrap();
@@ -1294,6 +1299,7 @@ mod tests {
             centrality: HashMap::new(),
             logic_concept_overlaps: Vec::new(),
             nesting_trees: Vec::new(),
+            imports: Vec::new(),
         }
     }
 

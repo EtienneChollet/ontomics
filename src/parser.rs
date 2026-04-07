@@ -1,6 +1,7 @@
 use crate::types::{
-    CallSite, ClassInfo, EntityType, FileNestingTree, FunctionBody, Param,
-    ParseResult, RawIdentifier, NestingKind, NestingNode, Signature,
+    CallSite, ClassInfo, EntityType, FileNestingTree, FunctionBody,
+    ImportStatement, Param, ParseResult, RawIdentifier, NestingKind,
+    NestingNode, Signature,
 };
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -37,6 +38,19 @@ pub trait LanguageParser: Send + Sync {
 
     /// Strip language-specific doc-comment syntax from raw text.
     fn strip_doc_syntax<'a>(&self, raw: &'a str) -> &'a str;
+
+    /// Extract all import statements from a parsed source tree.
+    ///
+    /// Default returns empty; each language parser overrides this.
+    fn extract_imports(
+        &self,
+        root: tree_sitter::Node,
+        source: &[u8],
+        file: &Path,
+    ) -> Vec<ImportStatement> {
+        let _ = (root, source, file);
+        Vec::new()
+    }
 
     /// Visit one AST node, extracting identifiers, docs, signatures, etc.
     #[allow(clippy::too_many_arguments)]
@@ -117,6 +131,7 @@ pub fn parse_content_with(
         &mut call_sites,
     );
 
+    let imports = lang.extract_imports(tree.root_node(), source_bytes, path);
     let nesting_tree = build_nesting_tree(path, &signatures, &classes);
 
     Ok(ParseResult {
@@ -125,6 +140,7 @@ pub fn parse_content_with(
         signatures,
         classes,
         call_sites,
+        imports,
         nesting_trees: vec![nesting_tree],
     })
 }
@@ -552,6 +568,15 @@ impl LanguageParser for PythonParser {
 
     fn strip_doc_syntax<'a>(&self, raw: &'a str) -> &'a str {
         strip_docstring_quotes(raw)
+    }
+
+    fn extract_imports(
+        &self,
+        root: tree_sitter::Node,
+        source: &[u8],
+        file: &Path,
+    ) -> Vec<ImportStatement> {
+        py_extract_imports(root, source, file)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1259,6 +1284,15 @@ impl LanguageParser for TypeScriptParser {
         strip_jsdoc_borrow(raw)
     }
 
+    fn extract_imports(
+        &self,
+        root: tree_sitter::Node,
+        source: &[u8],
+        file: &Path,
+    ) -> Vec<ImportStatement> {
+        js_extract_imports(root, source, file)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn visit_node(
         &self,
@@ -1460,6 +1494,15 @@ impl LanguageParser for JavaScriptParser {
         strip_jsdoc_borrow(raw)
     }
 
+    fn extract_imports(
+        &self,
+        root: tree_sitter::Node,
+        source: &[u8],
+        file: &Path,
+    ) -> Vec<ImportStatement> {
+        js_extract_imports(root, source, file)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn visit_node(
         &self,
@@ -1605,6 +1648,15 @@ impl LanguageParser for RustParser {
         let s = s.strip_prefix(" * ").unwrap_or(s);
         let s = s.strip_prefix("* ").unwrap_or(s);
         s.trim()
+    }
+
+    fn extract_imports(
+        &self,
+        root: tree_sitter::Node,
+        source: &[u8],
+        file: &Path,
+    ) -> Vec<ImportStatement> {
+        rs_extract_imports(root, source, file)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3482,6 +3534,402 @@ fn js_extract_arrow_signature(
 }
 
 // =========================================================================
+// Import extraction helpers
+// =========================================================================
+
+/// Walk the AST and collect all import statements for Python.
+fn py_extract_imports(
+    root: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut stack: Vec<tree_sitter::Node> = vec![root];
+
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "import_statement" => {
+                py_collect_import_statement(node, source, file, &mut imports);
+            }
+            "import_from_statement" => {
+                py_collect_import_from(node, source, file, &mut imports);
+            }
+            _ => {
+                let mut child_cursor = node.walk();
+                for child in node.named_children(&mut child_cursor) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    imports
+}
+
+fn py_collect_import_statement(
+    node: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+    imports: &mut Vec<ImportStatement>,
+) {
+    let line = node.start_position().row + 1;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "dotted_name" => {
+                let module = child.utf8_text(source).unwrap_or("").to_string();
+                imports.push(ImportStatement {
+                    source_module: module,
+                    imported_symbols: Vec::new(),
+                    alias: None,
+                    resolved_file: None,
+                    file: file.to_path_buf(),
+                    line,
+                });
+            }
+            "aliased_import" => {
+                let name_node = child.child_by_field_name("name");
+                let alias_node = child.child_by_field_name("alias");
+                let module = name_node
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("")
+                    .to_string();
+                let alias = alias_node
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| s.to_string());
+                imports.push(ImportStatement {
+                    source_module: module,
+                    imported_symbols: Vec::new(),
+                    alias,
+                    resolved_file: None,
+                    file: file.to_path_buf(),
+                    line,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn py_collect_import_from(
+    node: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+    imports: &mut Vec<ImportStatement>,
+) {
+    let line = node.start_position().row + 1;
+    let mut module = String::new();
+    let mut symbols = Vec::new();
+    let mut first_dotted_name = true;
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "dotted_name" => {
+                if first_dotted_name {
+                    // First dotted_name is the source module (e.g. "neurite.utils")
+                    module = child.utf8_text(source).unwrap_or("").to_string();
+                    first_dotted_name = false;
+                } else {
+                    // Subsequent dotted_names are imported symbols (e.g. "resize")
+                    if let Ok(s) = child.utf8_text(source) {
+                        symbols.push(s.to_string());
+                    }
+                }
+            }
+            "relative_import" => {
+                module = child
+                    .utf8_text(source)
+                    .unwrap_or("")
+                    .trim_start_matches('.')
+                    .to_string();
+                first_dotted_name = false;
+            }
+            "wildcard_import" => {
+                symbols.push("*".to_string());
+            }
+            "aliased_import" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    if let Ok(s) = name.utf8_text(source) {
+                        symbols.push(s.to_string());
+                    }
+                }
+            }
+            "identifier" => {
+                if let Ok(s) = child.utf8_text(source) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        symbols.push(trimmed.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    imports.push(ImportStatement {
+        source_module: module,
+        imported_symbols: symbols,
+        alias: None,
+        resolved_file: None,
+        file: file.to_path_buf(),
+        line,
+    });
+}
+
+/// Walk the AST and collect import statements for JavaScript/TypeScript.
+fn js_extract_imports(
+    root: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut stack: Vec<tree_sitter::Node> = vec![root];
+
+    while let Some(node) = stack.pop() {
+        if node.kind() == "import_statement" {
+            js_collect_import_statement(node, source, file, &mut imports);
+        } else {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+    }
+    imports
+}
+
+fn js_collect_import_statement(
+    node: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+    imports: &mut Vec<ImportStatement>,
+) {
+    let line = node.start_position().row + 1;
+
+    // Extract the module source string (e.g. "./utils" or "react")
+    let source_module = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "string")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(|s| s.trim_matches('"').trim_matches('\'').to_string())
+        .unwrap_or_default();
+
+    let mut symbols = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "import_clause" => {
+                // Named imports: { a, b as c }
+                let mut cc = child.walk();
+                for sub in child.named_children(&mut cc) {
+                    match sub.kind() {
+                        "named_imports" => {
+                            let mut nc = sub.walk();
+                            for spec in sub.named_children(&mut nc) {
+                                if spec.kind() == "import_specifier" {
+                                    if let Some(name) = spec.child_by_field_name("name") {
+                                        if let Ok(s) = name.utf8_text(source) {
+                                            symbols.push(s.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "namespace_import" => {
+                            symbols.push("*".to_string());
+                        }
+                        "identifier" => {
+                            // default import
+                            if let Ok(s) = sub.utf8_text(source) {
+                                symbols.push(s.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "string" => {} // already captured
+            _ => {}
+        }
+    }
+
+    imports.push(ImportStatement {
+        source_module,
+        imported_symbols: symbols,
+        alias: None,
+        resolved_file: None,
+        file: file.to_path_buf(),
+        line,
+    });
+}
+
+/// Walk the AST and collect use declarations for Rust.
+fn rs_extract_imports(
+    root: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+) -> Vec<ImportStatement> {
+    let mut imports = Vec::new();
+    let mut stack: Vec<tree_sitter::Node> = vec![root];
+
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_declaration" {
+            rs_collect_use_declaration(node, source, file, &mut imports);
+        } else {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+    }
+    imports
+}
+
+fn rs_collect_use_declaration(
+    node: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+    imports: &mut Vec<ImportStatement>,
+) {
+    let line = node.start_position().row + 1;
+    let mut cursor = node.walk();
+
+    for child in node.named_children(&mut cursor) {
+        rs_flatten_use_tree(child, source, file, line, "", imports);
+    }
+}
+
+/// Recursively flatten a Rust use_tree into ImportStatements.
+fn rs_flatten_use_tree(
+    node: tree_sitter::Node,
+    source: &[u8],
+    file: &Path,
+    line: usize,
+    prefix: &str,
+    imports: &mut Vec<ImportStatement>,
+) {
+    match node.kind() {
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                rs_flatten_use_tree(child, source, file, line, prefix, imports);
+            }
+        }
+        "use_as_clause" => {
+            // e.g. `std::io::Read as IoRead`
+            let path_node = node.child_by_field_name("path");
+            let alias_node = node.child_by_field_name("alias");
+            let path = path_node
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            let alias = alias_node
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string());
+            let full_path = if prefix.is_empty() {
+                path
+            } else {
+                format!("{prefix}::{path}")
+            };
+            let (module, symbol) = rs_split_path(&full_path);
+            imports.push(ImportStatement {
+                source_module: module,
+                imported_symbols: symbol.into_iter().collect(),
+                alias,
+                resolved_file: None,
+                file: file.to_path_buf(),
+                line,
+            });
+        }
+        "scoped_identifier" | "scoped_use_list" => {
+            // e.g. `std::collections::HashMap` or `std::collections::{HashMap, BTreeMap}`
+            if let Ok(text) = node.utf8_text(source) {
+                let text = text.to_string();
+                // Find nested use_list
+                let mut cursor = node.walk();
+                let use_list = node.named_children(&mut cursor)
+                    .find(|c| c.kind() == "use_list");
+                if let Some(list) = use_list {
+                    // Extract prefix from text up to the list
+                    let path_prefix = text
+                        .rfind("::{")
+                        .map(|i| &text[..i])
+                        .unwrap_or(&text)
+                        .to_string();
+                    let new_prefix = if prefix.is_empty() {
+                        path_prefix
+                    } else {
+                        format!("{prefix}::{path_prefix}")
+                    };
+                    let mut cc = list.walk();
+                    for child in list.named_children(&mut cc) {
+                        rs_flatten_use_tree(child, source, file, line, &new_prefix, imports);
+                    }
+                } else {
+                    let full = if prefix.is_empty() {
+                        text
+                    } else {
+                        format!("{prefix}::{text}")
+                    };
+                    let (module, symbol) = rs_split_path(&full);
+                    imports.push(ImportStatement {
+                        source_module: module,
+                        imported_symbols: symbol.into_iter().collect(),
+                        alias: None,
+                        resolved_file: None,
+                        file: file.to_path_buf(),
+                        line,
+                    });
+                }
+            }
+        }
+        "identifier" => {
+            if let Ok(name) = node.utf8_text(source) {
+                let full = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}::{name}")
+                };
+                let (module, symbol) = rs_split_path(&full);
+                imports.push(ImportStatement {
+                    source_module: module,
+                    imported_symbols: symbol.into_iter().collect(),
+                    alias: None,
+                    resolved_file: None,
+                    file: file.to_path_buf(),
+                    line,
+                });
+            }
+        }
+        "use_wildcard" => {
+            let module = prefix.to_string();
+            imports.push(ImportStatement {
+                source_module: module,
+                imported_symbols: vec!["*".to_string()],
+                alias: None,
+                resolved_file: None,
+                file: file.to_path_buf(),
+                line,
+            });
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                rs_flatten_use_tree(child, source, file, line, prefix, imports);
+            }
+        }
+    }
+}
+
+/// Split `a::b::C` into (`a::b`, `Some("C")`).
+fn rs_split_path(path: &str) -> (String, Option<String>) {
+    match path.rfind("::") {
+        Some(idx) => (path[..idx].to_string(), Some(path[idx + 2..].to_string())),
+        None => (path.to_string(), None),
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
@@ -3865,6 +4313,38 @@ class Cls:
             Some("Cls.method".to_string())
         );
     }
+
+    #[test]
+    fn test_extract_imports_from_import() {
+        let source = "import numpy as np\nimport os\n";
+        let path = Path::new("train.py");
+        let result = parse_content(source, path).unwrap();
+        assert_eq!(result.imports.len(), 2);
+        let np_import = result.imports.iter().find(|i| i.source_module == "numpy").unwrap();
+        assert_eq!(np_import.alias, Some("np".to_string()));
+        assert!(result.imports.iter().any(|i| i.source_module == "os"));
+    }
+
+    #[test]
+    fn test_extract_imports_from_from_import() {
+        let source = "from neurite.utils import resize, zoom\n";
+        let path = Path::new("train.py");
+        let result = parse_content(source, path).unwrap();
+        assert_eq!(result.imports.len(), 1);
+        let imp = &result.imports[0];
+        assert_eq!(imp.source_module, "neurite.utils");
+        assert!(imp.imported_symbols.contains(&"resize".to_string()));
+        assert!(imp.imported_symbols.contains(&"zoom".to_string()));
+    }
+
+    #[test]
+    fn test_extract_imports_external_package_no_resolved_file() {
+        let source = "import torch\n";
+        let path = Path::new("model.py");
+        let result = parse_content(source, path).unwrap();
+        assert!(!result.imports.is_empty());
+        assert!(result.imports[0].resolved_file.is_none());
+    }
 }
 
 // =========================================================================
@@ -4236,6 +4716,27 @@ function spatialTransform(vol: Tensor, trf: Transform, nbDims: number = 3): Tens
             "Missing type: Transform. Got: {types:?}"
         );
     }
+
+    #[test]
+    fn test_ts_extract_imports_named() {
+        let source = r#"import { useState, useEffect } from "react";"#;
+        let path = Path::new("app.ts");
+        let result = parse_content_with(source, path, &TypeScriptParser).unwrap();
+        assert_eq!(result.imports.len(), 1);
+        let imp = &result.imports[0];
+        assert_eq!(imp.source_module, "react");
+        assert!(imp.imported_symbols.contains(&"useState".to_string()));
+        assert!(imp.imported_symbols.contains(&"useEffect".to_string()));
+    }
+
+    #[test]
+    fn test_ts_extract_imports_relative() {
+        let source = r#"import { helper } from "./utils";"#;
+        let path = Path::new("app.ts");
+        let result = parse_content_with(source, path, &TypeScriptParser).unwrap();
+        assert_eq!(result.imports.len(), 1);
+        assert_eq!(result.imports[0].source_module, "./utils");
+    }
 }
 
 // =========================================================================
@@ -4488,6 +4989,26 @@ function spatialTransform(vol, trf, nbDims = 3) {
         let aliases = names_of(result, EntityType::TypeAlias);
         assert!(interfaces.is_empty(), "JS should have no interfaces");
         assert!(aliases.is_empty(), "JS should have no type aliases");
+    }
+
+    #[test]
+    fn test_js_extract_imports_named() {
+        let source = r#"import { helper } from "./utils.js";"#;
+        let path = Path::new("app.js");
+        let result = parse_content_with(source, path, &JavaScriptParser).unwrap();
+        assert_eq!(result.imports.len(), 1);
+        let imp = &result.imports[0];
+        assert_eq!(imp.source_module, "./utils.js");
+        assert!(imp.imported_symbols.contains(&"helper".to_string()));
+    }
+
+    #[test]
+    fn test_js_extract_imports_bare_module_no_symbols() {
+        let source = r#"import React from "react";"#;
+        let path = Path::new("app.js");
+        let result = parse_content_with(source, path, &JavaScriptParser).unwrap();
+        assert_eq!(result.imports.len(), 1);
+        assert_eq!(result.imports[0].source_module, "react");
     }
 }
 
@@ -5330,6 +5851,28 @@ struct Widget {
             "Widget should have field 'width'. Got: {:?}",
             widget.attributes
         );
+    }
+
+    #[test]
+    fn test_rs_extract_imports_simple_use() {
+        let source = "use crate::parser::PythonParser;\n";
+        let path = Path::new("main.rs");
+        let result = parse_content_with(source, path, &RustParser).unwrap();
+        assert!(!result.imports.is_empty());
+        let has_parser = result.imports.iter().any(|i| i.source_module.contains("parser"));
+        assert!(has_parser, "Should find parser module import");
+    }
+
+    #[test]
+    fn test_rs_extract_imports_std_use() {
+        let source = "use std::collections::HashMap;\n";
+        let path = Path::new("lib.rs");
+        let result = parse_content_with(source, path, &RustParser).unwrap();
+        assert!(!result.imports.is_empty());
+        let has_collections = result.imports.iter().any(|i| {
+            i.source_module.contains("std") || i.source_module.contains("collections")
+        });
+        assert!(has_collections, "Should find std::collections import");
     }
 
 }

@@ -133,6 +133,8 @@ pub struct ParseResult {
     pub classes: Vec<ClassInfo>,
     pub call_sites: Vec<CallSite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<ImportStatement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nesting_trees: Vec<FileNestingTree>,
 }
 
@@ -303,6 +305,16 @@ pub struct ClassInfo {
 pub struct CallSite {
     pub caller_scope: Option<String>,
     pub callee: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImportStatement {
+    pub source_module: String,
+    pub imported_symbols: Vec<String>,
+    pub alias: Option<String>,
+    pub resolved_file: Option<PathBuf>,
     pub file: PathBuf,
     pub line: usize,
 }
@@ -669,5 +681,38 @@ mod tests {
         assert_eq!(Verdict::Consistent, Verdict::Consistent);
         assert_ne!(Verdict::Consistent, Verdict::Inconsistent);
         assert_ne!(Verdict::Inconsistent, Verdict::Unknown);
+    }
+
+    #[test]
+    fn test_import_statement_serde_roundtrip() {
+        let stmt = ImportStatement {
+            source_module: "neurite.utils".to_string(),
+            imported_symbols: vec!["resize".to_string(), "zoom".to_string()],
+            alias: None,
+            resolved_file: Some(std::path::PathBuf::from("/repo/neurite/utils.py")),
+            file: std::path::PathBuf::from("/repo/train.py"),
+            line: 3,
+        };
+        let json = serde_json::to_string(&stmt).unwrap();
+        let back: ImportStatement = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source_module, "neurite.utils");
+        assert_eq!(back.imported_symbols, vec!["resize", "zoom"]);
+        assert_eq!(back.resolved_file, Some(std::path::PathBuf::from("/repo/neurite/utils.py")));
+    }
+
+    #[test]
+    fn test_import_statement_none_resolved_file() {
+        let stmt = ImportStatement {
+            source_module: "torch".to_string(),
+            imported_symbols: vec![],
+            alias: Some("torch".to_string()),
+            resolved_file: None,
+            file: std::path::PathBuf::from("train.py"),
+            line: 1,
+        };
+        let json = serde_json::to_string(&stmt).unwrap();
+        let back: ImportStatement = serde_json::from_str(&json).unwrap();
+        assert!(back.resolved_file.is_none());
+        assert_eq!(back.alias, Some("torch".to_string()));
     }
 }
