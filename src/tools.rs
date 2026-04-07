@@ -1,3 +1,4 @@
+use crate::ontology_md;
 use ontomics::diff;
 use ontomics::graph::ConceptGraph;
 use ontomics::parser::LanguageParser;
@@ -338,6 +339,18 @@ impl OntomicsServer {
             );
         }
         Ok(val)
+    }
+
+    fn handle_generate_ontology_md(
+        &self,
+        _args: &Value,
+    ) -> Result<Value, String> {
+        let graph = self
+            .graph
+            .read()
+            .map_err(|e| format!("lock error: {e}"))?;
+        let md = ontology_md::generate_ontology_md(&graph);
+        Ok(json!({"markdown": md}))
     }
 
     fn handle_list_entities(&self, args: &Value) -> Result<Value, String> {
@@ -926,6 +939,16 @@ fn tool_definitions() -> Vec<Tool> {
                 &["type_name"],
             ),
         ),
+        Tool::new(
+            "generate_ontology_md",
+            "Generate a human-readable ONTOLOGY.md from the concept graph \
+             — returns a Markdown document covering domain concepts, naming \
+             conventions, abbreviations, key entities by PageRank, and \
+             top co-occurrence relationships. Use when asked to 'generate \
+             ONTOLOGY.md', 'export the ontology as markdown', or 'create \
+             a domain summary document'.",
+            tool_schema(json!({}), &[]),
+        ),
     ]
 }
 
@@ -1033,6 +1056,7 @@ impl ServerHandler for OntomicsServer {
             "concept_map" => self.handle_concept_map(&args),
             "type_flows" => self.handle_type_flows(&args),
             "trace_type" => self.handle_trace_type(&args),
+            "generate_ontology_md" => self.handle_generate_ontology_md(&args),
             other => Err(format!("unknown tool: {other}")),
         };
 
@@ -1277,7 +1301,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
     }
 
     #[test]

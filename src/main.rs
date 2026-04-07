@@ -1,3 +1,4 @@
+mod ontology_md;
 mod tools;
 
 use ontomics::analyzer;
@@ -168,6 +169,12 @@ enum Command {
         /// Output JSON file (stdout if omitted)
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Generate ONTOLOGY.md from the concept graph
+    Generate {
+        /// Output path for the generated file
+        #[arg(short = 'o', long, default_value = "ONTOLOGY.md")]
+        output: String,
     },
 }
 
@@ -1182,6 +1189,9 @@ async fn main() -> anyhow::Result<()> {
                     &repo, &config, &lang_parsers, &model, threshold,
                     output.as_deref(),
                 ),
+                Command::Generate { output } => {
+                    cmd_generate(&result.graph, &output)
+                }
             }
         }
     }
@@ -1319,6 +1329,14 @@ fn cmd_trace(
 fn cmd_briefing(graph: &graph::ConceptGraph) -> anyhow::Result<()> {
     let briefing = graph.session_briefing();
     print_json(&briefing);
+    Ok(())
+}
+
+fn cmd_generate(graph: &graph::ConceptGraph, output: &str) -> anyhow::Result<()> {
+    let content = ontology_md::generate_ontology_md(graph);
+    std::fs::write(output, &content)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", output, e))?;
+    eprintln!("Wrote ONTOLOGY.md to {output}");
     Ok(())
 }
 
