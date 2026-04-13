@@ -7,6 +7,7 @@
 ![platform](https://img.shields.io/badge/macOS_·_Linux-grey)
 ![MCP](https://img.shields.io/badge/MCP_Server-green)
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-listed-blue)](https://registry.modelcontextprotocol.io/)
+[![Glama](https://glama.ai/mcp/servers/EtienneChollet/ontomics/badges/score.svg)](https://glama.ai/mcp/servers/EtienneChollet/ontomics)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-cc785c?logo=anthropic&logoColor=white)
 ![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
 ![pi](https://img.shields.io/badge/pi--coding--agent-blue)
