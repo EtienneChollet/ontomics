@@ -83,6 +83,54 @@ pub struct EntityCheck {
     pub name: &'static str,
 }
 
+/// A single describe_logic check.
+pub struct DescribeLogicCheck {
+    pub name: &'static str,
+    pub expected_kind: &'static str,
+    pub has_body_text: bool,
+    pub has_logic_cluster: bool,
+}
+
+/// A single find_similar_logic check.
+pub struct FindSimilarLogicCheck {
+    pub name: &'static str,
+    pub min_similar: usize,
+    pub top_k: usize,
+}
+
+/// A single compact_context check.
+pub struct CompactContextCheck {
+    pub scope: &'static str,
+    pub must_contain: Vec<&'static str>,
+    pub max_tokens: usize,
+}
+
+/// A concept_map check (one per codebase).
+pub struct ConceptMapCheck {
+    pub min_modules: usize,
+    pub min_total_entities: usize,
+    pub must_have_concepts: Vec<&'static str>,
+}
+
+/// A type_flows check (one per codebase).
+pub struct TypeFlowsCheck {
+    pub min_flows: usize,
+    pub must_have_types: Vec<&'static str>,
+}
+
+/// A single trace_type check.
+pub struct TraceTypeCheck {
+    pub type_name: &'static str,
+    pub min_flows: usize,
+}
+
+/// A single trace_concept check.
+pub struct TraceConceptCheck {
+    pub concept: &'static str,
+    pub min_call_chain: usize,
+    pub must_have_in_chain: Vec<&'static str>,
+}
+
 /// Full expectations for one codebase.
 pub struct TestbedExpectations {
     pub repo_path: &'static str,
@@ -123,6 +171,27 @@ pub struct TestbedExpectations {
 
     // vocabulary_health
     pub vocabulary_health_check: Option<VocabularyHealthCheck>,
+
+    // describe_logic
+    pub describe_logic_checks: Vec<DescribeLogicCheck>,
+
+    // find_similar_logic
+    pub find_similar_logic_checks: Vec<FindSimilarLogicCheck>,
+
+    // compact_context
+    pub compact_context_checks: Vec<CompactContextCheck>,
+
+    // concept_map
+    pub concept_map_check: ConceptMapCheck,
+
+    // type_flows
+    pub type_flows_check: TypeFlowsCheck,
+
+    // trace_type
+    pub trace_type_checks: Vec<TraceTypeCheck>,
+
+    // trace_concept
+    pub trace_concept_checks: Vec<TraceConceptCheck>,
 
     // performance ceiling (seconds, release-mode builds)
     pub max_build_seconds: u64,
@@ -279,6 +348,60 @@ pub fn voxelmorph_expectations() -> TestbedExpectations {
         vocabulary_health_check: Some(VocabularyHealthCheck {
             min_overall: 0.3,
         }),
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "spatial_transform",
+                expected_kind: "Function",
+                has_body_text: true,
+                has_logic_cluster: true,
+            },
+            DescribeLogicCheck {
+                name: "SpatialTransformer",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![
+            FindSimilarLogicCheck {
+                name: "spatial_transform",
+                min_similar: 1,
+                top_k: 5,
+            },
+        ],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "SpatialTransformer",
+                must_contain: vec!["spatial"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 3,
+            min_total_entities: 60,
+            must_have_concepts: vec!["transform", "disp"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 50,
+            must_have_types: vec!["torch.Tensor"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "Tensor",
+                min_flows: 20,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "SpatialTransformer",
+                min_call_chain: 5,
+                must_have_in_chain: vec![
+                    "SpatialTransformer",
+                    "spatial_transform",
+                    "VxmPairwise",
+                ],
+            },
+        ],
         max_build_seconds: 15,
     }
 }
@@ -372,6 +495,59 @@ pub fn neurite_expectations() -> TestbedExpectations {
         vocabulary_health_check: Some(VocabularyHealthCheck {
             min_overall: 0.3,
         }),
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "gaussian_kernel",
+                expected_kind: "Function",
+                has_body_text: true,
+                has_logic_cluster: true,
+            },
+            DescribeLogicCheck {
+                name: "BasicUNet",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![
+            FindSimilarLogicCheck {
+                name: "gaussian_kernel",
+                min_similar: 1,
+                top_k: 5,
+            },
+        ],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "BasicUNet",
+                must_contain: vec!["BasicUNet"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 3,
+            min_total_entities: 100,
+            must_have_concepts: vec!["conv"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 50,
+            must_have_types: vec!["torch.Tensor"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "Tensor",
+                min_flows: 10,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "BasicUNet",
+                min_call_chain: 5,
+                must_have_in_chain: vec![
+                    "BasicUNet",
+                    "ConvBlock",
+                ],
+            },
+        ],
         max_build_seconds: 15,
     }
 }
@@ -446,6 +622,60 @@ pub fn interseg3d_expectations() -> TestbedExpectations {
         ],
         min_domain_terms: 8,
         vocabulary_health_check: None,
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "focal_loss",
+                expected_kind: "Function",
+                has_body_text: true,
+                has_logic_cluster: true,
+            },
+            DescribeLogicCheck {
+                name: "UniverSeg3d",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![
+            FindSimilarLogicCheck {
+                name: "focal_loss",
+                min_similar: 1,
+                top_k: 5,
+            },
+        ],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "UniverSeg3d",
+                must_contain: vec!["UniverSeg3d"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 20,
+            min_total_entities: 500,
+            must_have_concepts: vec!["cross", "click"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 500,
+            must_have_types: vec!["int", "torch.Tensor"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "Tensor",
+                min_flows: 100,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "UniverSeg3d",
+                min_call_chain: 5,
+                must_have_in_chain: vec![
+                    "UniverSeg3d",
+                    "CrossBlock",
+                    "CrossAttentionOp",
+                ],
+            },
+        ],
         max_build_seconds: 30,
     }
 }
@@ -520,6 +750,60 @@ pub fn scribbleprompt_expectations() -> TestbedExpectations {
         ],
         min_domain_terms: 5,
         vocabulary_health_check: None,
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "click_onehot",
+                expected_kind: "Function",
+                has_body_text: true,
+                has_logic_cluster: true,
+            },
+            DescribeLogicCheck {
+                name: "ScribblePromptUNet",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![
+            FindSimilarLogicCheck {
+                name: "click_onehot",
+                min_similar: 1,
+                top_k: 5,
+            },
+        ],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "ScribblePromptUNet",
+                must_contain: vec!["ScribblePromptUNet"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 8,
+            min_total_entities: 200,
+            must_have_concepts: vec!["click", "scribble"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 100,
+            must_have_types: vec!["torch.Tensor"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "Tensor",
+                min_flows: 20,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "ScribblePromptUNet",
+                min_call_chain: 5,
+                must_have_in_chain: vec![
+                    "ScribblePromptUNet",
+                    "click_onehot",
+                    "prepare_inputs",
+                ],
+            },
+        ],
         max_build_seconds: 30,
     }
 }
@@ -587,6 +871,54 @@ pub fn freebrowse_expectations() -> TestbedExpectations {
         ],
         min_domain_terms: 3,
         vocabulary_health_check: None,
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "FreeBrowse",
+                expected_kind: "Function",
+                has_body_text: true,
+                has_logic_cluster: true,
+            },
+        ],
+        find_similar_logic_checks: vec![
+            FindSimilarLogicCheck {
+                name: "FreeBrowse",
+                min_similar: 1,
+                top_k: 5,
+            },
+        ],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "FreeBrowse",
+                must_contain: vec!["FreeBrowse"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 8,
+            min_total_entities: 60,
+            must_have_concepts: vec!["view", "browse"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 40,
+            must_have_types: vec!["string"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "string",
+                min_flows: 5,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "FreeBrowse",
+                min_call_chain: 5,
+                must_have_in_chain: vec![
+                    "FreeBrowse",
+                    "useVolumes",
+                    "useSurfaces",
+                ],
+            },
+        ],
         max_build_seconds: 30,
     }
 }
@@ -652,6 +984,64 @@ pub fn pylot_expectations() -> TestbedExpectations {
         ],
         min_domain_terms: 8,
         vocabulary_health_check: None,
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "soft_dice_loss",
+                expected_kind: "Function",
+                has_body_text: true,
+                has_logic_cluster: true,
+            },
+            DescribeLogicCheck {
+                name: "Config",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![
+            FindSimilarLogicCheck {
+                name: "soft_dice_loss",
+                min_similar: 1,
+                top_k: 5,
+            },
+        ],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "Config",
+                must_contain: vec!["Config"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 15,
+            min_total_entities: 500,
+            must_have_concepts: vec!["config"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 200,
+            must_have_types: vec!["Tensor", "str"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "Tensor",
+                min_flows: 40,
+            },
+            TraceTypeCheck {
+                type_name: "str",
+                min_flows: 40,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "Config",
+                min_call_chain: 10,
+                must_have_in_chain: vec![
+                    "Config",
+                    "HDict",
+                    "FinetuningExperiment",
+                ],
+            },
+        ],
         max_build_seconds: 30,
     }
 }
@@ -744,6 +1134,44 @@ pub fn pytorch_expectations() -> TestbedExpectations {
         ],
         min_domain_terms: 20,
         vocabulary_health_check: None,
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "Linear",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "Module",
+                must_contain: vec!["Module"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 5,
+            min_total_entities: 20,
+            must_have_concepts: vec!["conv", "loss"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 1,
+            must_have_types: vec!["Tensor"],
+        },
+        trace_type_checks: vec![
+            TraceTypeCheck {
+                type_name: "Tensor",
+                min_flows: 1,
+            },
+        ],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "Module",
+                min_call_chain: 1,
+                must_have_in_chain: vec!["Module"],
+            },
+        ],
         max_build_seconds: 300,
     }
 }
@@ -820,6 +1248,39 @@ pub fn pandas_expectations() -> TestbedExpectations {
         ],
         min_domain_terms: 20,
         vocabulary_health_check: None,
+        describe_logic_checks: vec![
+            DescribeLogicCheck {
+                name: "DataFrame",
+                expected_kind: "Class",
+                has_body_text: false,
+                has_logic_cluster: false,
+            },
+        ],
+        find_similar_logic_checks: vec![],
+        compact_context_checks: vec![
+            CompactContextCheck {
+                scope: "DataFrame",
+                must_contain: vec!["DataFrame"],
+                max_tokens: 500,
+            },
+        ],
+        concept_map_check: ConceptMapCheck {
+            min_modules: 5,
+            min_total_entities: 20,
+            must_have_concepts: vec!["frame", "index"],
+        },
+        type_flows_check: TypeFlowsCheck {
+            min_flows: 1,
+            must_have_types: vec![],
+        },
+        trace_type_checks: vec![],
+        trace_concept_checks: vec![
+            TraceConceptCheck {
+                concept: "DataFrame",
+                min_call_chain: 1,
+                must_have_in_chain: vec!["DataFrame"],
+            },
+        ],
         max_build_seconds: 300,
     }
 }
