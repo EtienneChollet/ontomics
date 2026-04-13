@@ -93,6 +93,23 @@ mod testbed {
         });
     }
 
+    /// Build entity-to-call-sites map for logic cluster labeling.
+    fn build_entity_call_sites(
+        graph: &ConceptGraph,
+    ) -> HashMap<u64, Vec<&types::CallSite>> {
+        let mut map: HashMap<u64, Vec<&types::CallSite>> = HashMap::new();
+        for cs in &graph.call_sites {
+            if let Some(scope) = &cs.caller_scope {
+                if let Some(entity) = graph.entities.values().find(|e| {
+                    e.name == *scope && e.file == cs.file
+                }) {
+                    map.entry(entity.id).or_default().push(cs);
+                }
+            }
+        }
+        map
+    }
+
     /// Build or retrieve a cached BuiltGraph for the given repo.
     /// Returns None if the repo path doesn't exist (test should skip).
     pub fn get_or_build_graph(exp: &TestbedExpectations) -> Option<BuiltGraph> {
@@ -186,6 +203,7 @@ mod testbed {
             &analysis.classes,
             &analysis.call_sites,
             &concept_map,
+            &[],
         );
         eprintln!("  Built {} entities", built_entities.len());
 
@@ -217,11 +235,22 @@ mod testbed {
             embedding_index,
             built_entities,
             entity_rels,
+            Vec::new(),
         )
         .expect("graph build failed");
 
         if config.embeddings.enabled {
             graph.cluster_and_add_similarity_edges(config.embeddings.similarity_threshold);
+
+            // Release the concept embedding model to free GPU VRAM.
+            // Only the vectors are needed from this point forward.
+            let mut slim_emb = EmbeddingIndex::empty();
+            for id in graph.embeddings.vector_ids() {
+                if let Some(v) = graph.embeddings.get_vector(id) {
+                    slim_emb.insert_vector(id, v.clone());
+                }
+            }
+            graph.embeddings = slim_emb;
         }
         graph.add_abbreviation_edges();
         graph.add_contrastive_edges();
@@ -237,6 +266,87 @@ mod testbed {
         );
         for ent in ents {
             graph.entities.insert(ent.id, ent);
+        }
+
+        // L4: logic embeddings (CodeRankEmbed for function body text)
+        if config.embeddings.enabled {
+            match ontomics::logic::LogicIndex::new(None) {
+                Ok(mut logic_idx) => {
+                    let items: Vec<(u64, String)> = graph
+                        .signatures
+                        .iter()
+                        .filter_map(|sig| {
+                            let body = sig.body.as_ref()?;
+                            let entity = graph.entities.values().find(|e| {
+                                e.name == sig.name && e.file == sig.file
+                            })?;
+                            Some((entity.id, body.body_text.clone()))
+                        })
+                        .collect();
+                    if let Err(e) = logic_idx.embed_batch(items) {
+                        eprintln!("  Warning: logic embedding failed: {e}");
+                    }
+                    let entity_ids: Vec<u64> =
+                        graph.entities.keys().copied().collect();
+                    graph.logic_clusters = ontomics::logic::cluster_logic(
+                        &logic_idx,
+                        &entity_ids,
+                        1.0 - config.logic.similarity_threshold,
+                    );
+                    // Label clusters by most common callee
+                    let mut clusters = std::mem::take(&mut graph.logic_clusters);
+                    let entity_cs = build_entity_call_sites(&graph);
+                    ontomics::logic::label_clusters(&mut clusters, &entity_cs);
+                    graph.logic_clusters = clusters;
+                    eprintln!(
+                        "  Logic: {} embeddings, {} clusters",
+                        logic_idx.nb_vectors(),
+                        graph.logic_clusters.len(),
+                    );
+                    // Transfer vectors to a model-free index to
+                    // release the GPU model and avoid VRAM exhaustion
+                    // when multiple codebases are tested sequentially.
+                    let mut slim_idx = ontomics::logic::LogicIndex::empty();
+                    for id in logic_idx.vector_ids() {
+                        if let Some(v) = logic_idx.get_vector(id) {
+                            slim_idx.insert_vector(id, v.clone());
+                        }
+                    }
+                    graph.logic_index = slim_idx;
+                }
+                Err(e) => eprintln!("  Warning: logic model unavailable: {e}"),
+            }
+        }
+
+        // L4: centrality (PageRank on entity graph)
+        if config.centrality.enabled {
+            let centrality = ontomics::centrality::compute_centrality(
+                &graph.entities,
+                &graph.relationships,
+                config.centrality.damping,
+                config.centrality.iterations,
+            );
+            eprintln!("  Computed centrality for {} entities", centrality.len());
+            graph.centrality = centrality;
+        }
+
+        // L4: cross-reference logic clusters with concept clusters
+        if !graph.logic_clusters.is_empty() {
+            let concept_assignments: HashMap<u64, usize> = graph
+                .entities
+                .values()
+                .filter_map(|ent| {
+                    ent.concept_tags
+                        .iter()
+                        .find_map(|&cid| graph.concepts.get(&cid)?.cluster_id)
+                        .map(|cid| (ent.id, cid))
+                })
+                .collect();
+            graph.logic_concept_overlaps = ontomics::logic::cross_reference(
+                &graph.logic_clusters,
+                &concept_assignments,
+                0.1,
+            );
         }
 
         let build_elapsed = build_start.elapsed();
