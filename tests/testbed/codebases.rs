@@ -41,6 +41,27 @@ macro_rules! testbed_tests {
 
             #[test]
             fn vocabulary_health() { universal::run_vocabulary_health(&$expectations_fn()); }
+
+            #[test]
+            fn describe_logic() { universal::run_describe_logic(&$expectations_fn()); }
+
+            #[test]
+            fn find_similar_logic() { universal::run_find_similar_logic(&$expectations_fn()); }
+
+            #[test]
+            fn compact_context() { universal::run_compact_context(&$expectations_fn()); }
+
+            #[test]
+            fn concept_map() { universal::run_concept_map(&$expectations_fn()); }
+
+            #[test]
+            fn type_flows() { universal::run_type_flows(&$expectations_fn()); }
+
+            #[test]
+            fn trace_type() { universal::run_trace_type(&$expectations_fn()); }
+
+            #[test]
+            fn trace_concept() { universal::run_trace_concept(&$expectations_fn()); }
         }
     };
     ($mod_name:ident, $expectations_fn:ident, #[ignore]) => {
@@ -82,6 +103,27 @@ macro_rules! testbed_tests {
 
             #[test] #[ignore]
             fn vocabulary_health() { universal::run_vocabulary_health(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn describe_logic() { universal::run_describe_logic(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn find_similar_logic() { universal::run_find_similar_logic(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn compact_context() { universal::run_compact_context(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn concept_map() { universal::run_concept_map(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn type_flows() { universal::run_type_flows(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn trace_type() { universal::run_trace_type(&$expectations_fn()); }
+
+            #[test] #[ignore]
+            fn trace_concept() { universal::run_trace_concept(&$expectations_fn()); }
         }
     };
 }

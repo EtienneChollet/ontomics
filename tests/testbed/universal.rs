@@ -702,3 +702,317 @@ pub fn run_vocabulary_health(exp: &TestbedExpectations) {
         );
     }
 }
+
+// ── describe_logic ────────────────────────────────────────────────────────
+
+pub fn run_describe_logic(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    // Structural: any entity with a body should produce a result
+    let has_body_entity = bg.graph.entities.values().any(|e| {
+        bg.graph.signatures.iter().any(|sig| {
+            sig.name == e.name && sig.file == e.file && sig.body.is_some()
+        })
+    });
+    if has_body_entity {
+        let some_entity = bg.graph.entities.values().find(|e| {
+            bg.graph.signatures.iter().any(|sig| {
+                sig.name == e.name && sig.file == e.file && sig.body.is_some()
+            })
+        }).unwrap();
+        let result = bg.graph.describe_logic(&some_entity.name);
+        assert!(
+            result.is_some(),
+            "{}: describe_logic('{}') returned None for entity with body",
+            exp.name, some_entity.name
+        );
+        let r = result.unwrap();
+        assert!(
+            !r.body_text.is_empty(),
+            "{}: describe_logic('{}') has empty body_text",
+            exp.name, some_entity.name
+        );
+
+        // MCP token limit
+        let json = serde_json::to_string(&r).unwrap_or_default();
+        assert!(
+            estimate_tokens(&json) < MCP_TOKEN_LIMIT,
+            "{}: describe_logic response exceeds token limit",
+            exp.name
+        );
+    }
+
+    // Per-codebase checks
+    for check in &exp.describe_logic_checks {
+        let result = bg.graph.describe_logic(check.name);
+        assert!(
+            result.is_some(),
+            "{}: describe_logic('{}') returned None",
+            exp.name, check.name
+        );
+        let r = result.unwrap();
+
+        let kind_str = format!("{:?}", r.entity.kind);
+        assert_eq!(
+            kind_str, check.expected_kind,
+            "{}: describe_logic('{}') expected kind {}, got {}",
+            exp.name, check.name, check.expected_kind, kind_str
+        );
+
+        if check.has_body_text {
+            assert!(
+                !r.body_text.is_empty(),
+                "{}: describe_logic('{}') expected non-empty body_text",
+                exp.name, check.name
+            );
+        }
+
+        if check.has_logic_cluster {
+            assert!(
+                r.logic_cluster.is_some(),
+                "{}: describe_logic('{}') expected logic_cluster to be Some",
+                exp.name, check.name
+            );
+        } else {
+            assert!(
+                r.logic_cluster.is_none(),
+                "{}: describe_logic('{}') expected logic_cluster to be None",
+                exp.name, check.name
+            );
+        }
+    }
+}
+
+// ── find_similar_logic ────────────────────────────────────────────────────
+
+pub fn run_find_similar_logic(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    for check in &exp.find_similar_logic_checks {
+        let result = bg.graph.find_similar_logic(check.name, check.top_k);
+        assert!(
+            result.is_some(),
+            "{}: find_similar_logic('{}') returned None",
+            exp.name, check.name
+        );
+        let r = result.unwrap();
+
+        assert!(
+            r.similar.len() >= check.min_similar,
+            "{}: find_similar_logic('{}') expected >= {} similar, got {}",
+            exp.name, check.name, check.min_similar, r.similar.len()
+        );
+
+        // All similarity scores must be in (0.0, 1.0]
+        for (entity, score) in &r.similar {
+            assert!(
+                *score > 0.0 && *score <= 1.0,
+                "{}: find_similar_logic('{}') score {} out of range for '{}'",
+                exp.name, check.name, score, entity.name
+            );
+        }
+
+        // MCP token limit
+        let json = serde_json::to_string(&r).unwrap_or_default();
+        assert!(
+            estimate_tokens(&json) < MCP_TOKEN_LIMIT,
+            "{}: find_similar_logic response exceeds token limit",
+            exp.name
+        );
+    }
+}
+
+// ── compact_context ───────────────────────────────────────────────────────
+
+pub fn run_compact_context(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    for check in &exp.compact_context_checks {
+        let result = bg.graph.compact_context(check.scope, check.max_tokens);
+        assert!(
+            result.is_some(),
+            "{}: compact_context('{}') returned None",
+            exp.name, check.scope
+        );
+        let r = result.unwrap();
+
+        assert!(
+            r.token_estimate <= check.max_tokens,
+            "{}: compact_context('{}') token_estimate {} exceeds max {}",
+            exp.name, check.scope, r.token_estimate, check.max_tokens
+        );
+
+        for substr in &check.must_contain {
+            assert!(
+                r.text.to_lowercase().contains(&substr.to_lowercase()),
+                "{}: compact_context('{}') text doesn't contain '{}'",
+                exp.name, check.scope, substr
+            );
+        }
+
+        // MCP token limit
+        let json = serde_json::to_string(&r).unwrap_or_default();
+        assert!(
+            estimate_tokens(&json) < MCP_TOKEN_LIMIT,
+            "{}: compact_context response exceeds token limit",
+            exp.name
+        );
+    }
+}
+
+// ── concept_map ───────────────────────────────────────────────────────────
+
+pub fn run_concept_map(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+    let map = bg.graph.concept_map();
+    let check = &exp.concept_map_check;
+
+    // Structural
+    assert!(
+        map.modules.len() >= check.min_modules,
+        "{}: concept_map expected >= {} modules, got {}",
+        exp.name, check.min_modules, map.modules.len()
+    );
+    assert!(
+        map.total_entities >= check.min_total_entities,
+        "{}: concept_map expected >= {} total_entities, got {}",
+        exp.name, check.min_total_entities, map.total_entities
+    );
+
+    // Modules sorted by nb_entities descending
+    for pair in map.modules.windows(2) {
+        assert!(
+            pair[0].nb_entities >= pair[1].nb_entities,
+            "{}: concept_map modules not sorted by nb_entities desc",
+            exp.name
+        );
+    }
+
+    // Must-have concepts in some module's dominant_concepts
+    let all_dominant: Vec<&str> = map.modules.iter()
+        .flat_map(|m| m.dominant_concepts.iter().map(|s| s.as_str()))
+        .collect();
+    for concept in &check.must_have_concepts {
+        assert!(
+            all_dominant.iter().any(|d| d.contains(concept)),
+            "{}: concept_map must_have concept '{}' not in dominant. Got: {:?}",
+            exp.name, concept, &all_dominant[..all_dominant.len().min(20)]
+        );
+    }
+
+    // MCP token limit
+    let json = serde_json::to_string(&map).unwrap_or_default();
+    assert!(
+        estimate_tokens(&json) < MCP_TOKEN_LIMIT,
+        "{}: concept_map response exceeds token limit (~{} tokens)",
+        exp.name, estimate_tokens(&json)
+    );
+}
+
+// ── type_flows ────────────────────────────────────────────────────────────
+
+pub fn run_type_flows(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+    let result = bg.graph.type_flows();
+    let check = &exp.type_flows_check;
+
+    assert!(
+        result.flows.len() >= check.min_flows,
+        "{}: type_flows expected >= {} flows, got {}",
+        exp.name, check.min_flows, result.flows.len()
+    );
+
+    // dominant_types sorted by count descending
+    for pair in result.dominant_types.windows(2) {
+        assert!(
+            pair[0].count >= pair[1].count,
+            "{}: type_flows dominant_types not sorted desc",
+            exp.name
+        );
+    }
+
+    // Must-have types in dominant_types
+    let type_names: Vec<&str> = result.dominant_types.iter()
+        .map(|t| t.type_name.as_str())
+        .collect();
+    for expected in &check.must_have_types {
+        let lower = expected.to_lowercase();
+        assert!(
+            type_names.iter().any(|t| t.to_lowercase().contains(&lower)),
+            "{}: type_flows must_have type '{}' not in dominant. Got: {:?}",
+            exp.name, expected, &type_names[..type_names.len().min(20)]
+        );
+    }
+
+    // Note: no MCP token limit check here. type_flows returns all
+    // flows which can be very large for big codebases. The MCP layer
+    // handles truncation via OUTPUT_BUDGET_BYTES.
+}
+
+// ── trace_type ────────────────────────────────────────────────────────────
+
+pub fn run_trace_type(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    for check in &exp.trace_type_checks {
+        let result = bg.graph.trace_type(check.type_name);
+
+        assert!(
+            result.len() >= check.min_flows,
+            "{}: trace_type('{}') expected >= {} flows, got {}",
+            exp.name, check.type_name, check.min_flows, result.len()
+        );
+
+        // All returned flows should contain the type name
+        let needle = check.type_name.to_lowercase();
+        for flow in &result {
+            assert!(
+                flow.type_name.to_lowercase().contains(&needle),
+                "{}: trace_type('{}') flow type '{}' doesn't match",
+                exp.name, check.type_name, flow.type_name
+            );
+        }
+    }
+}
+
+// ── trace_concept ─────────────────────────────────────────────────────────
+
+pub fn run_trace_concept(exp: &TestbedExpectations) {
+    let bg = skip_if_missing!(exp);
+
+    for check in &exp.trace_concept_checks {
+        let result = bg.graph.trace_concept(check.concept, 5);
+        assert!(
+            result.is_some(),
+            "{}: trace_concept('{}') returned None",
+            exp.name, check.concept
+        );
+        let r = result.unwrap();
+
+        assert!(
+            r.call_chain.len() >= check.min_call_chain,
+            "{}: trace_concept('{}') expected >= {} call_chain, got {}",
+            exp.name, check.concept, check.min_call_chain,
+            r.call_chain.len()
+        );
+
+        let chain_names: Vec<&str> = r.call_chain.iter()
+            .map(|n| n.entity_name.as_str())
+            .collect();
+        for expected in &check.must_have_in_chain {
+            assert!(
+                chain_names.contains(expected),
+                "{}: trace_concept('{}') chain missing '{}'. Got: {:?}",
+                exp.name, check.concept, expected, chain_names
+            );
+        }
+
+        // MCP token limit
+        let json = serde_json::to_string(&r).unwrap_or_default();
+        assert!(
+            estimate_tokens(&json) < MCP_TOKEN_LIMIT,
+            "{}: trace_concept response exceeds token limit",
+            exp.name
+        );
+    }
+}
