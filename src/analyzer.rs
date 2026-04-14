@@ -200,6 +200,12 @@ fn build_concepts(
             .cloned()
             .unwrap_or_default();
 
+        // Docstring words can boost TF-IDF scores but a concept without
+        // identifier occurrences is untraceable — skip it.
+        if occurrences.is_empty() {
+            continue;
+        }
+
         let entity_types = corpus
             .subtoken_entity_types
             .get(subtoken)
