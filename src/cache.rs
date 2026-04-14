@@ -675,6 +675,7 @@ mod tests {
                 embedding: None,
                 cluster_id: None,
                 subconcepts: Vec::new(),
+                doc_context: Vec::new(),
             },
         );
         ConceptGraph {
@@ -890,6 +891,7 @@ mod tests {
                     embedding: None,
                     cluster_id,
                     subconcepts: Vec::new(),
+                    doc_context: Vec::new(),
                 },
             );
         }
@@ -1069,6 +1071,7 @@ mod tests {
                     embedding: None,
                     cluster_id: None,
                     subconcepts: Vec::new(),
+                    doc_context: Vec::new(),
                 },
             );
         }
@@ -1143,6 +1146,7 @@ mod tests {
                     embedding: None,
                     cluster_id: None,
                     subconcepts: Vec::new(),
+                    doc_context: Vec::new(),
                 },
             );
         }
@@ -1281,6 +1285,7 @@ mod tests {
                 embedding: None,
                 cluster_id: None,
                 subconcepts: Vec::new(),
+                doc_context: Vec::new(),
             },
         );
         ConceptGraph {

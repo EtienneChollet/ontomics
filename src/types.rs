@@ -38,6 +38,8 @@ pub struct Concept {
     pub cluster_id: Option<usize>,
     #[serde(default)]
     pub subconcepts: Vec<Subconcept>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc_context: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +129,6 @@ pub struct RawIdentifier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseResult {
     pub identifiers: Vec<RawIdentifier>,
-    #[allow(dead_code)]
     pub doc_texts: Vec<(PathBuf, usize, String)>,
     pub signatures: Vec<Signature>,
     pub classes: Vec<ClassInfo>,
@@ -149,6 +150,7 @@ pub struct AnalysisResult {
     pub classes: Vec<ClassInfo>,
     pub call_sites: Vec<CallSite>,
     pub nesting_trees: Vec<FileNestingTree>,
+    pub doc_texts: Vec<(PathBuf, usize, String)>,
 }
 
 // --- Query result types ---
@@ -438,6 +440,8 @@ pub struct DescribeSymbolResult {
     pub concepts: Vec<String>,
     #[serde(default)]
     pub related_entities: Vec<EntitySummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc_context: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

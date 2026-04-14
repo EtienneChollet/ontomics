@@ -1613,6 +1613,33 @@ impl ConceptGraph {
             })
             .unwrap_or_default();
 
+        let mut doc_context = Vec::new();
+        if let Some(ref sig) = signature {
+            if let Some(ref doc) = sig.docstring_first_line {
+                doc_context.push(doc.clone());
+            }
+        }
+        if let Some(ref ci) = class_info {
+            if let Some(ref doc) = ci.docstring_first_line {
+                if !doc_context.contains(doc) {
+                    doc_context.push(doc.clone());
+                }
+            }
+        }
+        for concept_name in &concepts {
+            if let Some(c) = self
+                .concepts
+                .values()
+                .find(|c| c.canonical == *concept_name)
+            {
+                for doc in &c.doc_context {
+                    if !doc_context.contains(doc) {
+                        doc_context.push(doc.clone());
+                    }
+                }
+            }
+        }
+
         Some(DescribeSymbolResult {
             name: name.to_string(),
             kind,
@@ -1622,6 +1649,7 @@ impl ConceptGraph {
             callees,
             concepts,
             related_entities,
+            doc_context,
         })
     }
 
@@ -4249,6 +4277,7 @@ mod tests {
             embedding: None,
             cluster_id: None,
             subconcepts: Vec::new(),
+            doc_context: Vec::new(),
         }
     }
 
@@ -4299,6 +4328,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap()
     }
@@ -4397,6 +4427,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         analysis.call_sites.push(crate::types::CallSite {
             caller_scope: Some("register".to_string()),
@@ -4429,6 +4460,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let mut graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty())
@@ -4515,6 +4547,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let mut embeddings = EmbeddingIndex::empty();
         embeddings.insert_vector(1, vec![1.0, 0.0, 0.0]);
@@ -4561,6 +4594,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let entities = vec![
             Entity {
@@ -4614,6 +4648,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let mut embeddings = EmbeddingIndex::empty();
         for (id, vec) in embedding_pairs {
@@ -4850,6 +4885,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty())
@@ -4907,6 +4943,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty())
@@ -5007,6 +5044,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build(
             analysis,
@@ -5138,6 +5176,7 @@ mod tests {
             classes: Vec::new(),
             call_sites,
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -5196,6 +5235,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build(
             analysis,
@@ -5277,6 +5317,7 @@ mod tests {
             classes: Vec::new(),
             call_sites,
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -5361,6 +5402,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(), // zero call sites
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -5486,6 +5528,7 @@ mod tests {
             classes: Vec::new(),
             call_sites,
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -5625,6 +5668,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph = ConceptGraph::build_with_entities(
             analysis,
@@ -6139,6 +6183,7 @@ mod tests {
             classes,
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         ConceptGraph::build_with_entities(
             analysis,
@@ -6249,6 +6294,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let entities = vec![
             Entity {
@@ -6536,6 +6582,7 @@ mod tests {
                 line: 8,
             }],
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -6584,6 +6631,7 @@ mod tests {
                 line: 5,
             }],
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -6656,6 +6704,7 @@ mod tests {
                 },
             ],
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -6706,6 +6755,7 @@ mod tests {
                 line: 5,
             }],
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();

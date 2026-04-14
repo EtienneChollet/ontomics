@@ -356,6 +356,7 @@ fn make_synthetic_concept(term: &str, entity_types: HashSet<EntityType>) -> Conc
         embedding: None,
         cluster_id: None,
         subconcepts: Vec::new(),
+        doc_context: Vec::new(),
     }
 }
 
@@ -384,6 +385,7 @@ mod tests {
             embedding: None,
             cluster_id: None,
             subconcepts: Vec::new(),
+            doc_context: Vec::new(),
         }
     }
 
@@ -408,6 +410,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let mut graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();
@@ -551,6 +554,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
 
         merge_pack_into_analysis(&pack, &mut analysis);

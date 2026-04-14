@@ -554,6 +554,11 @@ impl EmbeddingIndex {
                 parts.push(id.clone());
             }
         }
+        for doc in &concept.doc_context {
+            if !parts.contains(doc) {
+                parts.push(doc.clone());
+            }
+        }
         parts.join(" ")
     }
 
@@ -769,6 +774,7 @@ mod tests {
             embedding: None,
             cluster_id: None,
             subconcepts: Vec::new(),
+            doc_context: Vec::new(),
         };
 
         let result = index.embed_concept(&concept);
@@ -841,6 +847,7 @@ mod tests {
                 embedding: None,
                 cluster_id: None,
                 subconcepts: Vec::new(),
+                doc_context: Vec::new(),
             },
             Concept {
                 id: 2,
@@ -856,6 +863,7 @@ mod tests {
                 embedding: None,
                 cluster_id: None,
                 subconcepts: Vec::new(),
+                doc_context: Vec::new(),
             },
         ];
 

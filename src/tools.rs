@@ -1163,6 +1163,7 @@ mod tests {
             embedding: None,
             cluster_id: None,
             subconcepts: Vec::new(),
+            doc_context: Vec::new(),
         }
     }
 
@@ -1192,6 +1193,7 @@ mod tests {
             classes: Vec::new(),
             call_sites: Vec::new(),
             nesting_trees: Vec::new(),
+            doc_texts: Vec::new(),
         };
         let graph =
             ConceptGraph::build(analysis, EmbeddingIndex::empty()).unwrap();

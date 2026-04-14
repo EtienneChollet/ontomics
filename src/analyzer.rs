@@ -25,7 +25,28 @@ struct Corpus {
     nb_files: usize,
 }
 
-fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
+/// Common English stop words filtered from docstring text.
+const DOCSTRING_STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "must", "can", "could", "of", "in", "to",
+    "for", "with", "on", "at", "from", "by", "as", "into", "through",
+    "during", "before", "after", "above", "below", "between", "out",
+    "off", "over", "under", "again", "further", "then", "once", "here",
+    "there", "when", "where", "why", "how", "all", "each", "every",
+    "both", "few", "more", "most", "other", "some", "such", "no", "nor",
+    "not", "only", "own", "same", "so", "than", "too", "very", "just",
+    "because", "but", "and", "or", "if", "while", "about", "up", "that",
+    "this", "it", "its", "they", "them", "their", "we", "us", "our",
+    "you", "your", "he", "she", "his", "her", "i", "me", "my", "which",
+    "what", "who", "whom", "these", "those",
+];
+
+fn build_corpus(
+    parse_results: &[ParseResult],
+    language: &str,
+    docstring_weight: f64,
+) -> Corpus {
     let stop_words: HashSet<&str> = language
         .split(',')
         .flat_map(|l| crate::tokenizer::language_stop_words(l.trim()))
@@ -39,6 +60,8 @@ fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
     let mut subtoken_occurrences: HashMap<String, Vec<Occurrence>> =
         HashMap::new();
     let mut all_files: HashSet<PathBuf> = HashSet::new();
+    let doc_stop: HashSet<&str> =
+        DOCSTRING_STOP_WORDS.iter().copied().collect();
 
     for pr in parse_results {
         for ident in &pr.identifiers {
@@ -71,6 +94,33 @@ fn build_corpus(parse_results: &[ParseResult], language: &str) -> Corpus {
                         identifier: ident.name.clone(),
                         entity_type: ident.entity_type.clone(),
                     });
+            }
+        }
+
+        // Include docstring words in TF-IDF corpus
+        if docstring_weight > 0.0 {
+            for (file, _line, text) in &pr.doc_texts {
+                all_files.insert(file.clone());
+                let words: Vec<String> = text
+                    .to_lowercase()
+                    .split(|c: char| !c.is_alphabetic())
+                    .filter(|w| {
+                        w.len() > 1
+                            && !doc_stop.contains(w)
+                            && !stop_words.contains(w)
+                    })
+                    .map(|w| w.to_string())
+                    .collect();
+                for word in &words {
+                    *subtoken_file_counts
+                        .entry(word.clone())
+                        .or_default()
+                        .entry(file.clone())
+                        .or_insert(0) += 1;
+                    *subtoken_total_counts
+                        .entry(word.clone())
+                        .or_insert(0) += 1;
+                }
             }
         }
     }
@@ -127,6 +177,7 @@ fn build_concepts(
     tfidf_scores: &HashMap<String, f64>,
     min_frequency: usize,
     tfidf_threshold: f64,
+    doc_texts: &[(PathBuf, usize, String)],
 ) -> Vec<Concept> {
     let mut concepts = Vec::new();
 
@@ -155,6 +206,18 @@ fn build_concepts(
             .cloned()
             .unwrap_or_default();
 
+        let doc_context: Vec<String> = doc_texts
+            .iter()
+            .filter(|(_, _, text)| {
+                text.to_lowercase().contains(&canonical)
+            })
+            .filter_map(|(_, _, text)| {
+                text.lines().next().map(|l| l.trim().to_string())
+            })
+            .filter(|line| !line.is_empty())
+            .take(5)
+            .collect();
+
         concepts.push(Concept {
             id,
             canonical,
@@ -164,6 +227,7 @@ fn build_concepts(
             embedding: None,
             cluster_id: None,
             subconcepts: Vec::new(),
+            doc_context,
         });
     }
 
@@ -594,6 +658,7 @@ pub struct AnalysisParams {
     pub convention_threshold: usize,
     /// Language name (e.g. "python", "rust") for stop-word filtering.
     pub language: String,
+    pub docstring_weight: f64,
 }
 
 impl Default for AnalysisParams {
@@ -603,6 +668,7 @@ impl Default for AnalysisParams {
             tfidf_threshold: 0.1,
             convention_threshold: 3,
             language: String::new(),
+            docstring_weight: 0.5,
         }
     }
 }
@@ -618,13 +684,22 @@ pub fn analyze(
     parse_results: &[ParseResult],
     params: &AnalysisParams,
 ) -> Result<AnalysisResult> {
-    let corpus = build_corpus(parse_results, &params.language);
+    let corpus = build_corpus(
+        parse_results,
+        &params.language,
+        params.docstring_weight,
+    );
     let tfidf_scores = compute_tfidf(&corpus);
+    let doc_texts: Vec<(PathBuf, usize, String)> = parse_results
+        .iter()
+        .flat_map(|pr| pr.doc_texts.clone())
+        .collect();
     let concepts = build_concepts(
         &corpus,
         &tfidf_scores,
         params.min_frequency,
         params.tfidf_threshold,
+        &doc_texts,
     );
     let conventions =
         detect_conventions(parse_results, params.convention_threshold);
@@ -657,6 +732,7 @@ pub fn analyze(
         classes,
         call_sites,
         nesting_trees,
+        doc_texts,
     })
 }
 
