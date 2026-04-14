@@ -554,9 +554,23 @@ impl EmbeddingIndex {
                 parts.push(id.clone());
             }
         }
+        // Add individual words from docstrings (not full sentences) to
+        // provide semantic context without overwhelming identifier terms.
+        let mut doc_word_count = 0;
         for doc in &concept.doc_context {
-            if !parts.contains(doc) {
-                parts.push(doc.clone());
+            for word in doc.split_whitespace() {
+                let w = word.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase();
+                if w.len() > 2 && !parts.contains(&w) {
+                    parts.push(w);
+                    doc_word_count += 1;
+                    if doc_word_count >= 8 {
+                        break;
+                    }
+                }
+            }
+            if doc_word_count >= 8 {
+                break;
             }
         }
         parts.join(" ")
