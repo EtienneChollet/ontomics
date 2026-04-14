@@ -12,7 +12,7 @@
 ![Codex](https://img.shields.io/badge/Codex-black?logo=openai&logoColor=white)
 ![pi](https://img.shields.io/badge/pi--coding--agent-blue)
 
-ontomics gives Claude Code instant knowledge of your codebase. One tool call instead of 19. ~20x fewer tokens.
+ontomics gives any coding agent **instant knowledge** of your codebase. One tool call instead of 19. ~20x fewer tokens.
 
 ## Benchmark
 
