@@ -399,7 +399,6 @@ fn build_graph(
         tfidf_threshold: config.analysis.domain_specificity_threshold,
         convention_threshold: config.analysis.convention_threshold,
         language: lang_key.clone(),
-        docstring_weight: config.analysis.docstring_weight,
     };
     let mut analysis =
         analyzer::analyze(&all_parse_results, &analysis_params)?;
@@ -1918,9 +1917,6 @@ async fn run_server(
                             .analysis
                             .convention_threshold,
                         language: watcher_lang_key.clone(),
-                        docstring_weight: watcher_config
-                            .analysis
-                            .docstring_weight,
                     };
                     let mut analysis = match analyzer::analyze(
                         &parse_results,

@@ -303,7 +303,6 @@ pub struct AnalysisConfig {
     pub domain_specificity_threshold: f64,
     pub co_occurrence_scope: String,
     pub convention_threshold: usize,
-    pub docstring_weight: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -390,7 +389,6 @@ impl Default for AnalysisConfig {
             domain_specificity_threshold: 0.3,
             co_occurrence_scope: "function".to_string(),
             convention_threshold: 3,
-            docstring_weight: 0.5,
         }
     }
 }

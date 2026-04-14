@@ -182,7 +182,6 @@ mod testbed {
             tfidf_threshold: config.analysis.domain_specificity_threshold,
             convention_threshold: config.analysis.convention_threshold,
             language: language_name.to_string(),
-            docstring_weight: config.analysis.docstring_weight,
         };
         let analysis =
             analyzer::analyze(&parse_results, &analysis_params)
