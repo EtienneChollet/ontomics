@@ -12,6 +12,7 @@ const INDEX_FILES: &[&str] = &[
     "src/types.rs",
     "src/logic.rs",
     "src/centrality.rs",
+    "src/pipeline.rs",
 ];
 
 fn main() {

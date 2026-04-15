@@ -13,6 +13,7 @@ pub mod logic;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod parser;
+pub mod pipeline;
 pub mod resolve;
 pub mod tokenizer;
 pub mod types;
