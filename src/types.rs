@@ -81,7 +81,7 @@ pub struct Convention {
     pub frequency: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PatternKind {
     Prefix(String),
     Suffix(String),
