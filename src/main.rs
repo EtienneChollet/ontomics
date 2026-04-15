@@ -348,13 +348,8 @@ fn build_graph(
 
     for (parser, lang_name) in lang_parsers {
         if stale.contains(lang_name) {
-            let lang_enum = match lang_name.as_str() {
-                "python" => config::Language::Python,
-                "typescript" => config::Language::TypeScript,
-                "javascript" => config::Language::JavaScript,
-                "rust" => config::Language::Rust,
-                _ => config::Language::Python,
-            };
+            let lang_enum = lang_name.parse::<config::Language>()
+                .unwrap_or(config::Language::Python);
             let parse_opts = parser::ParseOptions {
                 include: lang_enum.default_include(),
                 exclude: lang_enum.default_exclude(),
@@ -435,27 +430,7 @@ fn build_graph(
 
         // Only add if not already discovered
         let already_exists = analysis.conventions.iter().any(|c| {
-            std::mem::discriminant(&c.pattern)
-                == std::mem::discriminant(&pattern)
-                && match (&c.pattern, &pattern) {
-                    (
-                        types::PatternKind::Prefix(a),
-                        types::PatternKind::Prefix(b),
-                    ) => a == b,
-                    (
-                        types::PatternKind::Suffix(a),
-                        types::PatternKind::Suffix(b),
-                    ) => a == b,
-                    (
-                        types::PatternKind::Conversion(a),
-                        types::PatternKind::Conversion(b),
-                    ) => a == b,
-                    (
-                        types::PatternKind::Compound(a),
-                        types::PatternKind::Compound(b),
-                    ) => a == b,
-                    _ => false,
-                }
+            c.pattern == pattern
         });
         if !already_exists {
             analysis.conventions.push(types::Convention {
@@ -1483,13 +1458,8 @@ fn cmd_benchmark_embeddings(
 
     let mut all_bodies: Vec<(String, String, String)> = Vec::new(); // (name, file, body_text)
     for (p, lang_name) in lang_parsers {
-        let lang_enum = match lang_name.as_str() {
-            "python" => config::Language::Python,
-            "typescript" => config::Language::TypeScript,
-            "javascript" => config::Language::JavaScript,
-            "rust" => config::Language::Rust,
-            _ => config::Language::Python,
-        };
+        let lang_enum = lang_name.parse::<config::Language>()
+            .unwrap_or(config::Language::Python);
         let results = parser::parse_directory_with(
             repo,
             &parse_opts_for(&lang_enum),
@@ -1723,13 +1693,8 @@ async fn run_server(
     let bg_parsers: Vec<LangParser> = arc_parsers
         .iter()
         .map(|(_p, n)| {
-            let lang = match n.as_str() {
-                "python" => config::Language::Python,
-                "typescript" => config::Language::TypeScript,
-                "javascript" => config::Language::JavaScript,
-                "rust" => config::Language::Rust,
-                _ => config::Language::Python,
-            };
+            let lang = n.parse::<config::Language>()
+                .unwrap_or(config::Language::Python);
             (lang.make_parser(), n.clone())
         })
         .collect();
@@ -1810,13 +1775,8 @@ async fn run_server(
         arc_parsers
             .iter()
             .map(|(_, n)| {
-                let lang = match n.as_str() {
-                    "python" => config::Language::Python,
-                    "typescript" => config::Language::TypeScript,
-                    "javascript" => config::Language::JavaScript,
-                    "rust" => config::Language::Rust,
-                    _ => config::Language::Python,
-                };
+                let lang = n.parse::<config::Language>()
+                    .unwrap_or(config::Language::Python);
                 (lang.make_parser(), n.clone())
             })
             .collect();
@@ -1875,13 +1835,8 @@ async fn run_server(
                     let mut parse_results = Vec::new();
                     let mut parse_failed = false;
                     for (wp, wn) in &watcher_parsers {
-                        let lang_enum = match wn.as_str() {
-                            "python" => config::Language::Python,
-                            "typescript" => config::Language::TypeScript,
-                            "javascript" => config::Language::JavaScript,
-                            "rust" => config::Language::Rust,
-                            _ => config::Language::Python,
-                        };
+                        let lang_enum = wn.parse::<config::Language>()
+                            .unwrap_or(config::Language::Python);
                         let opts = parser::ParseOptions {
                             include: lang_enum.default_include(),
                             exclude: lang_enum.default_exclude(),

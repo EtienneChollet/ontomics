@@ -499,6 +499,20 @@ impl Default for CentralityConfig {
     }
 }
 
+impl std::str::FromStr for Language {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "python" => Ok(Language::Python),
+            "typescript" => Ok(Language::TypeScript),
+            "javascript" => Ok(Language::JavaScript),
+            "rust" => Ok(Language::Rust),
+            other => Err(format!("unknown language: {other}")),
+        }
+    }
+}
+
 impl Config {
     /// Load config from `.ontomics/config.toml` relative to repo_root.
     /// Returns default config if file doesn't exist.
