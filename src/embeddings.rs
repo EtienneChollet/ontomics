@@ -375,7 +375,7 @@ impl EmbeddingModel for CodeRankModel {
             return Ok(vec![]);
         }
         let mut all_results = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(1) {
+        for chunk in texts.chunks(8) {
             let (token_ids, type_ids, mask, batch_size, _) =
                 encode_batch(&self.tokenizer, chunk, &self.device)?;
             let output = self.model.forward(
