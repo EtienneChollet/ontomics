@@ -15,7 +15,8 @@
 ontomics gives any coding agent **instant knowledge** of your codebase. One tool call instead of 19. ~20x fewer tokens.
 
 
-https://github.com/user-attachments/assets/cc18c961-39eb-4c1f-8aab-716dbef4363a
+<video src="https://github.com/EtienneChollet/ontomics/raw/main/doc/demo.mp4" controls muted width="100%"></video>
+
 Visualization for the [voxelmorph](https://github.com/voxelmorph/voxelmorph) project -- a library for unsupervised learning in image registration
 
 ## Benchmark
